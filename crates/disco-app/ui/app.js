@@ -46,10 +46,11 @@ function md(src) {
   const parts = esc(src).split(/```(?:[\w-]*)\n?([\s\S]*?)```/g);
   return parts.map((p, i) => {
     if (i % 2) return `<pre><button class="copy" type="button">复制</button><code>${p.replace(/\n$/, "")}</code></pre>`;
-    return p.split(/\n{2,}/).map((blk) => {
+    return p.replace(/^(#{1,6} .*)$/gm, "\n$1\n").split(/\n{2,}/).map((blk) => {
       const inline = (t) => t.replace(/`([^`]+)`/g, "<code>$1</code>").replace(/\*\*([^*]+)\*\*/g, "<b>$1</b>");
       const lines = blk.split("\n").filter((l) => l.trim());
       if (!lines.length) return "";
+      if (lines.length === 1 && /^#{1,6} /.test(lines[0])) return `<h4>${inline(lines[0].replace(/^#+ /, ""))}</h4>`;
       if (lines.every((l) => /^\s*[-*]\s/.test(l))) return `<ul>${lines.map((l) => `<li>${inline(l.replace(/^\s*[-*]\s/, ""))}</li>`).join("")}</ul>`;
       if (lines.every((l) => /^\s*\d+[.)]\s/.test(l))) return `<ol>${lines.map((l) => `<li>${inline(l.replace(/^\s*\d+[.)]\s/, ""))}</li>`).join("")}</ol>`;
       return `<p>${inline(lines.join("<br>"))}</p>`;
@@ -154,6 +155,7 @@ async function openThread(t) {
     h("div", { class: "head", "data-tauri-drag-region": true }, avatar(name, { group: isGroup }),
       h("div", {}, h("h2", { title: a ? "双击重命名" : "", ondblclick: a ? (e) => inlineRename(e.currentTarget, a.name) : null }, name), h("small", {}, sub)), h("span", { class: "sp" }),
       a && a.kind === "acp" ? h("div", { id: "cfgs" }) : null,
+      !peer ? h("button", { class: "btn space-btn", title: "待办和群文档（agent 也能读写）", onclick: () => toggleSpace(t) }, "待办 · 文档", h("span", { class: "count", id: "todo-count" })) : null,
       isGroup ? h("button", { class: "btn", onclick: () => groupDialog(g) }, "成员") : null,
       a ? h("button", { class: "icon-btn", title: "更多", onclick: (e) => agentMenu(e.currentTarget, a.name) }, "⋯") : null),
     h("div", { id: "log" }),
@@ -173,6 +175,7 @@ async function openThread(t) {
   });
   ta.focus();
   if (a && a.kind === "acp") loadConfigs(name, t);
+  if (!peer) loadSpace(t);
   const draw = (msgs) => {
     const log = $("#log"); if (!log || S.thread !== t) return;
     log.replaceChildren(...msgs.map((m) => bubble(m.author, m.body)));
@@ -187,6 +190,50 @@ async function openThread(t) {
   S.msgs[t] = fresh;
   if (!Array.isArray(had) || had.length !== fresh.length) draw(fresh);
 }
+// ---------- space: the thread's shared to-dos and doc (agents edit them through Disco tools)
+function toggleSpace(t) {
+  const open = $("#space");
+  if (open) { open.remove(); $(".space-btn")?.classList.remove("on"); return; }
+  const box = h("aside", { id: "space" });
+  box.style.top = `${$("#pane .head")?.offsetHeight ?? 0}px`;
+  $("#pane").append(box);
+  $(".space-btn")?.classList.add("on");
+  loadSpace(t);
+}
+async function loadSpace(t) {
+  let sp; try { sp = await invoke("space", { thread: t }); } catch { return; }
+  if (S.thread !== t) return;
+  const left = sp.todos.filter((x) => !x.done).length;
+  const cnt = $("#todo-count"); if (cnt) cnt.textContent = left ? String(left) : "";
+  const box = $("#space"); if (!box) return;
+  const who = (a) => (a === "me" ? "我" : a);
+  const add = h("input", { placeholder: "加一项待办，回车", class: "todo-in" });
+  add.onkeydown = async (e) => {
+    if (e.key !== "Enter" || e.isComposing || !add.value.trim()) return;
+    try { await invoke("todo_new", { thread: t, text: add.value }); add.value = ""; } catch (er) { toast(er); }
+  };
+  const todos = h("ul", { class: "todos" }, ...sp.todos.map((x) => h("li", { class: x.done ? "done" : "" },
+    h("input", { type: "checkbox", checked: x.done, onchange: (e) => invoke("todo_set", { thread: t, id: x.id, done: e.target.checked }).catch(toast) }),
+    h("span", { class: "tx" }, x.text, x.assignee ? h("em", {}, ` → ${who(x.assignee)}`) : null, x.by && x.by !== "me" ? h("small", {}, ` · ${x.by} 添加`) : null),
+    h("button", { class: "icon-btn", title: "删除", onclick: () => invoke("todo_remove", { thread: t, id: x.id }).catch(toast) }, "×"))));
+  const doc = h("div", { class: "doc md" });
+  doc.innerHTML = sp.doc.trim() ? md(sp.doc) : '<p class="mute">还没有内容。agent 可以用 doc_write 写入目标、结论和分工，你也可以直接编辑。</p>';
+  const edit = h("button", { class: "btn sm" }, "编辑");
+  edit.onclick = () => {
+    const ta = h("textarea", { class: "doc-edit" }); ta.value = sp.doc;
+    const save = h("button", { class: "btn sm primary" }, "保存");
+    save.onclick = async () => { try { await invoke("doc_save", { thread: t, content: ta.value }); } catch (er) { toast(er); } };
+    doc.replaceWith(ta); edit.replaceWith(save); ta.focus();
+  };
+  box.replaceChildren(
+    h("div", { class: "sp-head" }, h("b", {}, "待办"), h("span", { class: "mute" }, left ? `${left} 项未完成` : "")),
+    todos, add,
+    h("div", { class: "sp-head" }, h("b", {}, "群文档"), h("span", { class: "sp" }), edit,
+      h("button", { class: "btn sm", title: sp.doc_path, onclick: () => invoke("reveal_doc", { thread: t }).catch(toast) }, "在访达中显示")),
+    doc);
+}
+listen("space", ({ payload: t }) => { if (S.thread === t && !$("#space .doc-edit")) loadSpace(t); });
+
 // Model picker: only the agent's own model list (ACP session config, category "model").
 async function loadConfigs(agent, t) {
   const box = $("#cfgs");

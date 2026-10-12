@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::schema::v1::{
-    CancelNotification, ContentBlock, InitializeRequest, NewSessionRequest, PermissionOptionKind, PromptRequest,
+    CancelNotification, ContentBlock, EnvVariable, InitializeRequest, McpServer, McpServerStdio, NewSessionRequest, PermissionOptionKind, PromptRequest,
     RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
     SelectedPermissionOutcome, SessionConfigKind, SessionConfigOption, SessionConfigOptionCategory,
     SessionConfigSelectOptions, SessionId, SessionNotification, SessionUpdate,
@@ -49,6 +49,18 @@ pub struct Launch {
     /// Session settings to apply to every new session (config id -> value id),
     /// e.g. `model = "sonnet"`. Ids the agent doesn't offer are ignored.
     pub config: Vec<(String, String)>,
+    /// A stdio MCP server handed to every new session. Each session gets
+    /// `DISCO_CONTEXT=<session key>` added to its env so the server knows where it is.
+    pub mcp: Option<McpStdio>,
+}
+
+/// A stdio MCP server the agent should launch for its sessions.
+#[derive(Debug, Clone)]
+pub struct McpStdio {
+    pub name: String,
+    pub command: PathBuf,
+    pub args: Vec<String>,
+    pub env: Vec<(String, String)>,
 }
 
 /// One selectable session setting the agent offers: model, reasoning effort, mode …
@@ -247,6 +259,14 @@ fn map_update(u: SessionUpdate) -> Option<AgentEvent> {
     }
 }
 
+fn new_session(launch: &Launch, key: &str) -> NewSessionRequest {
+    let req = NewSessionRequest::new(launch.cwd.clone());
+    let Some(m) = &launch.mcp else { return req };
+    let env = m.env.iter().map(|(k, v)| EnvVariable::new(k, v))
+        .chain(std::iter::once(EnvVariable::new("DISCO_CONTEXT", key))).collect();
+    req.mcp_servers(vec![McpServer::Stdio(McpServerStdio::new(&m.name, &m.command).args(m.args.clone()).env(env))])
+}
+
 async fn run_connection<W, R>(
     transport: ByteStreams<W, R>,
     launch: Launch,
@@ -349,7 +369,7 @@ async fn run_connection<W, R>(
                 };
                 let (session, turn) = match sessions.get(&key) {
                     Some(s) => s.clone(),
-                    None => match conn.send_request(NewSessionRequest::new(launch.cwd.clone())).block_task().await {
+                    None => match conn.send_request(new_session(&launch, &key)).block_task().await {
                         Ok(r) => {
                             let offered = choices(r.config_options.as_deref().unwrap_or_default());
                             for (id, value) in &prefs {

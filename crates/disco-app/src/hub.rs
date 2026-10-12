@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use disco_a2a::{Credential, RemoteAgent};
-use disco_acp::{AcpAgent, Launch};
+use disco_acp::{AcpAgent, Launch, McpStdio};
 use disco_store::AgentRow;
 use disco_types::{AgentEvent, PermissionDecision, TaskPhase};
 use futures::StreamExt;
@@ -63,6 +63,11 @@ pub struct Hub {
     /// The user's login-shell PATH: GUI apps start with a bare one, so npx and
     /// Homebrew tools would otherwise be invisible.
     pub user_path: String,
+    /// Port of the loopback Disco MCP endpoint (see mcp.rs), once it listens.
+    pub mcp_port: std::sync::OnceLock<u16>,
+    /// MCP token -> agent name. Each ACP agent gets its own token, so a tool call
+    /// can only ever act as the agent it was handed to.
+    pub mcp_tokens: std::sync::Mutex<HashMap<String, String>>,
 }
 
 pub const MAX_CONCURRENT: usize = 8;
@@ -71,7 +76,7 @@ pub type CredLookup = dyn Fn(&str) -> Option<String> + Send + Sync;
 
 impl Hub {
     pub fn new() -> Self {
-        Self { live: Mutex::default(), slots: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT)), user_path: login_path() }
+        Self { live: Mutex::default(), slots: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT)), user_path: login_path(), mcp_port: Default::default(), mcp_tokens: Default::default() }
     }
 
     async fn runtime(&self, row: &AgentRow, secret: &CredLookup) -> Result<Runtime, String> {
@@ -146,12 +151,29 @@ impl Hub {
                     cwd,
                     prompt_timeout: Duration::from_secs(15 * 60),
                     config: spec.config.into_iter().collect(),
+                    mcp: self.mcp_for(&row.name),
                 };
                 Runtime::Acp(Arc::new(AcpAgent::spawn(launch).await.map_err(|e| e.to_string())?))
             }
             t => return Err(format!("暂不支持的类型 {t}")),
         };
         Ok(rt)
+    }
+
+    /// The Disco MCP server for `agent`'s sessions: this same executable in `--mcp` mode.
+    fn mcp_for(&self, agent: &str) -> Option<McpStdio> {
+        let port = *self.mcp_port.get()?;
+        let exe = std::env::current_exe().ok()?;
+        let token = uuid::Uuid::new_v4().simple().to_string();
+        let mut tokens = self.mcp_tokens.lock().unwrap_or_else(|p| p.into_inner());
+        tokens.retain(|_, a| a != agent);
+        tokens.insert(token.clone(), agent.to_owned());
+        Some(McpStdio {
+            name: "disco".into(),
+            command: exe,
+            args: vec!["--mcp".into()],
+            env: vec![("DISCO_MCP_PORT".into(), port.to_string()), ("DISCO_MCP_TOKEN".into(), token)],
+        })
     }
 
     /// Run one prompt; every event goes to `on_event`; returns the answer text.

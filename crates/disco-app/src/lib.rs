@@ -3,6 +3,8 @@
 #![forbid(unsafe_code)]
 
 mod hub;
+mod mcp;
+pub use mcp::stdio_proxy as mcp_stdio;
 mod share;
 mod templates;
 
@@ -200,7 +202,11 @@ impl Core {
         kept.reverse();
         let mut out = String::from("【Disco 长期记忆】\n");
         for t in &kept { out.push_str("- "); out.push_str(t); out.push('\n'); }
-        out.push_str(&format!("（需要长期记住的事实或偏好，单独一行以「{MEM_TAG}」开头写出，Disco 会保存。）\n\n"));
+        out.push_str(&format!("（需要长期记住的事实或偏好，单独一行以「{MEM_TAG}」开头写出，Disco 会保存。）\n"));
+        if self.hub.mcp_port.get().is_some() && self.agent(agent).is_ok_and(|r| r.transport == "acp") {
+            out.push_str("（你有 disco 工具：overview 看自己在哪，post 发到群或通知用户，ask 请教其他 agent，todo_add/todo_list/todo_done 管待办，doc_read/doc_write 读写群文档，remember 保存长期记忆。）\n");
+        }
+        out.push('\n');
         out
     }
 
@@ -327,14 +333,22 @@ impl Core {
     async fn group(&self, channel: String, author: String, text: String, from_discord: bool) {
         let Some(g) = self.db().list_groups().ok().and_then(|gs| gs.into_iter().find(|g| g.id == channel)) else { return };
         let thread = format!("group:{channel}");
+        // A member agent posting through its Disco tools: only the members it @s answer.
+        let by_agent = g.members.contains(&author);
         self.post_message(&thread, &author, &text);
-        if self.user_remember(&thread, "all", &text) { return; }
+        if !by_agent && self.user_remember(&thread, "all", &text) { return; }
         if !from_discord && !channel.starts_with("local-") && let Some(d) = self.discord_rest() {
-            let (ch, line) = (channel.clone(), format!("**{author}**：{text}"));
-            tauri::async_runtime::spawn(async move { let _ = d.post(&ch, &line).await; });
+            let hook = if by_agent { g.webhook_ref.as_deref().and_then(secret_get) } else { None };
+            let (ch, author, text) = (channel.clone(), author.clone(), text.clone());
+            tauri::async_runtime::spawn(async move {
+                let _ = match hook {
+                    Some(h) => d.post_as(&h, &author, None, &text).await,
+                    None => d.post(&ch, &format!("**{author}**：{text}")).await,
+                };
+            });
         }
-        let mut wave = mentions(&text, &g.members, None);
-        if wave.is_empty() && let Some(lead) = g.lead_agent.clone().or_else(|| g.members.first().cloned()) {
+        let mut wave = mentions(&text, &g.members, by_agent.then_some(author.as_str()));
+        if wave.is_empty() && !by_agent && let Some(lead) = g.lead_agent.clone().or_else(|| g.members.first().cloned()) {
             wave.push(lead);
         }
         // Agents addressed together run concurrently; their @handoffs form the next
@@ -820,6 +834,50 @@ async fn discord_sync(core: St<'_>) -> CmdResult<usize> {
 }
 
 /// Opens Discord pages (bot invite / developer portal) in the default browser.
+#[derive(Serialize)]
+struct Space { todos: Vec<mcp::Todo>, doc: String, doc_path: String }
+
+/// A group's or DM's shared to-dos and doc (`thread` is `group:<id>` or `dm:<agent>`).
+#[tauri::command]
+fn space(core: St<'_>, thread: String) -> CmdResult<Space> {
+    let path = mcp::doc_path(&core, &thread);
+    Ok(Space { todos: mcp::todos(&core, &thread), doc: std::fs::read_to_string(&path).unwrap_or_default(), doc_path: path.display().to_string() })
+}
+
+#[tauri::command]
+fn todo_new(core: St<'_>, thread: String, text: String) -> CmdResult<String> {
+    let text = text.trim();
+    if text.is_empty() { return Err("内容不能为空".into()); }
+    Ok(mcp::add_todo(&core, &thread, text, None, "me"))
+}
+
+#[tauri::command]
+fn todo_set(core: St<'_>, thread: String, id: String, done: bool) -> CmdResult<()> {
+    mcp::set_todo_done(&core, &thread, &id, done).map(|_| ())
+}
+
+#[tauri::command]
+fn todo_remove(core: St<'_>, thread: String, id: String) -> CmdResult<()> {
+    mcp::delete_todo(&core, &thread, &id)
+}
+
+#[tauri::command]
+fn doc_save(core: St<'_>, thread: String, content: String) -> CmdResult<()> {
+    mcp::write_doc(&mcp::doc_path(&core, &thread), &content)?;
+    use mcp::EmitSpace;
+    let _ = core.app.emit_space(&thread);
+    Ok(())
+}
+
+/// Show the doc in Finder (creating an empty one first), so it can be opened in any editor.
+#[tauri::command]
+fn reveal_doc(core: St<'_>, thread: String) -> CmdResult<()> {
+    let path = mcp::doc_path(&core, &thread);
+    if !path.exists() { mcp::write_doc(&path, "")?; }
+    std::process::Command::new("/usr/bin/open").arg("-R").arg(&path).spawn().map_err(err)?;
+    Ok(())
+}
+
 #[tauri::command]
 fn open_url(url: String) -> CmdResult<()> {
     if !(url.starts_with("https://discord.com/") || url.starts_with("https://github.com/Cosmoto-jian/")) {
@@ -1029,6 +1087,7 @@ pub fn run() {
                 let _ = core.db().set_setting(SET_TOKEN_SAVED, "1");
             }
             if core.db().setting(SET_TOKEN_SAVED).is_some() { connect_discord(core.clone()); }
+            mcp::start(core.clone());
             core.warm(None);
             if !core.shares().is_empty() { core.serve_shares(); }
             app.manage(core);
@@ -1045,7 +1104,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             overview, detect_agents, conda_envs, choose_path, memories, forget, add_agent, remove_agent, rename_agent, stop_reply, messages, send, decide_permission, agent_configs, set_agent_config,
             stop_all, resume, save_discord_token, discord_connect, discord_settings, discord_sync, diagnose, open_url, discord_channels, save_group, delete_group,
-            check_update, install_update, share::share_status, share::create_share, share::share_invite, share::revoke_share, share::accept_invite
+            check_update, install_update, space, todo_new, todo_set, todo_remove, doc_save, reveal_doc, share::share_status, share::create_share, share::share_invite, share::revoke_share, share::accept_invite
         ])
         .run(tauri::generate_context!())
         .expect("error while running Disco");

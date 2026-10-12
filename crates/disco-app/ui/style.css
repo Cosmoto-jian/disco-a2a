@@ -309,3 +309,30 @@ dialog[open]::backdrop { animation:fade .2s var(--ease); }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation-duration:.01ms !important; animation-iteration-count:1 !important; transition-duration:.01ms !important; }
 }
+
+/* space drawer: to-dos + group doc */
+.space-btn { display:inline-flex; align-items:center; gap:6px; }
+.space-btn .count:not(:empty) { min-width:18px; height:18px; padding:0 5px; border-radius:9px; background:var(--acc); color:#fff; font-size:11px; line-height:18px; text-align:center; }
+#space { position:absolute; top:0; right:0; bottom:0; width:340px; background:var(--main); border-left:1px solid var(--line); box-shadow:-8px 0 24px rgba(0,0,0,.06); padding:6px 16px 16px; overflow:auto; display:flex; flex-direction:column; gap:8px; z-index:5; animation:slidein .22s var(--ease); -webkit-user-select:text; user-select:text; }
+@keyframes slidein { from { transform:translateX(24px); opacity:0; } }
+#space .sp-head { display:flex; align-items:center; gap:8px; margin-top:10px; }
+#space .sp-head .sp { flex:1; }
+#space .mute, #space .doc .mute { color:var(--mute); font-size:12px; }
+.todos { list-style:none; margin:0; padding:0; display:flex; flex-direction:column; gap:2px; }
+.todos li { display:flex; align-items:flex-start; gap:8px; padding:5px 6px; border-radius:8px; }
+.todos li:hover { background:var(--hover); }
+.todos li .tx { flex:1; }
+.todos li em { color:var(--acc); font-style:normal; }
+.todos li small { color:var(--mute); }
+.todos li.done .tx { color:var(--mute); text-decoration:line-through; }
+.todos li .icon-btn { width:22px; height:22px; font-size:15px; opacity:0; }
+.todos li:hover .icon-btn { opacity:1; }
+.todo-in, .doc-edit { width:100%; border:1px solid var(--line); border-radius:8px; padding:7px 10px; background:var(--list); color:var(--fg); font:inherit; outline:none; }
+.todo-in:focus, .doc-edit:focus { border-color:var(--acc); }
+.doc-edit { min-height:260px; flex:1; resize:vertical; font:12.5px/1.5 ui-monospace, Menlo, monospace; }
+.doc { font-size:13px; }
+.doc h4 { margin:12px 0 4px; font-size:13.5px; }
+.doc p, .doc ul, .doc ol { margin:4px 0; }
+.btn.primary { background:var(--acc); color:#fff; }
+.space-btn.on { background:var(--sel); color:var(--acc); }
+.todos input[type=checkbox] { accent-color:var(--acc); margin-top:4px; }

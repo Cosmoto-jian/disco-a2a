@@ -12,6 +12,7 @@ fn launch() -> Launch {
         cwd: std::env::temp_dir(),
         prompt_timeout: Duration::from_secs(10),
         config: vec![],
+        mcp: None,
     }
 }
 
