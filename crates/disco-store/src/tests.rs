@@ -83,3 +83,16 @@ fn bench_hybrid_10k() {
     println!("hybrid search p50={p50:?} p95={p95:?}");
     assert!(p95 <= std::time::Duration::from_millis(50), "p95 {p95:?} > 50ms");
 }
+
+#[test]
+fn agents_upsert_list_delete() {
+    let mut s = Store::open_in_memory().unwrap();
+    let mut a = AgentRow { id: "1".into(), name: "echo".into(), transport: "a2a".into(),
+        endpoint: "http://x".into(), credential_ref: None, card_json: None };
+    s.upsert_agent(&a).unwrap();
+    a.endpoint = "http://y".into();
+    s.upsert_agent(&a).unwrap();
+    assert_eq!(s.list_agents().unwrap(), vec![a]);
+    assert!(s.delete_agent("echo").unwrap());
+    assert!(s.list_agents().unwrap().is_empty());
+}
