@@ -30,6 +30,9 @@ a2a.workspace = true
 a2a-server.workspace = true
 axum.workspace = true
 chrono.workspace = true
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls-no-provider"] }
+sha2 = "0.10"
+hex = "0.4"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 keyring = { version = "3", features = ["apple-native"] }

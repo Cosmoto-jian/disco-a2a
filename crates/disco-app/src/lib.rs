@@ -9,6 +9,8 @@ mod memory;
 mod team;
 pub use mcp::stdio_proxy as mcp_stdio;
 mod share;
+mod tailmsg;
+mod tailnet;
 mod templates;
 
 use std::collections::HashMap;
@@ -130,6 +132,8 @@ pub struct Core {
     teams: team::Teams,
     /// The Tailscale share server (see share.rs).
     server: Mutex<share::Server>,
+    /// Yobiru interop (see tailmsg.rs).
+    tm: tailmsg::Tm,
     app: AppHandle,
 }
 
@@ -170,7 +174,8 @@ impl Core {
             return Err("已全部停止".into());
         }
         let row = self.agent(agent)?;
-        let first = self.primed.lock().unwrap_or_else(|p| p.into_inner()).insert(format!("{agent}|{context}"));
+        // Memory goes only to agents running on this Mac, never to a remote one.
+        let first = row.transport == "acp" && self.primed.lock().unwrap_or_else(|p| p.into_inner()).insert(format!("{agent}|{context}"));
         let with_mem;
         let prompt = if first { with_mem = format!("{}{prompt}", self.memory_preamble(agent, context)); with_mem.as_str() } else { prompt };
         // Team members work behind the scenes: no bubbles, only the activity strip
@@ -180,7 +185,7 @@ impl Core {
         let app = self.app.clone();
         let (t, a) = (thread.to_owned(), agent.to_owned());
         let asked = Mutex::new(Vec::new());
-        let res = self
+        let res = if row.transport == tailmsg::TRANSPORT { self.tm_turn(thread, &row, context, prompt).await } else { self
             .hub
             .ask(&row, &secret_get, context, prompt, |ev| {
                 if !tap(ev) { return; }
@@ -194,7 +199,7 @@ impl Core {
                 }
                 let _ = app.emit("stream", StreamEvt { thread: t.clone(), agent: a.clone(), event: ev.clone() });
             })
-            .await;
+            .await };
         self.inbox_expire(&asked.into_inner().unwrap_or_else(|p| p.into_inner()));
         if !hidden { let _ = self.app.emit("typing", TypingEvt { thread: thread.into(), agent: agent.into(), on: false }); }
         if matches!(&res, Err(e) if e.contains("进程已退出")) { self.forget_sessions(Some(agent)); }
@@ -243,7 +248,7 @@ impl Core {
                     self.post_message(&thread, "system", &format!("Discord 发送失败：{e}"));
                 }
             }
-            Err(e) => self.post_message(&thread, "system", &format!("{agent} 出错：{e}")),
+            Err(e) => self.post_message(&thread, "system", &fail_line(&agent, &e)),
         }
     }
 
@@ -253,7 +258,7 @@ impl Core {
         tauri::async_runtime::spawn(async move {
             let Ok(rows) = core.db().list_agents() else { return };
             let groups = core.db().list_groups().unwrap_or_default();
-            let runs = rows.into_iter().filter(|r| only.as_ref().is_none_or(|o| o.contains(&r.name))).map(|r| {
+            let runs = rows.into_iter().filter(|r| r.transport != tailmsg::TRANSPORT).filter(|r| only.as_ref().is_none_or(|o| o.contains(&r.name))).map(|r| {
                 let core = core.clone();
                 let ctxs: Vec<String> = std::iter::once(format!("dm:{}", r.name))
                     .chain(groups.iter().filter(|g| g.members.contains(&r.name)).map(|g| format!("group:{}", g.id))).collect();
@@ -365,7 +370,7 @@ impl Core {
                             mentions(&answer, &g.members, Some(agent))
                         }
                         Err(e) => {
-                            self.post_message(thread, "system", &format!("{agent} 出错：{e}"));
+                            self.post_message(thread, "system", &fail_line(agent, &e));
                             Vec::new()
                         }
                     }
@@ -421,10 +426,12 @@ impl Core {
 fn mentions(text: &str, members: &[String], me: Option<&str>) -> Vec<String> {
     let lower = text.to_lowercase();
     let others = members.iter().filter(|m| Some(m.as_str()) != me);
-    if lower.contains("@all") || text.contains("@所有人") {
+    let is_name_char = |c: char| c.is_alphanumeric() || c == '-' || c == '_';
+    // `@all` as a word (so a member called `alloy` is not everyone).
+    let all = lower.match_indices("@all").any(|(i, _)| !lower[i + 4..].chars().next().is_some_and(is_name_char)) && !members.iter().any(|m| m.eq_ignore_ascii_case("all"));
+    if all || text.contains("@所有人") {
         return others.cloned().collect();
     }
-    let is_name_char = |c: char| c.is_alphanumeric() || c == '-' || c == '_';
     let mut hits: Vec<(usize, &String)> = others
         .filter_map(|m| {
             let needle = format!("@{}", m.to_lowercase());
@@ -435,6 +442,14 @@ fn mentions(text: &str, members: &[String], me: Option<&str>) -> Vec<String> {
         .collect();
     hits.sort_unstable_by_key(|(i, _)| *i);
     hits.into_iter().map(|(_, m)| m.clone()).collect()
+}
+
+/// Errors starting with this are notices, not failures ("sent, no reply yet").
+pub(crate) const QUIET: &str = "⏳";
+
+/// The system line for a failed turn.
+pub(crate) fn fail_line(agent: &str, e: &str) -> String {
+    match e.strip_prefix(QUIET) { Some(n) => format!("{agent} {n}"), None => format!("{agent} 出错：{e}") }
 }
 
 fn now() -> i64 {
@@ -700,6 +715,7 @@ async fn rename_agent(core: St<'_>, name: String, new_name: String) -> CmdResult
 /// Stop the reply an agent is giving in a thread.
 #[tauri::command]
 async fn stop_reply(core: St<'_>, thread: String, agent: String) -> CmdResult<bool> {
+    if core.agent(&agent)?.transport == tailmsg::TRANSPORT { return Ok(core.tm_cancel(&thread)); }
     Ok(core.hub.cancel(&agent, &thread).await)
 }
 
@@ -755,6 +771,60 @@ fn team_files(core: St<'_>, thread: String) -> Vec<(String, String)> { core.team
 
 #[tauri::command]
 fn inbox(core: St<'_>) -> Vec<inbox::Item> { core.inbox.list() }
+
+// ---------------------------------------------------------------- Yobiru / tailnet
+
+#[tauri::command]
+async fn tm_status(core: St<'_>) -> CmdResult<tailmsg::Status> {
+    let c = core.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || c.tm_status()).await.map_err(err)
+}
+
+/// Turn the Yobiru receiver on or off, and pick the agent that answers unaddressed messages.
+#[tauri::command]
+async fn tm_set(core: St<'_>, on: bool, default_agent: Option<String>) -> CmdResult<tailmsg::Status> {
+    if let Some(a) = default_agent.as_deref().filter(|a| !a.is_empty()) { core.agent(a)?; }
+    {
+        let db = core.db();
+        db.set_setting(tailmsg::SET_ON, if on { "1" } else { "" }).map_err(err)?;
+        db.set_setting(tailmsg::SET_DEFAULT, default_agent.as_deref().unwrap_or("")).map_err(err)?;
+    }
+    let _ = core.db().audit("me", None, "tailmsg.set", if on { "on" } else { "off" });
+    let c = core.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || { c.tm_apply(); c.tm_status() }).await.map_err(err)
+}
+
+/// Who may reach this Mac over the tailnet, and who may wake its agents.
+#[tauri::command]
+fn net_policy_set(core: St<'_>, policy: tailnet::Policy) -> CmdResult<tailnet::Policy> {
+    let p = policy.cleaned()?;
+    core.db().set_setting(tailnet::POLICY, &serde_json::to_string(&p).map_err(err)?).map_err(err)?;
+    let _ = core.db().audit("me", None, "tailnet.policy", &format!("{} allow={} deny={} wake={}", p.mode, p.allow.len(), p.deny.len(), p.wake_now.len()));
+    Ok(p)
+}
+
+#[tauri::command]
+async fn tm_discover(core: St<'_>) -> CmdResult<Vec<tailmsg::Found>> { Ok(core.tm_discover().await) }
+
+/// Add a Yobiru agent by its address, `machine/agent` (agent optional).
+#[tauri::command]
+async fn tm_add(core: St<'_>, addr: String, name: Option<String>) -> CmdResult<String> {
+    let addr = addr.trim().trim_start_matches("http://");
+    let (host, agent) = addr.split_once('/').map_or((addr, None), |(h, a)| (h, Some(a.trim()).filter(|a| !a.is_empty())));
+    if host.is_empty() { return Err("写一下对方的设备名，如 my-server/codex".into()); }
+    if agent.is_some_and(|a| !tailmsg::agent_name_ok(a)) { return Err("agent 名不能含 / 或空白开头结尾".into()); }
+    let h = host.to_owned();
+    let node = tauri::async_runtime::spawn_blocking(move || tailnet::resolve(&h)).await.map_err(err)??;
+    let (n, _) = core.tm_contact(&node.node, agent, name.as_deref())?;
+    let _ = core.db().audit("me", Some(&n), "tailmsg.add", &format!("{}/{}", node.node, agent.unwrap_or("")));
+    Ok(n)
+}
+
+/// The user hands a file to a chat (see `Core::share_file`).
+#[tauri::command]
+async fn send_file(core: St<'_>, thread: String, path: String, note: Option<String>) -> CmdResult<String> {
+    core.share_file(&thread, "me", &path, note.as_deref().unwrap_or("")).await
+}
 
 #[tauri::command]
 async fn inbox_answer(core: St<'_>, id: String, option_id: Option<String>, text: Option<String>) -> CmdResult<String> {
@@ -864,6 +934,19 @@ fn reveal_doc(core: St<'_>, thread: String) -> CmdResult<()> {
     Ok(())
 }
 
+/// Show a file Disco keeps (a received or shared file) in Finder. Only paths inside
+/// Disco's own data folder: a message's text must not be able to point anywhere else.
+#[tauri::command]
+fn reveal_path(core: St<'_>, path: String) -> CmdResult<()> {
+    let base = core.app.path().app_data_dir().map_err(err)?;
+    let p = std::path::PathBuf::from(path.trim());
+    if p.components().any(|c| matches!(c, std::path::Component::ParentDir)) || !p.starts_with(&base) || !p.exists() {
+        return Err("这个文件不在 Disco 的数据目录里，或已被删除".into());
+    }
+    std::process::Command::new("/usr/bin/open").arg("-R").arg(&p).spawn().map_err(err)?;
+    Ok(())
+}
+
 #[tauri::command]
 fn open_url(url: String) -> CmdResult<()> {
     if !(url.starts_with("https://discord.com/") || url.starts_with("https://github.com/Cosmoto-jian/")) {
@@ -905,6 +988,12 @@ async fn diagnose(core: St<'_>) -> CmdResult<Vec<Check>> {
                 None => add("主服务器", Err("还没选主服务器".into())),
             }
         }
+    }
+    let (me, tm) = { let c = core.inner().clone(); tauri::async_runtime::spawn_blocking(move || (tailnet::me(), c.tm_status())).await.map_err(err)? };
+    add("Tailscale", me.map(|n| format!("这台 Mac：{}", n.node)).ok_or("没检测到：共享 agent 和 Yobiru 互通需要先安装并登录 Tailscale".into()));
+    let tm = serde_json::to_value(&tm).unwrap_or_default();
+    if tm["on"].as_bool() == Some(true) {
+        add("Yobiru 接收端", tm["addr"].as_str().map(|a| format!("在 {a} 接收")).ok_or_else(|| tm["error"].as_str().unwrap_or("未启动").to_owned()));
     }
     let path = core.hub.user_path.clone();
     add("Node.js / npx", hub::which("npx", &path).map(|p| p.display().to_string()).ok_or("找不到 npx：Claude Code、Codex、pi 需要先安装 Node.js".into()));
@@ -1073,6 +1162,7 @@ pub fn run() {
                 inbox: Arc::default(),
                 teams: team::Teams::default(),
                 server: Mutex::default(),
+                tm: tailmsg::Tm::default(),
                 app: app.handle().clone(),
             });
             // Installs from before v0.4 kept only the Keychain entry.
@@ -1084,6 +1174,15 @@ pub fn run() {
             mcp::start(core.clone());
             core.warm(None);
             if !core.shares().is_empty() { core.serve_shares(); }
+            // Tailscale may come up after Disco: keep trying until the receiver runs.
+            let c = core.clone();
+            tauri::async_runtime::spawn(async move {
+                loop {
+                    let c2 = c.clone();
+                    let _ = tauri::async_runtime::spawn_blocking(move || c2.tm_apply()).await;
+                    tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                }
+            });
             app.manage(core);
             let handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
@@ -1096,8 +1195,8 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
-            overview, detect_agents, conda_envs, choose_path, memories, forget, add_agent, remove_agent, rename_agent, stop_reply, messages, send, inbox, inbox_answer, team_state, team_files, agent_configs, set_agent_config,
-            stop_all, resume, save_discord_token, discord_connect, discord_settings, discord_sync, diagnose, open_url, discord_channels, save_group, delete_group,
+            overview, detect_agents, conda_envs, choose_path, memories, forget, add_agent, remove_agent, rename_agent, stop_reply, messages, send, inbox, inbox_answer, tm_status, tm_set, net_policy_set, tm_discover, tm_add, send_file, team_state, team_files, agent_configs, set_agent_config,
+            stop_all, resume, save_discord_token, discord_connect, discord_settings, discord_sync, diagnose, open_url, reveal_path, discord_channels, save_group, delete_group,
             check_update, install_update, space, todo_new, todo_set, todo_remove, doc_save, reveal_doc, share::share_status, share::create_share, share::share_invite, share::revoke_share, share::accept_invite
         ])
         .run(tauri::generate_context!())
@@ -1122,5 +1221,7 @@ mod tests {
         let m2 = vec!["coder".to_string(), "coder-2".to_string(), "coder-3".to_string()];
         assert_eq!(mentions("@coder-2 和 @coder 分头做", &m2, None), ["coder-2", "coder"]);
         assert_eq!(mentions("@all 并行开工", &m2, Some("coder")), ["coder-2", "coder-3"]);
+        let m3 = vec!["alloy".to_string(), "coder".to_string()];
+        assert_eq!(mentions("@alloy 看下", &m3, None), ["alloy"]);
     }
 }

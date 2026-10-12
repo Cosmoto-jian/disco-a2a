@@ -146,13 +146,15 @@ fn tools() -> Value {
           "inputSchema": { "type": "object", "properties": { "content": { "type": "string" }, "mode": { "type": "string", "enum": ["append", "replace"] }, "group": group }, "required": ["content"] } },
         { "name": "remember", "description": "保存一条长期记忆，以后的新会话都会看到。scope：self 只给你自己（默认），group 给当前群的所有成员，all 给所有 agent。topic 是主题（如 code-style、user-prefs），同主题的记忆存在一起。只记持久的事实和偏好。",
           "inputSchema": { "type": "object", "properties": { "text": { "type": "string" }, "scope": { "type": "string", "enum": ["self", "group", "all"] }, "topic": { "type": "string" } }, "required": ["text"] } },
+        { "name": "send_file", "description": "把一个文件交给别人：to 填 Yobiru 联系人（其他设备上的 agent）时，经 Tailscale 发过去，对方会校验大小和 SHA-256（需要用户同意）；不填 to 时放进当前群或私聊的共享空间，并在会话里贴出路径，群成员都能读到。",
+          "inputSchema": { "type": "object", "properties": { "path": { "type": "string", "description": "文件的绝对路径" }, "to": { "type": "string", "description": "Yobiru 联系人的名字（可选）" }, "note": { "type": "string", "description": "附言（可选）" }, "group": group }, "required": ["path"] } },
         { "name": "memory_read", "description": "读长期记忆：不给 topic 时返回该层的索引（MEMORY.md），给 topic 返回该主题的全部记忆。",
           "inputSchema": { "type": "object", "properties": { "scope": { "type": "string", "enum": ["self", "group", "all"] }, "topic": { "type": "string" } } } },
     ])
 }
 
 /// Where a session lives.
-enum Place { Dm, Group(GroupRow), Ask, Elsewhere }
+enum Place { Dm, Group(GroupRow), Ask, Yobiru(String), Elsewhere }
 
 struct Call<'a> { core: &'a Arc<Core>, agent: &'a str, context: &'a str }
 
@@ -168,6 +170,7 @@ impl Call<'_> {
     fn place(&self) -> Place {
         if self.context == format!("dm:{}", self.agent) { return Place::Dm; }
         if self.context.starts_with("ask:") { return Place::Ask; }
+        if let Some(rest) = self.context.strip_prefix("tm:") { return Place::Yobiru(rest.split('|').next().unwrap_or(rest).to_owned()); }
         // Team sessions (`team:group:<id>:<agent>`) live in their group too.
         let ctx = self.context.strip_prefix("team:").unwrap_or(self.context);
         if let Some(rest) = ctx.strip_prefix("group:")
@@ -203,6 +206,11 @@ impl Call<'_> {
         if self.context.starts_with("peer:") {
             return Err("这是朋友通过共享访问的会话，Disco 工具在这里不可用".into());
         }
+        // Text from another device is information, not the user's word: it may not
+        // change what the user's other agents see or remember.
+        if matches!(self.place(), Place::Yobiru(_)) && matches!(name, "post" | "doc_write" | "remember" | "todo_add") {
+            return Err("处理其他设备发来的消息时不能用这个工具（防止外部内容改动你的群、文档和记忆）。需要时先用 ask_user 问用户。".into());
+        }
         if name != "overview" && self.core.paused.load(std::sync::atomic::Ordering::Relaxed) {
             return Err("用户已全部停止，暂不执行".into());
         }
@@ -221,6 +229,19 @@ impl Call<'_> {
                 let (scope, label) = self.mem_scope(args)?;
                 self.core.remember_topic(&scope, s(args, "topic"), text);
                 Ok(format!("已记住（{label}）"))
+            }
+            "send_file" => {
+                let path = s(args, "path").ok_or("path 不能为空")?;
+                let thread = match s(args, "to") {
+                    Some(to) => {
+                        let to = to.trim_start_matches('@');
+                        let row = self.core.agent(to)?;
+                        if row.transport != crate::tailmsg::TRANSPORT { return Err(format!("{to} 不是 Yobiru 联系人；给本机 agent 的文件请不填 to，放进共享空间")); }
+                        format!("dm:{to}")
+                    }
+                    None => self.space(args)?.0,
+                };
+                self.core.share_file(&thread, self.agent, path, s(args, "note").unwrap_or("")).await
             }
             "memory_read" => {
                 let (scope, _) = self.mem_scope(args)?;
@@ -246,6 +267,7 @@ impl Call<'_> {
             Place::Dm => "和用户的私聊".to_owned(),
             Place::Group(g) => format!("群「{}」（id {}，成员 {}）", g.name, g.id, g.members.join("、")),
             Place::Ask => "另一个 agent 通过 ask 向你请教（你的回答会直接交给它）".to_owned(),
+            Place::Yobiru(c) => format!("回复 Yobiru 联系人 {c}（另一台设备上的 agent）；你的回答会自动发回给它"),
             Place::Elsewhere => "未知".to_owned(),
         });
         o.push_str("\n\n你所在的群：\n");
@@ -310,7 +332,7 @@ impl Call<'_> {
         let options: Vec<String> = args.get("options").and_then(Value::as_array).map(|a| a.iter()
             .filter_map(|v| v.as_str().map(str::trim).filter(|v| !v.is_empty()).map(str::to_owned)).take(10).collect()).unwrap_or_default();
         let text = args.get("allow_text").and_then(Value::as_bool).unwrap_or(options.is_empty());
-        let thread = match self.place() { Place::Group(g) => format!("group:{}", g.id), _ => format!("dm:{}", self.agent) };
+        let thread = match self.place() { Place::Group(g) => format!("group:{}", g.id), Place::Yobiru(c) => format!("dm:{c}"), _ => format!("dm:{}", self.agent) };
         self.core.post_message(&thread, self.agent, &format!("❓ {question}"));
         let rx = self.core.inbox_question(&thread, self.agent, question, options, text);
         match tokio::time::timeout(ASK_USER_WAIT, rx).await {

@@ -6,7 +6,7 @@
 //! loopback and Tailscale peers may connect, only the two "send message" methods
 //! are accepted, and tool permissions are decided on the owner's machine.
 use std::collections::HashMap;
-use std::net::{IpAddr, SocketAddr};
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 use a2a::event::StreamResponse;
@@ -23,11 +23,12 @@ use futures::stream::{self, BoxStream};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
-use crate::{CmdResult, Core, St, err, secret_del, secret_get, secret_set};
+use crate::{CmdResult, Core, St, err, secret_del, secret_get, secret_set, tailnet};
 
 pub const SHARE: &str = "share/";
 const PORTS: std::ops::RangeInclusive<u16> = 7480..=7489;
 const SHARE_HEADER: &str = "x-disco-share";
+const PEER_HEADER: &str = "x-disco-peer";
 const INVITE_PREFIX: &str = "disco1:";
 
 /// What a share allows. Stored as JSON in settings under `share/<id>`.
@@ -124,12 +125,13 @@ impl Core {
             let s = self.server.lock().unwrap_or_else(|p| p.into_inner());
             s.port.ok_or_else(|| s.error.clone().unwrap_or_else(|| "共享服务未启动".into()))?
         };
-        Ok(format!("http://{}:{port}", tailscale_host().ok_or("没检测到 Tailscale：请先安装 Tailscale 并登录，再回来生成邀请")?))
+        let me = crate::tailnet::me().ok_or("没检测到 Tailscale：请先安装 Tailscale 并登录，再回来生成邀请")?;
+        Ok(format!("http://{}:{port}", me.node))
     }
 
     /// Run one guest message as a turn of the shared agent. The owner sees it live
     /// in the `peer:<id>` thread, where permission prompts also appear.
-    async fn peer_turn(&self, id: &str, guest_ctx: &str, text: &str, out: mpsc::UnboundedSender<AgentEvent>) -> Result<String, String> {
+    async fn peer_turn(&self, id: &str, device: &str, guest_ctx: &str, text: &str, out: mpsc::UnboundedSender<AgentEvent>) -> Result<String, String> {
         let share = self.share(id).ok_or("这个共享已被撤销")?;
         let used = self.used_today(id);
         if share.limit > 0 && used >= share.limit {
@@ -157,39 +159,12 @@ impl Core {
             let _ = out.send(ev.clone());
             true
         }).await;
-        let _ = self.db().audit(&format!("peer:{}", share.guest), Some(&share.agent), "peer_prompt", if res.is_ok() { "ok" } else { "error" });
+        let _ = self.db().audit(&format!("peer:{}@{device}", share.guest), Some(&share.agent), "peer_prompt", if res.is_ok() { "ok" } else { "error" });
         match &res {
             Ok(a) => self.post_message(&thread, &share.agent, a.trim()),
-            Err(e) => self.post_message(&thread, "system", &format!("{} 出错：{e}", share.agent)),
+            Err(e) => self.post_message(&thread, "system", &crate::fail_line(&share.agent, e)),
         }
         res
-    }
-}
-
-/// This Mac's Tailscale name (MagicDNS) or IPv4 address.
-fn tailscale_host() -> Option<String> {
-    let cli = ["/Applications/Tailscale.app/Contents/MacOS/Tailscale", "/opt/homebrew/bin/tailscale", "/usr/local/bin/tailscale", "tailscale"];
-    for c in cli {
-        let Ok(o) = std::process::Command::new(c).args(["status", "--json"]).output() else { continue };
-        if !o.status.success() { continue; }
-        let Ok(v) = serde_json::from_slice::<serde_json::Value>(&o.stdout) else { continue };
-        if let Some(dns) = v["Self"]["DNSName"].as_str().map(|s| s.trim_end_matches('.')).filter(|s| !s.is_empty()) {
-            return Some(dns.to_owned());
-        }
-        if let Some(ip) = v["Self"]["TailscaleIPs"].as_array().and_then(|a| a.iter().filter_map(|x| x.as_str()).find(|s| s.contains('.'))) {
-            return Some(ip.to_owned());
-        }
-    }
-    // The CLI may be missing (App Store build): find a 100.64/10 address on an interface.
-    let o = std::process::Command::new("ifconfig").output().ok()?;
-    String::from_utf8_lossy(&o.stdout).split_whitespace().collect::<Vec<_>>().windows(2)
-        .find_map(|w| (w[0] == "inet" && w[1].parse::<IpAddr>().is_ok_and(|ip| is_tailnet(&ip))).then(|| w[1].to_owned()))
-}
-
-pub fn is_tailnet(ip: &IpAddr) -> bool {
-    match ip {
-        IpAddr::V4(v) => { let o = v.octets(); o[0] == 100 && (64..128).contains(&o[1]) }
-        IpAddr::V6(v) => v.segments()[..3] == [0xfd7a, 0x115c, 0xa1e0] || v.to_ipv4_mapped().is_some_and(|m| is_tailnet(&IpAddr::V4(m))),
     }
 }
 
@@ -208,9 +183,24 @@ fn router(core: Arc<Core>) -> axum::Router {
 
 fn deny(code: StatusCode, msg: &str) -> Response { (code, msg.to_owned()).into_response() }
 
-/// Tailnet/loopback only; per-share bearer token; only message methods.
+/// Tailnet/loopback only; the device must pass the access policy (when Tailscale
+/// can say who it is); per-share bearer token; only message methods.
 async fn guard(State(core): State<Arc<Core>>, ConnectInfo(peer): ConnectInfo<SocketAddr>, req: Request, next: Next) -> Response {
-    if !(peer.ip().is_loopback() || is_tailnet(&peer.ip())) { return deny(StatusCode::FORBIDDEN, "tailnet only"); }
+    let ip = peer.ip().to_canonical();
+    if !(ip.is_loopback() || tailnet::is_tailnet(&ip)) { return deny(StatusCode::FORBIDDEN, "tailnet only"); }
+    let mut who = String::from("local");
+    if !ip.is_loopback() {
+        let policy = core.net_policy();
+        match tauri::async_runtime::spawn_blocking(move || tailnet::whois(&ip)).await.ok().flatten() {
+            Some(id) => {
+                if let Err(e) = policy.admit(&id) { return deny(StatusCode::FORBIDDEN, e); }
+                who = id.node;
+            }
+            // Without the CLI we can't name the device: a restrictive policy then fails closed.
+            None if policy.mode == "allowlist" || !policy.deny.is_empty() => return deny(StatusCode::FORBIDDEN, "无法确认 Tailscale 身份"),
+            None => who = ip.to_string(),
+        }
+    }
     let path = req.uri().path().to_owned();
     let Some(rest) = path.strip_prefix("/a/") else { return deny(StatusCode::NOT_FOUND, "not found") };
     let (id, tail) = rest.split_once('/').unwrap_or((rest, ""));
@@ -227,6 +217,7 @@ async fn guard(State(core): State<Arc<Core>>, ConnectInfo(peer): ConnectInfo<Soc
         return deny(StatusCode::FORBIDDEN, "method not allowed");
     }
     parts.headers.insert(SHARE_HEADER, HeaderValue::from_str(&id).unwrap_or(HeaderValue::from_static("")));
+    parts.headers.insert(PEER_HEADER, HeaderValue::from_str(&who).unwrap_or(HeaderValue::from_static("")));
     next.run(Request::from_parts(parts, Body::from(bytes))).await
 }
 
@@ -260,6 +251,7 @@ fn status(task_id: &TaskId, context_id: &str, state: TaskState, message: Option<
 impl AgentExecutor for PeerExec {
     fn execute(&self, ctx: ExecutorContext) -> BoxStream<'static, Result<StreamResponse, A2AError>> {
         let id = ctx.service_params.get(SHARE_HEADER).and_then(|v| v.first()).cloned().unwrap_or_default();
+        let device = ctx.service_params.get(PEER_HEADER).and_then(|v| v.first()).cloned().unwrap_or_default();
         let text: String = ctx.message.as_ref().map(|m| m.parts.iter().filter_map(|p| match &p.content {
             PartContent::Text(t) => Some(t.as_str()),
             _ => None,
@@ -285,7 +277,7 @@ impl AgentExecutor for PeerExec {
                     }
                 }
             });
-            let res = core.peer_turn(&id, &context_id, &text, etx).await;
+            let res = core.peer_turn(&id, &device, &context_id, &text, etx).await;
             let _ = fwd.await;
             let _ = tx.send(Ok(match res {
                 Ok(_) => status(&task_id, &context_id, TaskState::Completed, None),
@@ -390,13 +382,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn b64_roundtrip_and_tailnet() {
+    fn b64_roundtrip() {
         for s in ["", "a", "ab", "abc", "abcd", "{\"url\":\"http://x.ts.net:7480/a/1\"}"] {
             assert_eq!(unb64(&b64(s.as_bytes())).unwrap(), s.as_bytes());
         }
-        assert!(is_tailnet(&"100.101.2.3".parse().unwrap()));
-        assert!(!is_tailnet(&"100.128.0.1".parse().unwrap()));
-        assert!(!is_tailnet(&"192.168.1.2".parse().unwrap()));
-        assert!(is_tailnet(&"fd7a:115c:a1e0::1".parse().unwrap()));
     }
 }

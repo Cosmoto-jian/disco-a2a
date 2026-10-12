@@ -362,3 +362,32 @@ dialog[open]::backdrop { animation:fade .2s var(--ease); }
 #space .bseg { display:flex; gap:4px; flex-wrap:wrap; }
 #space .bseg button { border:0; border-radius:8px; padding:4px 10px; background:var(--hover); color:var(--fg); font:inherit; font-size:12px; }
 #space .bseg button.on { background:var(--acc); color:#fff; }
+
+/* ---- v1.0: files, Yobiru, network settings */
+.attach { width:30px; height:30px; flex:none; border:0; border-radius:50%; background:none; color:var(--mute); display:grid; place-items:center; margin-left:-6px; transition:background .15s, color .15s; }
+.attach:hover { background:var(--hover); color:var(--fg); }
+.attach svg { width:17px; height:17px; fill:none; stroke:currentColor; stroke-width:1.8; stroke-linecap:round; stroke-linejoin:round; }
+.b a.path { color:inherit; opacity:.75; font:11.5px/1.4 ui-monospace, Menlo, monospace; word-break:break-all; text-decoration:underline dotted; cursor:pointer; }
+.m.me .b a.path { color:var(--me-fg); }
+.code-row code.wrap, .aform.yobiru .code-row code { white-space:normal; overflow:visible; -webkit-user-select:text; user-select:text; }
+.aform.yobiru .muted3 { margin-top:4px; }
+.found { display:flex; flex-direction:column; gap:8px; }
+.frow.node > span { width:auto; min-width:64px; max-width:160px; overflow:hidden; text-overflow:ellipsis; color:var(--fg); font-weight:500; }
+.choice { border:1px solid var(--line); background:var(--list); max-width:320px; }
+.choice .chev { width:7px; height:7px; border-right:1.5px solid var(--mute); border-bottom:1.5px solid var(--mute); transform:rotate(45deg) translateY(-2px); flex:none; }
+.mute2 { margin:0 0 12px; color:var(--mute); font-size:12.5px; }
+.nrow { display:flex; align-items:center; gap:10px; flex-wrap:wrap; margin:10px 0; }
+.nrow[hidden] { display:none; }
+.nrow > span:first-child { width:56px; flex:none; color:var(--mute); font-size:12px; }
+.nrow > .seg { flex:1; }
+.nrow small { color:var(--mute); font-size:11.5px; }
+.fld.rules { flex:1; height:auto; min-height:52px; border:1px solid var(--line); border-radius:8px; padding:6px 10px; background:var(--list); color:var(--fg); font:12px/1.5 ui-monospace, Menlo, monospace; resize:vertical; }
+.fld.t { flex:none; min-width:0; width:auto; height:30px; border:1px solid var(--line); border-radius:8px; padding:0 8px; background:var(--list); color:var(--fg); font:inherit; }
+input[type=number].fld.t { width:64px; }
+.switch { position:relative; width:38px; height:22px; flex:none; border:0; border-radius:11px; background:var(--line); padding:0; cursor:pointer; transition:background .2s; }
+.switch i { position:absolute; top:2px; left:2px; width:18px; height:18px; border-radius:50%; background:#fff; box-shadow:0 1px 3px rgba(0,0,0,.25); transition:transform .22s cubic-bezier(.3,1.4,.6,1); }
+.switch.on { background:var(--green); }
+.switch.on i { transform:translateX(16px); }
+.switch:disabled { opacity:.6; }
+@media (prefers-reduced-motion: reduce) { .switch i, .attach { transition:none; } }
+.found .linkish { align-self:flex-start; font-size:12px; }

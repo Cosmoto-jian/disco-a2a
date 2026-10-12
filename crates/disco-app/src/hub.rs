@@ -285,7 +285,10 @@ fn ensure_worktree(dir: &std::path::Path, name: &str, path: &str) -> Option<Path
     if !wt.exists() {
         let branch = format!("disco/{name}");
         let wt_s = wt.to_string_lossy().into_owned();
-        git(&["worktree", "add", "-B", &branch, &wt_s], &top)?;
+        // Reuse an existing branch as is: `-B` would reset it and drop the agent's earlier commits.
+        let exists = git(&["rev-parse", "--verify", "--quiet", &format!("refs/heads/{branch}")], &top).is_some();
+        if exists { git(&["worktree", "prune"], &top); git(&["worktree", "add", &wt_s, &branch], &top)?; }
+        else { git(&["worktree", "add", "-b", &branch, &wt_s], &top)?; }
         // Keep the worktrees out of the user's `git status`.
         let exclude = top.join(".git/info/exclude");
         let cur = std::fs::read_to_string(&exclude).unwrap_or_default();
