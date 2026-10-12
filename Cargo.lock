@@ -1039,6 +1039,10 @@ dependencies = [
 name = "disco-app"
 version = "0.0.1"
 dependencies = [
+ "a2a-lf",
+ "a2a-server-lf",
+ "axum",
+ "chrono",
  "disco-a2a",
  "disco-acp",
  "disco-discord",

@@ -26,6 +26,10 @@ serde_json.workspace = true
 tokio.workspace = true
 futures.workspace = true
 uuid.workspace = true
+a2a.workspace = true
+a2a-server.workspace = true
+axum.workspace = true
+chrono.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
 keyring = { version = "3", features = ["apple-native"] }

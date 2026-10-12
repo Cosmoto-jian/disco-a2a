@@ -220,3 +220,23 @@ dialog::backdrop { background:rgba(0,0,0,.28); }
 .mi .av, .mi-all { width:22px; height:22px; font-size:11px; flex:none; }
 .mi-all { display:inline-grid; place-items:center; border-radius:6px; background:var(--acc); color:#fff; font-weight:700; }
 .err:empty { display:none; }
+
+/* sharing */
+.peer-note { padding:14px 20px; border-top:1px solid var(--line); color:var(--mute); font-size:12px; text-align:center; }
+.seg { display:grid; grid-template-columns:1fr 1fr; gap:8px; }
+.seg button { display:flex; flex-direction:column; align-items:flex-start; gap:2px; padding:9px 11px; border:1px solid var(--line); border-radius:10px; background:var(--list); color:var(--fg); font:inherit; text-align:left; cursor:pointer; }
+.seg button small { color:var(--mute); font-size:11px; }
+.seg button.on { border-color:var(--acc); box-shadow:0 0 0 1px var(--acc) inset; }
+.warn { padding:8px 10px; border-radius:8px; background:rgba(245,158,11,.12); color:var(--fg); font-size:12px; }
+.linkish { border:0; background:none; color:var(--acc); padding:0; font:inherit; cursor:pointer; text-decoration:underline; }
+.invite { display:flex; flex-direction:column; gap:6px; }
+.code-row { display:flex; gap:8px; align-items:center; }
+.code-row code { flex:1; min-width:0; padding:8px 10px; border-radius:8px; background:var(--list); font:11px/1.4 ui-monospace, Menlo, monospace; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.muted3 { color:var(--mute); font-size:12px; }
+.share-list { display:flex; flex-direction:column; gap:6px; }
+.share-row { display:flex; align-items:center; gap:8px; padding:8px 10px; border-radius:10px; background:var(--list); }
+.share-row .grow { flex:1; display:flex; flex-direction:column; gap:2px; }
+.share-row small { color:var(--mute); font-size:11px; }
+.btn.sm { height:26px; padding:0 10px; font-size:12px; }
+.share-row .btn.danger { color:var(--red); margin-right:0; background:var(--main); }
+.fld.code { font:11px/1.4 ui-monospace, Menlo, monospace; resize:vertical; min-height:56px; padding:8px 10px; }

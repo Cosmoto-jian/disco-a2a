@@ -79,7 +79,10 @@ async function load() {
   $("#paused-bar").hidden = !S.ov.paused;
   renderList();
 }
-const threadName = (t) => t.startsWith("dm:") ? t.slice(3) : (S.ov.groups.find((g) => `group:${g.id}` === t)?.name ?? "群聊");
+const peerOf = (t) => S.ov.peers.find((p) => p.thread === t);
+const threadName = (t) => t.startsWith("dm:") ? t.slice(3)
+  : t.startsWith("peer:") ? (peerOf(t) ? `${peerOf(t).guest} → ${peerOf(t).agent}` : "共享")
+  : (S.ov.groups.find((g) => `group:${g.id}` === t)?.name ?? "群聊");
 
 // ---------- list column
 function renderList() {
@@ -89,7 +92,8 @@ function renderList() {
   const heads = Object.fromEntries(S.ov.heads.map((x) => [x.thread, x]));
   let rows = [];
   if (S.tab === "chats") {
-    const threads = [...S.ov.agents.map((a) => `dm:${a.name}`), ...S.ov.groups.map((g) => `group:${g.id}`)];
+    const threads = [...S.ov.agents.map((a) => `dm:${a.name}`), ...S.ov.groups.map((g) => `group:${g.id}`),
+      ...S.ov.peers.map((p) => p.thread).filter((t) => heads[t])];
     rows = threads.map((t) => ({ t, head: heads[t] })).sort((a, b) => (b.head?.ts ?? 0) - (a.head?.ts ?? 0))
       .map(({ t, head }) => threadRow(t, head));
   } else if (S.tab === "groups") {
@@ -122,9 +126,10 @@ function threadRow(t, head, fallback) {
 async function openThread(t) {
   S.thread = t; renderList();
   const isGroup = t.startsWith("group:"); const name = threadName(t);
+  const peer = peerOf(t);
   const g = isGroup && S.ov.groups.find((g) => `group:${g.id}` === t);
   const a = !isGroup && S.ov.agents.find((a) => a.name === name);
-  const sub = isGroup ? `${g.members.length} 个 agent · 组长 ${g.lead ?? "—"} · Discord 同步` : a ? `${a.kind.toUpperCase()} · ${a.detail}` : "";
+  const sub = isGroup ? `${g.members.length} 个 agent · 组长 ${g.lead ?? "—"} · Discord 同步` : peer ? `${peer.guest} 通过共享在用你的 ${peer.agent}` : a ? `${a.kind.toUpperCase()} · ${a.detail}` : "";
   const pane = $("#pane");
   pane.replaceChildren(
     h("div", { class: "head", "data-tauri-drag-region": true }, avatar(name, { group: isGroup }),
@@ -133,10 +138,10 @@ async function openThread(t) {
       isGroup ? h("button", { class: "btn", onclick: () => groupDialog(g) }, "成员") : null,
       a ? h("button", { class: "icon-btn", title: "更多", onclick: (e) => agentMenu(e.currentTarget, a.name) }, "⋯") : null),
     h("div", { id: "log" }),
-    h("div", { id: "composer" },
+    peer ? h("div", { class: "peer-note" }, "这是对方的会话，你只能旁观。需要你批准的操作会在这里弹出。") : h("div", { id: "composer" },
       h("textarea", { id: "input", rows: 1, placeholder: isGroup ? "发到群里：@名字 指定 agent，同时 @ 多个或 @all 并行执行" : `给 ${name} 发消息` }),
       h("div", { class: "hint" }, "↩ 发送 · ⇧↩ 换行")));
-  const ta = $("#input");
+  const ta = $("#input") ?? h("textarea");
   ta.addEventListener("input", () => { ta.style.height = "auto"; ta.style.height = ta.scrollHeight + "px"; });
   const mention = isGroup ? mentionPicker(ta, () => g.members) : null;
   ta.addEventListener("keydown", (e) => {
@@ -192,7 +197,9 @@ function popover(anchor, items) {
   addEventListener("mousedown", out, true); addEventListener("keydown", esc, true);
 }
 function agentMenu(anchor, name) {
+  const local = S.ov.agents.find((a) => a.name === name)?.kind !== "a2a";
   popover(anchor, [
+    ...(local ? [{ label: "共享给朋友…", run: () => shareDialog(name) }] : []),
     { label: "重命名…", run: () => renameAgent(name) },
     { label: "删除 Agent…", danger: true, run: () => removeAgent(name) },
   ]);
@@ -360,6 +367,7 @@ async function renderGallery() {
   const list = h("div", { class: "alist" },
     ...have.map((t) => agentRow({ ...t, kind: "acp" }, shortPath(t.found))),
     agentRow({ id: "command", name: "其他本地 agent", kind: "command", color: "#8a8a8e", letter: "›" }, "任意支持 ACP 的程序"),
+    agentRow({ id: "invite", name: "朋友的邀请码", kind: "invite", color: "#10a37f", letter: "@" }, "接入别人通过 Disco 共享的 agent"),
     agentRow({ id: "a2a", name: "远程 A2A agent", kind: "a2a", color: "#5865f2", letter: "A" }, "通过 URL 接入"));
   page.replaceChildren(h("h1", {}, "添加 Agent"),
     h("p", {}, have.length ? `在这台 Mac 上找到 ${have.length} 个，点一下就能导入。` : "没在这台 Mac 上找到已安装的 agent，可以手动添加。"),
@@ -380,7 +388,23 @@ function agentRow(t, sub) {
   row.append(head);
   return row;
 }
+function inviteForm() {
+  const err = h("div", { class: "err" });
+  const code = h("textarea", { class: "fld code", rows: 3, placeholder: "粘贴 disco1: 开头的邀请码", spellcheck: false });
+  const name = h("input", { class: "fld", placeholder: "名称（可选，默认 agent-主人）", spellcheck: false });
+  const go = h("button", { type: "button", class: "btn pri" }, "添加");
+  go.onclick = async () => {
+    go.disabled = true; err.textContent = "";
+    try {
+      const n = await invoke("accept_invite", { code: code.value, name: name.value || null });
+      await load(); setTab("chats"); openThread(`dm:${n}`);
+    } catch (e) { err.textContent = String(e); go.disabled = false; }
+  };
+  return h("div", { class: "aform" }, h("div", { class: "frow" }, h("span", {}, "邀请码"), code), h("div", { class: "frow" }, h("span", {}, "名称"), name),
+    h("p", { class: "hint2" }, "双方都要登录同一个 Tailscale 网络（或对方把你加为共享设备）。"), h("div", { class: "factions" }, err, go));
+}
 function agentForm(t) {
+  if (t.kind === "invite") return inviteForm();
   const st = { cwd: "", conda: "", count: 1 };
   const err = h("div", { class: "err" });
   const name = h("input", { class: "fld", value: t.kind === "acp" ? t.id : "", placeholder: "名称，如 coder", spellcheck: false });
@@ -426,6 +450,59 @@ function agentForm(t) {
   };
   return h("div", { class: "aform" }, ...parts, h("div", { class: "factions" }, err, go));
 }
+// ---------- sharing over Tailscale
+async function copyText(text, btn) {
+  try { await navigator.clipboard.writeText(text); if (btn) { btn.textContent = "已复制"; setTimeout(() => { btn.textContent = "复制"; }, 1200); } }
+  catch { toast("复制失败，请手动选中复制"); }
+}
+async function shareDialog(agent) {
+  const d = $("#dlg"), form = $("#dlg-form");
+  const st = await invoke("share_status").catch((e) => ({ problem: String(e), shares: [] }));
+  const mine = st.shares.filter((s) => s.agent === agent);
+  const guest = h("input", { placeholder: "对方的名字，如 小王", maxlength: 24 });
+  const st2 = { mode: "chat" };
+  const modes = h("div", { class: "seg" });
+  const drawModes = () => modes.replaceChildren(...[["chat", "只聊天", "需要批准的操作一律拒绝"], ["ask", "需要时问我", "由你在这台 Mac 上批准"]]
+    .map(([v, t, sub]) => h("button", { type: "button", class: st2.mode === v ? "on" : "", onclick: () => { st2.mode = v; drawModes(); } }, h("b", {}, t), h("small", {}, sub))));
+  drawModes();
+  const limit = h("input", { type: "number", min: 0, max: 10000, value: 50 });
+  const err = h("div", { class: "err" });
+  const out = h("div", { class: "invite", hidden: true });
+  const go = h("button", { class: "btn pri", type: "submit" }, "生成邀请码");
+  const list = h("div", { class: "share-list" }, ...mine.map((s) => shareRow(s, () => shareDialog(agent))));
+  form.replaceChildren(...[
+    h("div", { class: "del-head" }, avatar(agent), h("div", {}, h("h3", {}, `共享 ${agent}`),
+      h("p", { class: "del-sub" }, "通过 Tailscale 私有网络共享，只有拿到邀请码的人能用，随时可以撤销。"))),
+    st.problem ? h("div", { class: "warn" }, st.problem, " ", h("button", { type: "button", class: "linkish", onclick: () => invoke("open_url", { url: "https://tailscale.com/download/mac" }) }, "下载 Tailscale")) : null,
+    h("label", {}, "共享给", guest),
+    h("label", {}, "权限", modes),
+    h("label", {}, "每天最多几条消息（0 = 不限）", limit),
+    err, out,
+    mine.length ? h("div", { class: "muted3" }, "已共享") : null, list,
+    h("div", { class: "actions" }, h("button", { class: "btn", type: "button", onclick: () => d.close() }, "关闭"), go)].filter(Boolean));
+  form.onsubmit = async (e) => {
+    e.preventDefault(); err.textContent = ""; go.disabled = true;
+    try {
+      const code = await invoke("create_share", { agent, guest: guest.value, mode: st2.mode, limit: Number(limit.value) || 0 });
+      const cp = h("button", { type: "button", class: "btn", onclick: () => copyText(code, cp) }, "复制");
+      out.hidden = false;
+      out.replaceChildren(h("div", { class: "muted3" }, "把这串邀请码发给对方，让他在 Disco「添加 Agent → 朋友的邀请码」里粘贴。"),
+        h("div", { class: "code-row" }, h("code", {}, code), cp));
+      copyText(code); await load();
+    } catch (e2) { err.textContent = String(e2); }
+    go.disabled = false;
+  };
+  if (!d.open) d.showModal();
+  guest.focus();
+}
+function shareRow(s, after) {
+  const cp = h("button", { type: "button", class: "btn sm" }, "复制邀请");
+  cp.onclick = async () => { try { copyText(await invoke("share_invite", { id: s.id }), null); cp.textContent = "已复制"; } catch (e) { toast(e); } };
+  return h("div", { class: "share-row" },
+    h("div", { class: "grow" }, h("b", {}, s.guest), h("small", {}, `${s.mode === "ask" ? "需要时问我" : "只聊天"} · 今天 ${s.used_today}${s.limit ? "/" + s.limit : ""} 条`)),
+    cp, h("button", { type: "button", class: "btn sm danger", onclick: async () => { await invoke("revoke_share", { id: s.id }); toast(`已撤销 ${s.guest} 的访问`); await load(); after(); } }, "撤销"));
+}
+
 async function removeAgent(name) {
   const d = $("#dlg"), form = $("#dlg-form");
   const purge = h("input", { type: "checkbox" }); purge.checked = true;

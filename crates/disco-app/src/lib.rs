@@ -3,6 +3,7 @@
 #![forbid(unsafe_code)]
 
 mod hub;
+mod share;
 mod templates;
 
 use std::collections::HashMap;
@@ -120,6 +121,8 @@ pub struct Core {
     /// `agent|thread` -> id of the newest group message that agent's session has seen,
     /// so later turns send only what is new instead of the whole transcript again.
     seen: Mutex<HashMap<String, i64>>,
+    /// The Tailscale share server (see share.rs).
+    server: Mutex<share::Server>,
     app: AppHandle,
 }
 
@@ -150,6 +153,12 @@ impl Core {
 
     /// One agent turn: prompt, stream to the UI, return the answer.
     async fn turn(&self, thread: &str, agent: &str, context: &str, prompt: &str) -> CmdResult<String> {
+        self.turn_with(thread, agent, context, prompt, |_| true).await
+    }
+
+    /// Like `turn`, with `tap` seeing every event first; it returns false to keep
+    /// an event away from the UI.
+    async fn turn_with(&self, thread: &str, agent: &str, context: &str, prompt: &str, tap: impl Fn(&AgentEvent) -> bool + Send + Sync + 'static) -> CmdResult<String> {
         if self.paused.load(Ordering::Relaxed) {
             return Err("已全部停止".into());
         }
@@ -163,6 +172,7 @@ impl Core {
         let res = self
             .hub
             .ask(&row, &secret_get, context, prompt, move |ev| {
+                if !tap(ev) { return; }
                 let _ = app.emit("stream", StreamEvt { thread: t.clone(), agent: a.clone(), event: ev.clone() });
             })
             .await;
@@ -446,7 +456,10 @@ struct GroupView { id: String, name: String, guild_id: String, lead: Option<Stri
 #[derive(Serialize)]
 struct Head { thread: String, author: String, body: String, ts: i64 }
 #[derive(Serialize)]
+struct PeerView { thread: String, guest: String, agent: String }
+#[derive(Serialize)]
 struct Overview {
+    peers: Vec<PeerView>,
     agents: Vec<AgentView>,
     groups: Vec<GroupView>,
     heads: Vec<Head>,
@@ -473,7 +486,9 @@ async fn overview(core: St<'_>) -> CmdResult<Overview> {
         let template = if a.transport == "a2a" { "a2a".into() } else { spec.template };
         agents.push(AgentView { live: core.hub.is_live(&a.name).await, name: a.name, kind: a.transport, template, detail });
     }
+    let peers = core.shares().into_iter().map(|(id, s)| PeerView { thread: format!("peer:{id}"), guest: s.guest, agent: s.agent }).collect();
     Ok(Overview {
+        peers,
         agents,
         groups: groups.into_iter().map(|g| GroupView { id: g.id, name: g.name, guild_id: g.guild_id, lead: g.lead_agent, members: g.members }).collect(),
         heads: heads.into_iter().map(|(t, m)| Head { thread: t, author: m.author, body: m.body, ts: m.ts }).collect(),
@@ -547,7 +562,7 @@ fn valid_name(name: &str) -> CmdResult<String> {
 
 #[derive(serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct NewAgent {
+pub(crate) struct NewAgent {
     template: String,
     name: String,
     url: Option<String>,
@@ -577,7 +592,15 @@ async fn add_agent(core: St<'_>, spec: NewAgent) -> CmdResult<Vec<String>> {
     Ok(names)
 }
 
-async fn add_agent_rows(core: &Core, spec: NewAgent) -> CmdResult<Vec<String>> {
+impl NewAgent {
+    /// A remote A2A agent behind a bearer token (Disco invites).
+    pub(crate) fn remote(name: String, url: String, token: String) -> Self {
+        Self { template: "a2a".into(), name, url: Some(url), header_name: Some("authorization".into()), header_value: Some(format!("Bearer {token}")),
+            command: None, cwd: None, count: None, worktree: None, conda: None }
+    }
+}
+
+pub(crate) async fn add_agent_rows(core: &Core, spec: NewAgent) -> CmdResult<Vec<String>> {
     let NewAgent { template, name, url, header_name, header_value, command, cwd, count, worktree, conda } = spec;
     let name = valid_name(&name)?;
     let kind = match template.as_str() { "a2a" => "a2a", "command" => "command", _ => "acp" };
@@ -642,6 +665,7 @@ async fn remove_agent(core: St<'_>, name: String, purge: Option<bool>) -> CmdRes
     let row = core.agent(&name)?;
     if let Some(c) = row.credential_ref { secret_del(&c); }
     core.db().delete_agent(&name, purge.unwrap_or(false)).map_err(err)?;
+    core.shares_follow(&name, None);
     let _ = core.db().audit("user", Some(&name), "remove_agent", "ok");
     if let Some(ch) = core.agent_channel(&name) {
         let _ = core.db().set_setting(&format!("{SET_AGENT_CH}{name}"), "");
@@ -662,6 +686,7 @@ async fn rename_agent(core: St<'_>, name: String, new_name: String) -> CmdResult
     }
     core.hub.drop_agent(&name).await;
     core.forget_sessions(Some(&name));
+    core.shares_follow(&name, Some(&new));
     if let Some(mut spec) = row.card_json.as_deref().and_then(|j| serde_json::from_str::<LocalSpec>(j).ok()) {
         if spec.worktree && spec.worktree_name.is_empty() { spec.worktree_name = name.clone(); }
         row.card_json = Some(serde_json::to_string(&spec).map_err(err)?);
@@ -996,6 +1021,7 @@ pub fn run() {
                 paused: AtomicBool::new(false),
                 primed: Mutex::default(),
                 seen: Mutex::default(),
+                server: Mutex::default(),
                 app: app.handle().clone(),
             });
             // Installs from before v0.4 kept only the Keychain entry.
@@ -1004,6 +1030,7 @@ pub fn run() {
             }
             if core.db().setting(SET_TOKEN_SAVED).is_some() { connect_discord(core.clone()); }
             core.warm(None);
+            if !core.shares().is_empty() { core.serve_shares(); }
             app.manage(core);
             let handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
@@ -1018,7 +1045,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             overview, detect_agents, conda_envs, choose_path, memories, forget, add_agent, remove_agent, rename_agent, stop_reply, messages, send, decide_permission, agent_configs, set_agent_config,
             stop_all, resume, save_discord_token, discord_connect, discord_settings, discord_sync, diagnose, open_url, discord_channels, save_group, delete_group,
-            check_update, install_update
+            check_update, install_update, share::share_status, share::create_share, share::share_invite, share::revoke_share, share::accept_invite
         ])
         .run(tauri::generate_context!())
         .expect("error while running Disco");

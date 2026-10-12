@@ -121,9 +121,12 @@ fn origin(url: &str) -> Option<(String, String)> {
     Some((scheme.to_ascii_lowercase(), host))
 }
 
+/// Hosts where plain http is acceptable: loopback, or a Tailscale peer
+/// (WireGuard already encrypts and authenticates the link).
 fn is_loopback(host: &str) -> bool {
     let h = host.rsplit_once(':').filter(|(_, p)| p.bytes().all(|b| b.is_ascii_digit())).map_or(host, |(h, _)| h);
-    matches!(h, "localhost" | "127.0.0.1" | "[::1]")
+    if matches!(h, "localhost" | "127.0.0.1" | "[::1]") || h.ends_with(".ts.net") { return true; }
+    h.parse::<std::net::Ipv4Addr>().is_ok_and(|ip| { let o = ip.octets(); o[0] == 100 && (64..128).contains(&o[1]) })
 }
 
 /// A credential may only travel over https (or to loopback), and only to the
@@ -167,6 +170,10 @@ mod cred_tests {
         assert!(check_cred_target("http://a.example", &ok).is_err());
         let evil = json!({"supportedInterfaces": [{"url": "https://evil.example/rpc"}]});
         assert!(check_cred_target("https://a.example", &evil).is_err());
+        let ts = json!({"url": "http://mac.tail1.ts.net:7480/a/x/jsonrpc"});
+        assert!(check_cred_target("http://mac.tail1.ts.net:7480/a/x", &ts).is_ok());
+        assert!(check_cred_target("http://100.70.1.2:7480/a/x", &json!({"url": "http://100.70.1.2:7480/a/x/jsonrpc"})).is_ok());
+        assert!(check_cred_target("http://192.168.1.2:7480", &json!({})).is_err());
         let local = json!({"url": "http://127.0.0.1:9000/"});
         assert!(check_cred_target("http://127.0.0.1:9000", &local).is_ok());
         let trick = json!({"url": "https://a.example@evil.example/"});
