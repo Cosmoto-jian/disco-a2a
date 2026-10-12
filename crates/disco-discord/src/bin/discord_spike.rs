@@ -9,8 +9,7 @@ use twilight_model::gateway::event::Event;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    // Several deps enable different rustls backends; pin ring process-wide.
-    let _ = rustls::crypto::ring::default_provider().install_default();
+    disco_discord::install_crypto();
     let token = std::env::var("DISCORD_TOKEN")?;
     // HARK_INJECTED=1: the sandbox proxy adds the Authorization header itself.
     let http = if std::env::var_os("HARK_INJECTED").is_some() {
