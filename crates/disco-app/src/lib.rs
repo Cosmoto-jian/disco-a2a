@@ -28,6 +28,7 @@ const SET_HOME_GUILD: &str = "home_guild";
 /// `agent_channel/<agent>` -> Discord channel id of that agent's 1:1 channel.
 const SET_AGENT_CH: &str = "agent_channel/";
 const AGENT_CATEGORY: &str = "Disco Agents";
+const GROUP_CATEGORY: &str = "Disco 群聊";
 /// Memory notes live in settings as `mem/<scope>/<millis>`; scope is `all` or an agent name.
 const MEM: &str = "mem/";
 /// Memory handed to a session is capped so it never slows the first turn.
@@ -310,7 +311,7 @@ impl Core {
         let thread = format!("group:{channel}");
         self.post_message(&thread, &author, &text);
         if self.user_remember(&thread, "all", &text) { return; }
-        if !from_discord && let Some(d) = self.discord_rest() {
+        if !from_discord && !channel.starts_with("local-") && let Some(d) = self.discord_rest() {
             let (ch, line) = (channel.clone(), format!("**{author}**：{text}"));
             tauri::async_runtime::spawn(async move { let _ = d.post(&ch, &line).await; });
         }
@@ -782,21 +783,35 @@ async fn discord_channels(core: St<'_>) -> CmdResult<Vec<Channel>> {
 }
 
 #[tauri::command]
-async fn save_group(core: St<'_>, channel_id: String, guild_id: String, name: String, members: Vec<String>, lead: Option<String>) -> CmdResult<()> {
+async fn save_group(core: St<'_>, channel_id: Option<String>, guild_id: Option<String>, name: String, members: Vec<String>, lead: Option<String>) -> CmdResult<String> {
     if members.is_empty() { return Err("至少选一个 agent".into()); }
+    let name = name.trim();
+    if name.is_empty() { return Err("给群起个名字".into()); }
+    let rest = core.discord_rest();
+    let home = core.db().setting(SET_HOME_GUILD);
+    // No channel given: make one in the home guild, or keep the group local when Discord isn't set up.
+    let (channel_id, guild_id) = match (channel_id.filter(|c| !c.is_empty()), &rest) {
+        (Some(c), _) => (c, guild_id.unwrap_or_default()),
+        (None, Some(r)) if let Some(guild) = home => {
+            let (id, _) = r.ensure_channel(&guild, GROUP_CATEGORY, name, "Disco 群聊").await?;
+            (id, guild)
+        }
+        _ => (format!("local-{}", uuid::Uuid::new_v4().simple()), String::new()),
+    };
     let existing = core.db().list_groups().map_err(err)?.into_iter().find(|g| g.id == channel_id).and_then(|g| g.webhook_ref);
-    let webhook_ref = match existing {
-        Some(r) if secret_get(&r).is_some() => Some(r),
-        _ => {
-            let rest = core.discord_rest().ok_or("Discord 未连接")?;
+    let webhook_ref = match (existing, &rest) {
+        (Some(r), _) if secret_get(&r).is_some() => Some(r),
+        (_, Some(rest)) if !channel_id.starts_with("local-") => {
             let hook = rest.create_webhook(&channel_id).await?;
             let account = format!("webhook/{channel_id}");
             secret_set(&account, &hook)?;
             Some(account)
         }
+        _ => None,
     };
     let lead = lead.filter(|l| members.contains(l)).or_else(|| members.first().cloned());
-    core.db().upsert_group(&GroupRow { id: channel_id, guild_id, name, lead_agent: lead, webhook_ref, members }).map_err(err)
+    core.db().upsert_group(&GroupRow { id: channel_id.clone(), guild_id, name: name.into(), lead_agent: lead, webhook_ref, members }).map_err(err)?;
+    Ok(channel_id)
 }
 
 #[tauri::command]

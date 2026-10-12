@@ -220,53 +220,83 @@ listen("update-available", ({ payload: u }) => {
 listen("discord-status", ({ payload }) => { if (S.ov) { S.ov.discord_status = payload; if (S.tab === "settings") renderSettings(); renderList(); } });
 
 // ---------- agents page
+const shortPath = (p) => (p || "").replace(/^\/Users\/[^/]+/, "~");
+const baseName = (p) => (p ? p.replace(/\/$/, "").split("/").pop() : "");
 async function renderGallery() {
   S.thread = null; renderList();
-  const page = h("div", { class: "page" }, h("h1", {}, "添加 Agent"), h("p", {}, "正在扫描本机已安装的 agent…"));
+  const page = h("div", { class: "page add" }, h("h1", {}, "添加 Agent"), h("p", {}, "正在扫描这台 Mac…"));
   $("#pane").replaceChildren(page);
-  const found = await invoke("detect_agents").catch(() => []);
-  const card = (t, sub, onclick, letter, off) => h("button", { class: "card" + (off ? " off" : ""), onclick, disabled: !!off },
-    Object.assign(h("div", { class: "av" }, letter ?? t.name[0].toUpperCase()), { style: `background:${t.color}` }),
-    h("div", {}, h("b", {}, t.name), h("small", {}, sub)));
+  const [found, envs] = await Promise.all([invoke("detect_agents").catch(() => []), invoke("conda_envs").catch(() => [])]);
+  S.envs = envs;
   const have = found.filter((t) => t.found), miss = found.filter((t) => !t.found);
+  const list = h("div", { class: "alist" },
+    ...have.map((t) => agentRow({ ...t, kind: "acp" }, shortPath(t.found))),
+    agentRow({ id: "command", name: "其他本地 agent", kind: "command", color: "#8a8a8e", letter: "›" }, "任意支持 ACP 的程序"),
+    agentRow({ id: "a2a", name: "远程 A2A agent", kind: "a2a", color: "#5865f2", letter: "A" }, "通过 URL 接入"));
   page.replaceChildren(h("h1", {}, "添加 Agent"),
-    h("h3", {}, have.length ? `本机检测到 ${have.length} 个 agent，一键导入` : "本机没有检测到已安装的 agent"),
-    h("div", { class: "grid" }, ...have.map((t) => card(t, t.found, () => agentDialog({ ...t, kind: "acp" })))),
-    h("h3", {}, "自定义添加"),
-    h("div", { class: "grid" },
-      card({ name: "本地 agent 程序", color: "#8a8a8e" }, "任意说 ACP 协议的命令或程序，自选目录和环境", () => agentDialog({ id: "command", name: "本地 agent", kind: "command" }), ">"),
-      card({ name: "A2A 远程 Agent", color: "#5865f2" }, "输入 Agent Card 所在 URL，可选鉴权头", () => agentDialog({ id: "a2a", name: "A2A 远程 Agent", kind: "a2a" }), "A")),
-    miss.length ? h("p", { class: "muted" }, `也支持：${miss.map((t) => t.name).join("、")}（安装后重开此页即可导入）`) : null);
+    h("p", {}, have.length ? `在这台 Mac 上找到 ${have.length} 个，点一下就能导入。` : "没在这台 Mac 上找到已安装的 agent，可以手动添加。"),
+    list,
+    miss.length ? h("p", { class: "muted" }, `装好后会自动出现：${miss.map((t) => t.name).join(" · ")}`) : null);
 }
-async function agentDialog(t) {
-  const fields = [h("h3", {}, t.kind === "acp" ? `导入 ${t.name}` : `添加${t.name}`),
-    h("label", {}, "名称", h("input", { name: "name", required: true, value: t.kind === "acp" ? t.id : "", placeholder: "如 coder" }))];
-  if (t.kind === "a2a") fields.push(
-    h("label", {}, "Agent URL", h("input", { name: "url", required: true, placeholder: "https://agent.example.com" })),
-    h("label", {}, "鉴权头（可选）", h("input", { name: "header_name", placeholder: "authorization" })),
-    h("label", {}, "鉴权值（可选，存入钥匙串）", h("input", { name: "header_value", type: "password", placeholder: "Bearer …" })));
+function agentRow(t, sub) {
+  const row = h("div", { class: "arow" });
+  const head = h("button", { class: "ahead", onclick: () => {
+    const open = row.classList.toggle("open");
+    for (const o of document.querySelectorAll(".arow.open")) if (o !== row) o.classList.remove("open");
+    if (open && !row.querySelector(".aform")) row.append(agentForm(t));
+    if (open) row.querySelector(".aform input")?.focus();
+  } },
+    Object.assign(h("div", { class: "av" }, t.letter ?? t.name[0].toUpperCase()), { style: `background:${t.color}` }),
+    h("div", { class: "ameta" }, h("b", {}, t.name), h("small", {}, sub)),
+    h("span", { class: "aplus" }, t.kind === "acp" ? "导入" : "添加"));
+  row.append(head);
+  return row;
+}
+function agentForm(t) {
+  const st = { cwd: "", conda: "", count: 1 };
+  const err = h("div", { class: "err" });
+  const name = h("input", { class: "fld", value: t.kind === "acp" ? t.id : "", placeholder: "名称，如 coder", spellcheck: false });
+  const parts = [h("div", { class: "frow" }, h("span", {}, "名称"), name)];
+  let cmd, url, hn, hv;
   if (t.kind === "command") {
-    const cmd = h("input", { name: "command", required: true, placeholder: "/path/to/agent --acp" });
-    fields.push(h("label", {}, "启动命令（程序路径加参数）", h("div", { class: "row" }, cmd,
-      h("button", { type: "button", onclick: async () => { const p = await invoke("choose_path", { file: true }); if (p) cmd.value = /\s/.test(p) ? `"${p}"` : p; } }, "选择程序…"))));
+    cmd = h("input", { class: "fld", placeholder: "/path/to/agent --acp", spellcheck: false });
+    parts.push(h("div", { class: "frow" }, h("span", {}, "程序"), cmd, h("button", { type: "button", class: "ghost", onclick: async () => {
+      const p = await invoke("choose_path", { file: true }); if (p) cmd.value = /\s/.test(p) ? `"${p}"` : p;
+    } }, "选择…")));
+  }
+  if (t.kind === "a2a") {
+    url = h("input", { class: "fld", placeholder: "https://agent.example.com", spellcheck: false });
+    hn = h("input", { class: "fld", placeholder: "鉴权头（可选），如 authorization" });
+    hv = h("input", { class: "fld", type: "password", placeholder: "鉴权值（可选，存钥匙串）" });
+    parts.push(h("div", { class: "frow" }, h("span", {}, "URL"), url), h("div", { class: "frow" }, h("span", {}, "鉴权"), hn, hv));
   }
   if (t.kind !== "a2a") {
-    const cwd = h("input", { name: "cwd", placeholder: "默认主目录" });
-    const envs = await invoke("conda_envs").catch(() => []);
-    const conda = h("select", { name: "conda" }, h("option", { value: "" }, "不使用（系统环境）"), ...envs.map((e) => h("option", { value: e.path }, `${e.name} · ${e.path}`)));
-    const wt = h("input", { type: "checkbox", name: "worktree" });
-    const count = h("input", { name: "count", type: "number", min: 1, max: 8, value: 1, oninput: () => { wt.checked = Number(count.value) > 1; } });
-    fields.push(
-      h("label", {}, "工作目录", h("div", { class: "row" }, cwd,
-        h("button", { type: "button", onclick: async () => { const p = await invoke("choose_path", {}); if (p) cwd.value = p; } }, "选择文件夹…"))),
-      h("label", {}, envs.length ? "运行环境（conda）" : "运行环境（没有找到 conda 环境）", conda),
-      h("label", {}, "实例数量（命名为 名称、名称-2 …）", count),
-      h("div", { class: "checks" }, h("label", {}, wt, "每个实例使用独立 git worktree（多实例改同一仓库时推荐）")));
+    const folder = h("button", { type: "button", class: "pill" }, "主目录");
+    folder.onclick = async () => { const p = await invoke("choose_path", {}); if (p) { st.cwd = p; folder.textContent = baseName(p); folder.title = p; folder.classList.add("set"); } };
+    const chips = h("div", { class: "chips" });
+    const opts = [{ name: "系统", path: "" }, ...(S.envs || [])];
+    const draw = () => chips.replaceChildren(...opts.map((e) => h("button", { type: "button", class: "chip2" + (st.conda === e.path ? " on" : ""), title: e.path, onclick: () => { st.conda = e.path; draw(); } }, e.name)));
+    draw();
+    const count = h("div", { class: "stepper" },
+      h("button", { type: "button", onclick: () => { st.count = Math.max(1, st.count - 1); n.textContent = st.count; } }, "−"),
+      h("span", {}, "1"),
+      h("button", { type: "button", onclick: () => { st.count = Math.min(8, st.count + 1); n.textContent = st.count; } }, "+"));
+    const n = count.querySelector("span");
+    parts.push(
+      h("div", { class: "frow" }, h("span", {}, "目录"), folder),
+      h("div", { class: "frow" }, h("span", {}, "环境"), chips),
+      h("div", { class: "frow" }, h("span", {}, "数量"), count, h("small", { class: "hint2" }, "多个实例各用独立 git worktree")));
   }
-  dialog(fields, t.kind === "acp" ? "导入" : "添加", async (f) => {
-    await invoke("add_agent", { spec: { template: t.id, name: f.name, url: f.url ?? null, headerName: f.header_name || null, headerValue: f.header_value || null, command: f.command ?? null, cwd: f.cwd || null, count: Number(f.count || 1), worktree: f.worktree === "on", conda: f.conda || null } });
-    await load(); setTab("chats"); openThread(`dm:${f.name.trim()}`);
-  });
+  const go = h("button", { type: "button", class: "btn pri" }, t.kind === "acp" ? "导入" : "添加");
+  go.onclick = async () => {
+    go.disabled = true; err.textContent = "";
+    try {
+      await invoke("add_agent", { spec: { template: t.id, name: name.value, url: url?.value ?? null, headerName: hn?.value || null, headerValue: hv?.value || null,
+        command: cmd?.value ?? null, cwd: st.cwd || null, count: st.count, worktree: st.count > 1, conda: st.conda || null } });
+      await load(); setTab("chats"); openThread(`dm:${name.value.trim()}`);
+    } catch (e) { err.textContent = String(e); go.disabled = false; }
+  };
+  return h("div", { class: "aform" }, ...parts, h("div", { class: "factions" }, err, go));
 }
 async function removeAgent(name) {
   if (!(await ask(`移除 ${name}？聊天记录会保留，它的 Discord 频道会被删除。`, "移除"))) return;
@@ -275,24 +305,53 @@ async function removeAgent(name) {
 
 // ---------- groups
 async function groupDialog(g) {
-  if (!S.ov.agents.length) return toast("先添加至少一个 agent");
-  let channels = [];
-  try { channels = await invoke("discord_channels"); } catch (e) { return toast(`${e}：需要先连接 Discord`, 8000, ["去设置", () => setTab("settings")]); }
-  const sel = h("select", { name: "channel", required: true, disabled: !!g },
-    ...channels.map((c) => h("option", { value: `${c.guild_id}|${c.id}`, selected: g?.id === c.id }, `${c.guild} / #${c.name}`)));
-  const members = g?.members ?? [];
-  dialog([
-    h("h3", {}, g ? `群聊「${g.name}」` : "新建群聊"),
-    h("label", {}, "绑定的 Discord 频道", sel),
-    h("label", {}, "群名", h("input", { name: "name", required: true, value: g?.name ?? "" })),
-    h("label", {}, "成员", h("div", { class: "checks" }, ...S.ov.agents.map((a) => h("label", {}, h("input", { type: "checkbox", name: "m", value: a.name, checked: members.includes(a.name) }), a.name)))),
-    h("label", {}, "组长（没人被 @ 时回答）", h("select", { name: "lead" }, h("option", { value: "" }, "第一个成员"), ...S.ov.agents.map((a) => h("option", { value: a.name, selected: g?.lead === a.name }, a.name)))),
-  ], g ? "保存" : "创建", async (f, form) => {
-    const [guildId, channelId] = (g ? `${g.guild_id}|${g.id}` : f.channel).split("|");
-    const picked = [...form.querySelectorAll("input[name=m]:checked")].map((i) => i.value);
-    await invoke("save_group", { channelId, guildId, name: f.name.trim(), members: picked, lead: f.lead || null });
-    await load(); openThread(`group:${channelId}`);
-  }, g ? ["删除群聊", async () => { if (await ask("删除这个群聊？Discord 频道不受影响。", "删除")) { await invoke("delete_group", { id: g.id }); blank(); await load(); } }] : null);
+  if (!S.ov.agents.length) return toast("先添加至少一个 agent", 6000, ["去添加", () => setTab("agents")]);
+  S.thread = null; renderList();
+  const st = { members: [...(g?.members ?? [])], lead: g?.lead ?? null, channel: g ? `${g.guild_id}|${g.id}` : "" };
+  const name = h("input", { class: "gname", value: g?.name ?? "", placeholder: "群名", spellcheck: false });
+  const grid = h("div", { class: "pick" });
+  const count = h("span", { class: "muted2" });
+  const draw = () => {
+    if (st.lead && !st.members.includes(st.lead)) st.lead = null;
+    const lead = st.lead ?? st.members[0];
+    grid.replaceChildren(...S.ov.agents.map((a) => {
+      const on = st.members.includes(a.name);
+      const tile = h("button", { type: "button", class: "ptile" + (on ? " on" : ""), onclick: () => {
+        st.members = on ? st.members.filter((m) => m !== a.name) : [...st.members, a.name]; draw();
+      } }, avatar(a.name), h("span", {}, a.name), on ? h("i", { class: "tick" }, "✓") : null,
+        on && a.name === lead ? h("em", { class: "crown" }, "组长") : null);
+      if (on && a.name !== lead) tile.append(h("em", { class: "mklead", onclick: (e) => { e.stopPropagation(); st.lead = a.name; draw(); } }, "设为组长"));
+      return tile;
+    }));
+    count.textContent = st.members.length ? `已选 ${st.members.length} 个` : "点选成员";
+  };
+  draw();
+  const where = h("div", { class: "gwhere" });
+  const discordOn = /^在线/.test(S.ov.discord_status || "");
+  if (g) where.append(h("small", {}, g.id.startsWith("local-") ? "仅在 Disco 内" : "已绑定 Discord 频道"));
+  else if (discordOn) {
+    const sel = h("select", { class: "fld", onchange: () => { st.channel = sel.value; } }, h("option", { value: "" }, "自动新建同名频道"));
+    where.append(h("small", {}, "Discord"), sel);
+    invoke("discord_channels").then((cs) => sel.append(...cs.map((c) => h("option", { value: `${c.guild_id}|${c.id}` }, `用已有 #${c.name} · ${c.guild}`)))).catch(() => {});
+  } else where.append(h("small", {}, "Discord 未连接，群聊先只在 Disco 内进行"));
+  const err = h("div", { class: "err" });
+  const go = h("button", { class: "btn pri" }, g ? "保存" : "创建群聊");
+  go.onclick = async () => {
+    go.disabled = true; err.textContent = "";
+    try {
+      const [guildId, channelId] = st.channel ? st.channel.split("|") : [null, null];
+      const id = await invoke("save_group", { channelId, guildId, name: name.value, members: st.members, lead: st.lead ?? st.members[0] ?? null });
+      await load(); setTab("groups"); openThread(`group:${id}`);
+    } catch (e) { err.textContent = String(e); go.disabled = false; }
+  };
+  const del = g ? h("button", { class: "btn danger", onclick: async () => {
+    if (await ask("删除这个群聊？聊天记录保留，Discord 频道不受影响。", "删除")) { await invoke("delete_group", { id: g.id }); blank(); await load(); }
+  } }, "删除群聊") : null;
+  $("#pane").replaceChildren(h("div", { class: "page gpage" },
+    h("h1", {}, g ? "群设置" : "新建群聊"), name,
+    h("div", { class: "glabel" }, h("b", {}, "成员"), count), grid, where,
+    h("div", { class: "factions" }, del, err, go)));
+  if (!g) name.focus();
 }
 
 // ---------- settings
