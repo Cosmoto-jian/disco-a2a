@@ -6,7 +6,7 @@ const $ = (s, r = document) => r.querySelector(s);
 // ---------- state
 // typing: thread -> Set(agent); live: "thread|agent" -> streaming bubble
 // msgs: thread -> cached messages, so switching chats renders instantly.
-const S = { tab: "chats", thread: null, ov: null, tpl: [], typing: {}, live: {}, perms: {}, q: "", msgs: {}, found: null };
+const S = { tab: "chats", thread: null, ov: null, tpl: [], typing: {}, live: {}, inbox: [], q: "", msgs: {}, found: null };
 const REDUCED = matchMedia("(prefers-reduced-motion: reduce)").matches;
 const COLORS = ["#5865f2", "#d97757", "#10a37f", "#7c5cff", "#e5484d", "#3b82f6", "#f59e0b", "#14b8a6"];
 
@@ -107,6 +107,12 @@ function drawList() {
       .map(({ t, head }) => threadRow(t, head));
   } else if (S.tab === "groups") {
     rows = S.ov.groups.map((g) => threadRow(`group:${g.id}`, heads[`group:${g.id}`], g.members.join("、")));
+  } else if (S.tab === "inbox") {
+    rows = S.inbox.map((it) => h("li", { class: S.thread === it.thread ? "on" : "", onclick: () => openThread(it.thread) },
+      avatar(it.agent),
+      h("div", { class: "meta" },
+        h("div", { class: "row" }, h("span", { class: "name" }, `${it.agent} · ${it.thread.startsWith("dm:") ? "私聊" : threadName(it.thread)}`), h("span", { class: "time" }, when(it.ts))),
+        h("div", { class: "sub" }, `${it.kind === "permission" ? "🔐 请求执行" : "❓ 提问"}：${it.title}`))));
   } else if (S.tab === "agents") {
     rows = S.ov.agents.map((a) => h("li", { class: S.thread === `dm:${a.name}` ? "on" : "", onclick: () => openThread(`dm:${a.name}`) },
       avatar(a.name, { live: a.live }),
@@ -116,15 +122,17 @@ function drawList() {
     rows = [h("li", { class: "on" }, avatar("Discord", { small: true }), h("div", { class: "meta" }, h("div", { class: "name" }, "Discord"), h("div", { class: "sub" }, S.ov.discord_status)))];
   }
   rows = rows.filter((li) => !q || li.textContent.toLowerCase().includes(q));
-  if (!rows.length) rows = [h("li", { class: "empty" }, S.tab === "agents" ? "还没有 agent，点 ＋ 添加" : S.tab === "groups" ? "还没有群聊，点 ＋ 新建" : "没有会话")];
+  if (!rows.length) rows = [h("li", { class: "empty" }, S.tab === "agents" ? "还没有 agent，点 ＋ 添加" : S.tab === "groups" ? "还没有群聊，点 ＋ 新建" : S.tab === "inbox" ? "没有等你处理的事" : "没有会话")];
   ul.append(...rows);
 }
 function threadRow(t, head, fallback) {
   const isGroup = t.startsWith("group:"); const name = threadName(t);
   const typing = S.typing[t]?.size ? [...S.typing[t]].join("、") : "";
   const live = !isGroup && S.ov.agents.find((a) => `dm:${a.name}` === t)?.live;
+  const waiting = S.inbox.filter((it) => it.thread === t).length;
   return h("li", { class: S.thread === t ? "on" : "", onclick: () => openThread(t), onmouseenter: () => prefetch(t) },
     avatar(name, { group: isGroup, live }),
+    waiting ? h("i", { class: "badge row-badge", title: `${waiting} 项等你处理` }, String(waiting)) : null,
     h("div", { class: "meta" },
       h("div", { class: "row" }, h("span", { class: "name" }, name), h("span", { class: "time" }, when(head?.ts))),
       h("div", { class: `sub${typing ? " typing" : ""}` }, typing ? `${typing} 正在输入…` : head ? `${isGroup && head.author !== "me" ? head.author + "：" : ""}${head.body}` : (fallback ?? "")),
@@ -179,7 +187,7 @@ async function openThread(t) {
   const draw = (msgs) => {
     const log = $("#log"); if (!log || S.thread !== t) return;
     log.replaceChildren(...msgs.map((m) => bubble(m.author, m.body)));
-    for (const p of Object.values(S.perms)) if (p.thread === t) log.append(permCard(p));
+    for (const it of S.inbox) if (it.thread === t) log.append(inboxCard(it));
     for (const [k, v] of Object.entries(S.live)) if (k.startsWith(t + "|")) log.append(v.el);
     log.scrollTop = log.scrollHeight;
   };
@@ -376,23 +384,48 @@ async function sendMsg() {
   catch (e) { el.classList.add("failed"); el.title = String(e); toast(e); }
 }
 
-function permCard(p) {
-  return h("div", { class: "perm new", id: `perm-${p.request_id}` },
-    h("b", {}, `${p.agent} 请求执行：${p.title || "工具调用"}`),
-    h("div", { class: "opts" }, ...p.options.map((o) => h("button", { class: o.allow ? "allow" : "", onclick: () => decide(p, o.id) }, o.label)),
-      h("button", { onclick: () => decide(p, null) }, "取消")));
+// ---------- inbox: permission requests and agent questions, answered here or from Discord
+function inboxCard(it) {
+  const perm = it.kind === "permission";
+  const card = h("div", { class: `perm ${perm ? "" : "ask"}`, "data-item": it.id },
+    h("b", {}, perm ? `${it.agent} 请求执行：${it.title}` : `${it.agent} 问你：`),
+    perm ? null : h("div", { class: "q" }, it.title));
+  const answer = async (optionId, text) => {
+    card.querySelectorAll("button, textarea").forEach((b) => { b.disabled = true; });
+    try { await invoke("inbox_answer", { id: it.id, optionId, text }); }
+    catch (e) { card.querySelectorAll("button, textarea").forEach((b) => { b.disabled = false; }); toast(e); }
+  };
+  const opts = h("div", { class: "opts" }, ...it.options.map((o) => h("button", { class: o.allow ? "allow" : "", onclick: () => answer(o.id, null) }, o.label)),
+    perm ? h("button", { onclick: () => answer(null, null) }, "拒绝") : null);
+  if (it.options.length || perm) card.append(opts);
+  if (it.text) {
+    const ta = h("textarea", { rows: 1, placeholder: "输入回答，↩ 发送" });
+    ta.onkeydown = (e) => { if (e.key === "Enter" && !e.shiftKey && !e.isComposing && ta.value.trim()) { e.preventDefault(); answer(null, ta.value); } };
+    card.append(h("div", { class: "free" }, ta, h("button", { class: "allow", onclick: () => ta.value.trim() && answer(null, ta.value) }, "回答")));
+  }
+  return card;
 }
-async function decide(p, optionId) {
-  // request ids contain "/" etc., so look them up by id, not with a CSS selector.
-  const card = document.getElementById(`perm-${p.request_id}`);
-  card?.querySelectorAll("button").forEach((b) => { b.disabled = true; });
-  try {
-    const ok = await invoke("decide_permission", { agent: p.agent, requestId: p.request_id, optionId });
-    delete S.perms[p.request_id];
-    if (card) { card.classList.add("gone"); setTimeout(() => card.remove(), 180); }
-    if (!ok) toast("这个请求已经失效（agent 已结束这一轮）");
-  } catch (e) { card?.querySelectorAll("button").forEach((b) => { b.disabled = false; }); toast(e); }
+function setInbox(items, quiet = false) {
+  const before = new Set(S.inbox.map((i) => i.id));
+  S.inbox = items;
+  const badge = $("#inbox-badge"); badge.textContent = items.length ? String(items.length) : "";
+  const log = $("#log");
+  if (log) {
+    const ids = new Set(items.map((i) => i.id));
+    log.querySelectorAll(".perm[data-item]").forEach((c) => {
+      if (!ids.has(c.dataset.item)) { c.classList.add("gone"); setTimeout(() => c.remove(), 180); }
+    });
+    for (const it of items) if (it.thread === S.thread && !before.has(it.id) && !log.querySelector(`[data-item="${it.id}"]`)) {
+      const c = inboxCard(it); c.classList.add("new"); log.append(c); scrollLog(true);
+    }
+  }
+  // Somewhere else: don't pull the user away, just say it once.
+  if (!quiet) for (const it of items) if (!before.has(it.id) && it.thread !== S.thread) {
+    toast(`${it.agent} ${it.kind === "permission" ? "需要你批准" : "有问题问你"}`, 6000, ["查看", () => openThread(it.thread)]);
+  }
+  renderList();
 }
+listen("inbox", ({ payload }) => setInbox(payload));
 
 // ---------- events
 const liveKey = (thread, agent) => `${thread}|${agent}`;
@@ -439,9 +472,6 @@ listen("stream", ({ payload: { thread, agent, event } }) => {
   } else if (event.type === "tool" && S.thread === thread && event.title) {
     const chip = h("div", { class: "chip new" }, `🔧 ${agent} · ${event.title}`);
     live ? live.el.before(chip) : $("#log").append(chip);
-  } else if (event.type === "permission_asked") {
-    const p = { ...event, agent, thread }; S.perms[event.request_id] = p;
-    if (S.thread === thread) { $("#log").append(permCard(p)); scrollLog(); }
   }
 });
 async function installUpdate() {
@@ -816,7 +846,7 @@ addEventListener("keydown", (e) => {
   const mod = e.metaKey || e.ctrlKey;
   const typingInField = /^(INPUT|TEXTAREA|SELECT)$/.test(document.activeElement?.tagName) || document.activeElement?.isContentEditable;
   if (mod && e.key.toLowerCase() === "k") { e.preventDefault(); $("#search").focus(); $("#search").select(); return; }
-  if (mod && /^[1-4]$/.test(e.key)) { e.preventDefault(); setTab(["chats", "groups", "agents", "settings"][e.key - 1]); return; }
+  if (mod && /^[1-5]$/.test(e.key)) { e.preventDefault(); setTab(["chats", "groups", "agents", "inbox", "settings"][e.key - 1]); return; }
   if (mod && e.key.toLowerCase() === "n") { e.preventDefault(); if (S.tab === "agents") renderGallery(); else groupDialog(null); return; }
   if (!mod && !e.altKey && !typingInField && e.key.length === 1 && $("#input") && !$("#dlg").open) $("#input").focus();
 });
@@ -825,4 +855,4 @@ $("#search").addEventListener("keydown", (e) => {
   if (e.key === "Enter" && !e.isComposing) { e.preventDefault(); $("#items li:not(.empty)")?.click(); e.target.blur(); }
 });
 
-(async () => { await load(); blank(); })();
+(async () => { await load(); blank(); setInbox(await invoke("inbox").catch(() => []), true); })();

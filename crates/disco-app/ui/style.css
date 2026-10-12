@@ -336,3 +336,14 @@ dialog[open]::backdrop { animation:fade .2s var(--ease); }
 .btn.primary { background:var(--acc); color:#fff; }
 .space-btn.on { background:var(--sel); color:var(--acc); }
 .todos input[type=checkbox] { accent-color:var(--acc); margin-top:4px; }
+/* inbox */
+.tab { position:relative; }
+.badge:empty { display:none; }
+.badge { position:absolute; min-width:17px; height:17px; padding:0 5px; border-radius:9px; background:var(--red); color:#fff; font:600 10.5px/17px -apple-system, sans-serif; font-style:normal; text-align:center; box-shadow:0 0 0 2px var(--rail); animation:pop .3s var(--spring) both; }
+.tab .badge { top:3px; right:3px; }
+#items li .row-badge { position:absolute; left:40px; top:6px; box-shadow:0 0 0 2px var(--list); }
+.perm.ask { border-color:color-mix(in srgb, var(--acc) 45%, var(--line)); }
+.perm .q { margin:-2px 0 10px; white-space:pre-wrap; -webkit-user-select:text; user-select:text; }
+.perm .free { display:flex; gap:8px; margin-top:10px; }
+.perm .free textarea { flex:1; resize:none; border:1px solid var(--line); border-radius:8px; padding:6px 10px; background:var(--list); color:var(--fg); font:inherit; outline:none; }
+.perm .free textarea:focus { border-color:var(--acc); }

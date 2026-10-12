@@ -3,6 +3,7 @@
 #![forbid(unsafe_code)]
 
 mod hub;
+mod inbox;
 mod mcp;
 pub use mcp::stdio_proxy as mcp_stdio;
 mod share;
@@ -15,7 +16,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use disco_a2a::{Credential, RemoteAgent};
 use disco_discord::{Incoming, Rest};
 use disco_store::{AgentRow, GroupRow, Store};
-use disco_types::{AgentEvent, PermissionDecision};
+use disco_types::AgentEvent;
 use hub::{Hub, LocalSpec};
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, State};
@@ -123,6 +124,8 @@ pub struct Core {
     /// `agent|thread` -> id of the newest group message that agent's session has seen,
     /// so later turns send only what is new instead of the whole transcript again.
     seen: Mutex<HashMap<String, i64>>,
+    /// Everything waiting on the user (see inbox.rs).
+    inbox: Arc<inbox::Inbox>,
     /// The Tailscale share server (see share.rs).
     server: Mutex<share::Server>,
     app: AppHandle,
@@ -171,13 +174,19 @@ impl Core {
         let _ = self.app.emit("typing", TypingEvt { thread: thread.into(), agent: agent.into(), on: true });
         let app = self.app.clone();
         let (t, a) = (thread.to_owned(), agent.to_owned());
+        let asked = Mutex::new(Vec::new());
         let res = self
             .hub
-            .ask(&row, &secret_get, context, prompt, move |ev| {
+            .ask(&row, &secret_get, context, prompt, |ev| {
                 if !tap(ev) { return; }
+                if let AgentEvent::PermissionAsked { request_id, title, options } = ev {
+                    self.inbox_permission(&t, &a, request_id, title, options);
+                    asked.lock().unwrap_or_else(|p| p.into_inner()).push(request_id.clone());
+                }
                 let _ = app.emit("stream", StreamEvt { thread: t.clone(), agent: a.clone(), event: ev.clone() });
             })
             .await;
+        self.inbox_expire(&asked.into_inner().unwrap_or_else(|p| p.into_inner()));
         let _ = self.app.emit("typing", TypingEvt { thread: thread.into(), agent: agent.into(), on: false });
         if matches!(&res, Err(e) if e.contains("进程已退出")) { self.forget_sessions(Some(agent)); }
         let _ = self.db().audit("disco", Some(agent), "prompt", if res.is_ok() { "ok" } else { "error" });
@@ -204,7 +213,7 @@ impl Core {
         for t in &kept { out.push_str("- "); out.push_str(t); out.push('\n'); }
         out.push_str(&format!("（需要长期记住的事实或偏好，单独一行以「{MEM_TAG}」开头写出，Disco 会保存。）\n"));
         if self.hub.mcp_port.get().is_some() && self.agent(agent).is_ok_and(|r| r.transport == "acp") {
-            out.push_str("（你有 disco 工具：overview 看自己在哪，post 发到群或通知用户，ask 请教其他 agent，todo_add/todo_list/todo_done 管待办，doc_read/doc_write 读写群文档，remember 保存长期记忆。）\n");
+            out.push_str("（你有 disco 工具：overview 看自己在哪，post 发到群或通知用户，ask 请教其他 agent，ask_user 向用户提问（选择或确认），todo_add/todo_list/todo_done 管待办，doc_read/doc_write 读写群文档，remember 保存长期记忆。）\n");
         }
         out.push('\n');
         out
@@ -771,9 +780,11 @@ async fn set_agent_config(core: St<'_>, agent: String, id: String, value: String
 }
 
 #[tauri::command]
-async fn decide_permission(core: St<'_>, agent: String, request_id: String, option_id: Option<String>) -> CmdResult<bool> {
-    let d = option_id.map_or(PermissionDecision::Cancel, |option_id| PermissionDecision::Select { option_id });
-    Ok(core.hub.decide(&agent, &request_id, d).await)
+fn inbox(core: St<'_>) -> Vec<inbox::Item> { core.inbox.list() }
+
+#[tauri::command]
+async fn inbox_answer(core: St<'_>, id: String, option_id: Option<String>, text: Option<String>) -> CmdResult<String> {
+    core.inbox_answer(&id, inbox::Answer { option: option_id, text }, "Disco").await
 }
 
 #[tauri::command]
@@ -781,6 +792,7 @@ async fn stop_all(core: St<'_>) -> CmdResult<usize> {
     core.paused.store(true, Ordering::Relaxed);
     let n = core.hub.stop_all().await;
     core.forget_sessions(None);
+    core.inbox_clear();
     core.db().audit("me", None, "kill_switch", &format!("stopped {n}")).map_err(err)?;
     Ok(n)
 }
@@ -1008,6 +1020,11 @@ fn connect_discord(core: Arc<Core>) {
     }));
     tauri::async_runtime::spawn(async move {
         while let Some(m) = rx.recv().await {
+            if let Some(press) = m.press {
+                let c = core.clone();
+                tauri::async_runtime::spawn(async move { c.inbox_press(&m.author_id, &m.author, press).await });
+                continue;
+            }
             // Only the bot's owner(s) and explicitly allowed users may drive agents:
             // anyone else in the guild could otherwise run tools on this Mac.
             if !core.allowed(&m.author_id) {
@@ -1079,6 +1096,7 @@ pub fn run() {
                 paused: AtomicBool::new(false),
                 primed: Mutex::default(),
                 seen: Mutex::default(),
+                inbox: Arc::default(),
                 server: Mutex::default(),
                 app: app.handle().clone(),
             });
@@ -1102,7 +1120,7 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
-            overview, detect_agents, conda_envs, choose_path, memories, forget, add_agent, remove_agent, rename_agent, stop_reply, messages, send, decide_permission, agent_configs, set_agent_config,
+            overview, detect_agents, conda_envs, choose_path, memories, forget, add_agent, remove_agent, rename_agent, stop_reply, messages, send, inbox, inbox_answer, agent_configs, set_agent_config,
             stop_all, resume, save_discord_token, discord_connect, discord_settings, discord_sync, diagnose, open_url, discord_channels, save_group, delete_group,
             check_update, install_update, space, todo_new, todo_set, todo_remove, doc_save, reveal_doc, share::share_status, share::create_share, share::share_invite, share::revoke_share, share::accept_invite
         ])

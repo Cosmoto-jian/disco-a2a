@@ -292,6 +292,32 @@ impl Rest {
         Ok(())
     }
 
+    /// Post a message with buttons `(custom_id, label, allow)`; returns the message id.
+    /// Used for approvals and questions, so they can be answered from Discord too.
+    pub async fn post_buttons(&self, channel: &str, text: &str, buttons: &[(String, String, bool)]) -> Result<String, String> {
+        let rows: Vec<Value> = buttons.chunks(5).take(5).map(|row| json!({"type": 1, "components": row.iter().map(|(id, label, allow)| json!({
+            "type": 2, "style": if *allow { 3 } else { 2 }, "custom_id": id, "label": label.chars().take(80).collect::<String>(),
+        })).collect::<Vec<_>>()})).collect();
+        let content: String = text.chars().take(1900).collect();
+        let v = self.post_json(&format!("/channels/{channel}/messages"), json!({"content": content, "components": rows, "allowed_mentions": {"parse": []}})).await?;
+        v["id"].as_str().map(str::to_owned).ok_or_else(|| "Discord 没有返回消息 id".into())
+    }
+
+    /// Replace a message's text and remove its buttons.
+    pub async fn settle_message(&self, channel: &str, message: &str, text: &str) -> Result<(), String> {
+        let content: String = text.chars().take(1900).collect();
+        self.call(reqwest::Method::PATCH, &format!("/channels/{channel}/messages/{message}"), Some(json!({"content": content, "components": []}))).await.map(|_| ())
+    }
+
+    /// Answer a button press: `update` rewrites the pressed message (and drops its
+    /// buttons); otherwise only the presser sees `text`.
+    pub async fn interaction_reply(&self, id: &str, token: &str, update: bool, text: &str) -> Result<(), String> {
+        let content: String = text.chars().take(1900).collect();
+        let body = if update { json!({"type": 7, "data": {"content": content, "components": []}}) }
+            else { json!({"type": 4, "data": {"content": content, "flags": 64}}) };
+        self.post_json(&format!("/interactions/{id}/{token}/callback"), body).await.map(|_| ())
+    }
+
     /// Post as the bot itself (used for messages typed in the app). Never pings anyone.
     pub async fn post(&self, channel: &str, text: &str) -> Result<(), String> {
         for part in chunk(text) {
@@ -343,6 +369,8 @@ pub struct Incoming {
     pub author_id: String,
     pub author: String,
     pub content: String,
+    /// A button press on one of our messages: (interaction id, token, custom_id).
+    pub press: Option<(String, String, String)>,
 }
 
 #[derive(Debug, Clone)]
@@ -423,6 +451,11 @@ async fn session(
                     Some(0) => match v["t"].as_str() {
                         Some("READY") => on_ready(&v["d"]),
                         Some("MESSAGE_CREATE") if !on_message(&v["d"]) => return End::Stopped,
+                        Some("INTERACTION_CREATE") if v["d"]["type"].as_u64() == Some(3) => {
+                            let mut d = v["d"].clone();
+                            d["__press"] = json!(true);
+                            if !on_message(&d) { return End::Stopped; }
+                        }
                         _ => {}
                     },
                     _ => {}
@@ -466,6 +499,20 @@ pub async fn run_gateway(token: String, tx: mpsc::Sender<Incoming>, mut stop: wa
             let guilds = d["guilds"].as_array().map_or(0, Vec::len);
             on_status(format!("在线 · {} · {guilds} 个服务器", d["user"]["username"].as_str().unwrap_or("bot")));
         }, |m| {
+            if m["__press"].as_bool() == Some(true) {
+                // Component interaction: the presser is `member.user` in guilds, `user` in DMs.
+                let u = if m["member"]["user"].is_object() { &m["member"]["user"] } else { &m["user"] };
+                let msg = Incoming {
+                    guild_id: m["guild_id"].as_str().unwrap_or_default().into(),
+                    channel_id: m["channel_id"].as_str().unwrap_or_default().into(),
+                    author_id: u["id"].as_str().unwrap_or_default().into(),
+                    author: u["global_name"].as_str().or(u["username"].as_str()).unwrap_or("someone").into(),
+                    content: String::new(),
+                    press: Some((m["id"].as_str().unwrap_or_default().into(), m["token"].as_str().unwrap_or_default().into(),
+                        m["data"]["custom_id"].as_str().unwrap_or_default().into())),
+                };
+                return tx.try_send(msg).is_ok() || !tx.is_closed();
+            }
             if m["author"]["bot"].as_bool() == Some(true) || !m["webhook_id"].is_null() { return true; }
             let (Some(guild), Some(content)) = (m["guild_id"].as_str(), m["content"].as_str()) else { return true };
             if content.is_empty() { return true; }
@@ -476,6 +523,7 @@ pub async fn run_gateway(token: String, tx: mpsc::Sender<Incoming>, mut stop: wa
                 author_id: a["id"].as_str().unwrap_or_default().into(),
                 author: a["global_name"].as_str().or(a["username"].as_str()).unwrap_or("someone").into(),
                 content: content.into(),
+                press: None,
             };
             tx.try_send(msg).is_ok() || !tx.is_closed()
         }).await;

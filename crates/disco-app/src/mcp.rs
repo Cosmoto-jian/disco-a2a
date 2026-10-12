@@ -18,6 +18,8 @@ use tauri::Manager;
 use crate::{Core, GroupRow, mentions, secret_get};
 
 const TODO: &str = "todo/";
+/// How long `ask_user` waits for the human.
+const ASK_USER_WAIT: std::time::Duration = std::time::Duration::from_secs(30 * 60);
 /// Longest doc an agent may write in one call; keeps a runaway agent from filling the disk.
 const DOC_MAX: usize = 200_000;
 
@@ -130,6 +132,8 @@ fn tools() -> Value {
           "inputSchema": { "type": "object", "properties": { "text": { "type": "string" }, "group": group, "to_user": { "type": "boolean", "description": "true = 发到你和用户的私聊" } }, "required": ["text"] } },
         { "name": "ask", "description": "向另一个 agent 请教并等待它的回答（委派：对方单独作答，答案直接返回给你，不会发到群里）。适合需要别人专长的子问题。",
           "inputSchema": { "type": "object", "properties": { "agent": { "type": "string" }, "question": { "type": "string" } }, "required": ["agent", "question"] } },
+        { "name": "ask_user", "description": "向用户提问并等待回答（会在 Disco 和 Discord 里弹出卡片，用户在任一端回答即可）。需要用户做选择、确认或补充信息时用；能自己判断的不要问。给 options 时用户点选即可。",
+          "inputSchema": { "type": "object", "properties": { "question": { "type": "string" }, "options": { "type": "array", "items": { "type": "string" }, "maxItems": 10, "description": "可选项（最多 10 个）" }, "allow_text": { "type": "boolean", "description": "允许用户自由输入（不给 options 时默认 true）" } }, "required": ["question"] } },
         { "name": "todo_add", "description": "在群（或私聊）的待办里加一项。",
           "inputSchema": { "type": "object", "properties": { "text": { "type": "string" }, "assignee": { "type": "string", "description": "负责人：agent 名或 me（用户）" }, "group": group }, "required": ["text"] } },
         { "name": "todo_list", "description": "列出待办（默认只列未完成）。",
@@ -201,6 +205,7 @@ impl Call<'_> {
             "overview" => Ok(self.overview()),
             "post" => self.post(args),
             "ask" => self.ask(args).await,
+            "ask_user" => self.ask_user(args).await,
             "todo_add" => self.todo_add(args),
             "todo_list" => self.todo_list(args),
             "todo_done" => self.todo_done(args),
@@ -279,6 +284,21 @@ impl Call<'_> {
         let answer = answer.trim().to_owned();
         self.core.post_message(&thread, &target, &format!("↩ 回复 {}：{answer}", self.agent));
         Ok(answer)
+    }
+
+    async fn ask_user(&self, args: &Value) -> Result<String, String> {
+        let question = s(args, "question").ok_or("question 不能为空")?;
+        let options: Vec<String> = args.get("options").and_then(Value::as_array).map(|a| a.iter()
+            .filter_map(|v| v.as_str().map(str::trim).filter(|v| !v.is_empty()).map(str::to_owned)).take(10).collect()).unwrap_or_default();
+        let text = args.get("allow_text").and_then(Value::as_bool).unwrap_or(options.is_empty());
+        let thread = match self.place() { Place::Group(g) => format!("group:{}", g.id), _ => format!("dm:{}", self.agent) };
+        self.core.post_message(&thread, self.agent, &format!("❓ {question}"));
+        let rx = self.core.inbox_question(&thread, self.agent, question, options, text);
+        match tokio::time::timeout(ASK_USER_WAIT, rx).await {
+            Ok(Ok(answer)) => Ok(format!("用户回答：{answer}")),
+            Ok(Err(_)) => Err("用户撤回了这个问题（已全部停止）".into()),
+            Err(_) => Err(format!("{} 分钟内用户没有回答，请按最稳妥的方式继续或稍后再问", ASK_USER_WAIT.as_secs() / 60)),
+        }
     }
 
     fn todo_add(&self, args: &Value) -> Result<String, String> {
