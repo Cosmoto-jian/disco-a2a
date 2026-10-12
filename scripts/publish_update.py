@@ -6,7 +6,6 @@ Usage (from disco/, with GitHub credentials injected):
 
 The updater private key never leaves this machine (default /workspace/.keys/disco-updater.key).
 """
-import datetime
 import json
 import os
 import subprocess
@@ -44,7 +43,8 @@ def main():
     manifest = {
         "version": ver,
         "notes": notes,
-        "pub_date": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        # RFC 3339, which the Tauri updater requires.
+        "pub_date": subprocess.run(["date", "-u", "+%Y-%m-%dT%H:%M:%SZ"], capture_output=True, text=True).stdout.strip(),
         "platforms": {"darwin-aarch64": platform, "darwin-x86_64": platform},
     }
     os.makedirs(os.path.join(ROOT, "updates"), exist_ok=True)
