@@ -1,0 +1,47 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Disco</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<aside>
+  <header><b>Disco</b><span id="status"></span></header>
+  <ul id="agents"></ul>
+  <details id="add">
+    <summary>＋ 添加 A2A Agent</summary>
+    <form id="add-form">
+      <input name="name" placeholder="名称，如 planner" required>
+      <input name="url" placeholder="https://agent.example.com" required>
+      <input name="header_name" placeholder="鉴权头（可选），如 authorization">
+      <input name="header_value" type="password" placeholder="鉴权值（可选），如 Bearer …">
+      <button>连接并添加</button>
+      <small class="err" id="add-err"></small>
+    </form>
+  </details>
+  <details id="discord">
+    <summary>Discord</summary>
+    <form id="discord-form">
+      <input name="token" type="password" placeholder="Bot token（存入钥匙串）">
+      <button>保存</button>
+    </form>
+    <button id="discord-check">验证实时连接</button>
+    <small id="discord-out"></small>
+  </details>
+</aside>
+<main>
+  <div id="empty">左侧选择一个 agent 开始对话</div>
+  <section id="chat" hidden>
+    <h2 id="chat-title"></h2>
+    <div id="log"></div>
+    <form id="send">
+      <textarea name="text" rows="2" placeholder="给 agent 发消息，⌘↩ 发送"></textarea>
+      <button>发送</button>
+    </form>
+  </section>
+</main>
+<script src="app.js"></script>
+</body>
+</html>
