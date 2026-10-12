@@ -4,17 +4,18 @@ use std::time::Duration;
 use disco_acp::{AcpAgent, Launch};
 use disco_types::{AgentEvent, PermissionDecision, TaskPhase};
 
-async fn run(decision: &str) -> String {
-    // SAFETY-free: set in parent only; the child must not see it.
-    let launch = Launch {
+fn launch() -> Launch {
+    Launch {
         command: env!("CARGO_BIN_EXE_mock-acp-agent").into(),
         args: vec![],
         env: vec![],
         cwd: std::env::temp_dir(),
         prompt_timeout: Duration::from_secs(10),
-    };
-    let agent = AcpAgent::spawn(launch).await.unwrap();
-    let mut rx = agent.prompt("go").await.unwrap();
+    }
+}
+
+async fn drive(agent: &AcpAgent, key: &str, decision: &str) -> String {
+    let mut rx = agent.prompt(key, "go").await.unwrap();
     let mut text = String::new();
     while let Some(ev) = rx.recv().await {
         match ev {
@@ -35,6 +36,27 @@ async fn run(decision: &str) -> String {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn streams_and_handles_permission() {
-    assert_eq!(run("allow").await, "hello from mock env=clean ran");
-    assert_eq!(run("deny").await, "hello from mock env=clean skipped");
+    let agent = AcpAgent::spawn(launch()).await.unwrap();
+    assert_eq!(drive(&agent, "dm", "allow").await, "hello from mock env=clean ran");
+    assert_eq!(drive(&agent, "dm", "deny").await, "hello from mock env=clean skipped");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn sessions_run_concurrently() {
+    let agent = AcpAgent::spawn(launch()).await.unwrap();
+    let t = std::time::Instant::now();
+    let (a, b, c) = tokio::join!(drive(&agent, "group:1", "allow"), drive(&agent, "group:2", "deny"), drive(&agent, "dm", "allow"));
+    assert!(a.ends_with("ran") && b.ends_with("skipped") && c.ends_with("ran"));
+    // Each turn sleeps 300 ms in the mock; serial would take >= 900 ms.
+    assert!(t.elapsed() < Duration::from_millis(880), "took {:?}", t.elapsed());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn kill_ends_the_turn() {
+    let agent = AcpAgent::spawn(launch()).await.unwrap();
+    let mut rx = agent.prompt("dm", "go").await.unwrap();
+    agent.kill();
+    let mut last = None;
+    while let Some(ev) = rx.recv().await { last = Some(ev); }
+    assert!(!matches!(last, Some(AgentEvent::Done { phase: TaskPhase::Completed, .. })));
 }

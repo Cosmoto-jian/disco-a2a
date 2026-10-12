@@ -5,7 +5,6 @@
 mod hub;
 mod templates;
 
-use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -20,8 +19,9 @@ use tokio::sync::{mpsc, watch};
 
 const KEYCHAIN_SERVICE: &str = "dev.cosmoto.disco";
 const DISCORD_KEY: &str = "discord-bot-token";
-/// Agent-to-agent hand-offs allowed per human message in a group.
-const MAX_HOPS: usize = 4;
+/// Hand-off rounds and total agent turns allowed per human message in a group.
+const MAX_WAVES: usize = 4;
+const MAX_TURNS: usize = 12;
 const TRANSCRIPT: u32 = 20;
 
 type CmdResult<T> = Result<T, String>;
@@ -122,31 +122,47 @@ impl Core {
         if !from_discord && let Some(d) = self.discord_rest() {
             let _ = d.post(&channel, &format!("**{author}**：{text}")).await;
         }
-        let mut queue: VecDeque<String> = mentions(&text, &g.members, None).into();
-        if queue.is_empty() && let Some(lead) = g.lead_agent.clone().or_else(|| g.members.first().cloned()) {
-            queue.push_back(lead);
+        let mut wave = mentions(&text, &g.members, None);
+        if wave.is_empty() && let Some(lead) = g.lead_agent.clone().or_else(|| g.members.first().cloned()) {
+            wave.push(lead);
         }
-        let mut hops = 0;
-        while let Some(agent) = queue.pop_front() {
-            if hops >= MAX_HOPS || self.paused.load(Ordering::Relaxed) { break; }
-            hops += 1;
-            let prompt = self.group_prompt(&g, &thread, &agent);
-            match self.turn(&thread, &agent, &thread, &prompt).await {
-                Ok(answer) => {
-                    let answer = answer.trim().to_owned();
-                    if answer.is_empty() { continue; }
-                    self.post_message(&thread, &agent, &answer);
-                    if let (Some(d), Some(hook)) = (self.discord_rest(), g.webhook_ref.as_deref().and_then(secret_get))
-                        && let Err(e) = d.post_as(&hook, &agent, &answer).await
-                    {
-                        self.post_message(&thread, "system", &format!("Discord 发送失败：{e}"));
-                    }
-                    for next in mentions(&answer, &g.members, Some(&agent)) {
-                        if !queue.contains(&next) { queue.push_back(next); }
+        // Agents addressed together run concurrently; their @handoffs form the next
+        // wave. Bounded by MAX_WAVES and MAX_TURNS so agents can't ping-pong forever.
+        let (mut waves, mut turns) = (0, 0);
+        while !wave.is_empty() && waves < MAX_WAVES && !self.paused.load(Ordering::Relaxed) {
+            waves += 1;
+            wave.truncate(MAX_TURNS.saturating_sub(turns));
+            turns += wave.len();
+            let runs = wave.iter().map(|agent| {
+                let prompt = self.group_prompt(&g, &thread, agent);
+                let thread = &thread;
+                let g = &g;
+                async move {
+                    match self.turn(thread, agent, thread, &prompt).await {
+                        Ok(answer) => {
+                            let answer = answer.trim().to_owned();
+                            if answer.is_empty() { return Vec::new(); }
+                            // Post as soon as this agent finishes, not when the wave does.
+                            self.post_message(thread, agent, &answer);
+                            if let (Some(d), Some(hook)) = (self.discord_rest(), g.webhook_ref.as_deref().and_then(secret_get))
+                                && let Err(e) = d.post_as(&hook, agent, &answer).await
+                            {
+                                self.post_message(thread, "system", &format!("Discord 发送失败：{e}"));
+                            }
+                            mentions(&answer, &g.members, Some(agent))
+                        }
+                        Err(e) => {
+                            self.post_message(thread, "system", &format!("{agent} 出错：{e}"));
+                            Vec::new()
+                        }
                     }
                 }
-                Err(e) => self.post_message(&thread, "system", &format!("{agent} 出错：{e}")),
+            });
+            let mut next: Vec<String> = Vec::new();
+            for m in futures::future::join_all(runs).await.into_iter().flatten() {
+                if !next.contains(&m) { next.push(m); }
             }
+            wave = next;
         }
     }
 
@@ -170,13 +186,23 @@ impl Core {
     }
 }
 
-/// Members named as `@name` in `text` (case-insensitive), in order, excluding `me`.
+/// Members named as `@name` in `text` (case-insensitive, whole names only, so
+/// `@coder` does not match `@coder-2`), in order of first mention, excluding `me`.
+/// `@all` / `@所有人` addresses every member at once.
 fn mentions(text: &str, members: &[String], me: Option<&str>) -> Vec<String> {
     let lower = text.to_lowercase();
-    let mut hits: Vec<(usize, &String)> = members
-        .iter()
-        .filter(|m| Some(m.as_str()) != me)
-        .filter_map(|m| lower.find(&format!("@{}", m.to_lowercase())).map(|i| (i, m)))
+    let others = members.iter().filter(|m| Some(m.as_str()) != me);
+    if lower.contains("@all") || text.contains("@所有人") {
+        return others.cloned().collect();
+    }
+    let is_name_char = |c: char| c.is_alphanumeric() || c == '-' || c == '_';
+    let mut hits: Vec<(usize, &String)> = others
+        .filter_map(|m| {
+            let needle = format!("@{}", m.to_lowercase());
+            lower.match_indices(&needle).map(|(i, _)| i).find(|&i| {
+                !lower[i + needle.len()..].chars().next().is_some_and(is_name_char)
+            }).map(|i| (i, m))
+        })
         .collect();
     hits.sort_unstable_by_key(|(i, _)| *i);
     hits.into_iter().map(|(_, m)| m.clone()).collect()
@@ -262,11 +288,14 @@ struct NewAgent {
     header_value: Option<String>,
     command: Option<String>,
     cwd: Option<String>,
+    /// Local agents only: how many instances to add (name, name-2, name-3 …).
+    count: Option<u8>,
+    worktree: Option<bool>,
 }
 
 #[tauri::command]
-async fn add_agent(core: St<'_>, spec: NewAgent) -> CmdResult<()> {
-    let NewAgent { template, name, url, header_name, header_value, command, cwd } = spec;
+async fn add_agent(core: St<'_>, spec: NewAgent) -> CmdResult<Vec<String>> {
+    let NewAgent { template, name, url, header_name, header_value, command, cwd, count, worktree } = spec;
     let name = valid_name(&name)?;
     let t = templates::get(&template).ok_or("未知模板")?;
     let row = match t.kind {
@@ -282,7 +311,9 @@ async fn add_agent(core: St<'_>, spec: NewAgent) -> CmdResult<()> {
                 secret_set(&account, &format!("{h}\n{value}"))?;
                 Some(account)
             } else { None };
-            AgentRow { id: uuid::Uuid::new_v4().to_string(), name, transport: "a2a".into(), endpoint: url, credential_ref, card_json: serde_json::to_string(&agent.card).ok() }
+            let row = AgentRow { id: uuid::Uuid::new_v4().to_string(), name: name.clone(), transport: "a2a".into(), endpoint: url, credential_ref, card_json: serde_json::to_string(&agent.card).ok() };
+            core.db().upsert_agent(&row).map_err(err)?;
+            return Ok(vec![name]);
         }
         kind => {
             let (cmd, args) = if kind == "command" {
@@ -292,13 +323,33 @@ async fn add_agent(core: St<'_>, spec: NewAgent) -> CmdResult<()> {
             } else {
                 (t.command.to_owned(), t.args.iter().map(|s| s.to_string()).collect::<Vec<_>>())
             };
-            let spec = LocalSpec { template: t.id.into(), command: cmd.clone(), args: args.clone(), cwd: cwd.unwrap_or_default().trim().into(), description: t.blurb.into() };
-            AgentRow { id: uuid::Uuid::new_v4().to_string(), name, transport: "acp".into(), endpoint: std::iter::once(cmd).chain(args).collect::<Vec<_>>().join(" "), credential_ref: None, card_json: serde_json::to_string(&spec).ok() }
+            let n = count.unwrap_or(1).clamp(1, 8) as usize;
+            let spec = LocalSpec {
+                template: t.id.into(), command: cmd.clone(), args: args.clone(),
+                cwd: cwd.unwrap_or_default().trim().into(), description: t.blurb.into(),
+                worktree: worktree.unwrap_or(n > 1),
+            };
+            let endpoint = std::iter::once(cmd).chain(args).collect::<Vec<_>>().join(" ");
+            let card = serde_json::to_string(&spec).ok();
+            let existing: Vec<String> = core.db().list_agents().map_err(err)?.into_iter().map(|a| a.name).collect();
+            let mut names = Vec::with_capacity(n);
+            let mut i = 1;
+            while names.len() < n {
+                let candidate = if i == 1 { name.clone() } else { format!("{name}-{i}") };
+                i += 1;
+                if n > 1 && existing.contains(&candidate) { continue; }
+                names.push(candidate);
+            }
+            let mut db = core.db();
+            for nm in &names {
+                db.upsert_agent(&AgentRow { id: uuid::Uuid::new_v4().to_string(), name: nm.clone(), transport: "acp".into(), endpoint: endpoint.clone(), credential_ref: None, card_json: card.clone() }).map_err(err)?;
+            }
+            names
         }
     };
-    core.db().upsert_agent(&row).map_err(err)?;
-    Ok(())
+    Ok(row)
 }
+
 
 #[tauri::command]
 async fn remove_agent(core: St<'_>, name: String) -> CmdResult<()> {
@@ -460,5 +511,8 @@ mod tests {
         assert_eq!(mentions("@Reviewer 看下，@coder 先写", &m, None), ["reviewer", "coder"]);
         assert_eq!(mentions("@coder 我自己来 @planner", &m, Some("coder")), ["planner"]);
         assert!(mentions("没有提到谁", &m, None).is_empty());
+        let m2 = vec!["coder".to_string(), "coder-2".to_string(), "coder-3".to_string()];
+        assert_eq!(mentions("@coder-2 和 @coder 分头做", &m2, None), ["coder-2", "coder"]);
+        assert_eq!(mentions("@all 并行开工", &m2, Some("coder")), ["coder-2", "coder-3"]);
     }
 }

@@ -1,7 +1,9 @@
 //! ACP → Disco bridge. Spawns a local coding agent (Claude Code, Codex, Hermes, pi,
 //! OpenCode, dsh …) under a minimal sandbox and turns its ACP stream into
 //! transport-neutral [`AgentEvent`]s. One child process per agent, one ACP session per
-//! Disco context; the child is killed (whole process group) when the handle drops.
+//! Disco context (DM or group). Prompts on different sessions run concurrently;
+//! prompts on the same session are serialised, as ACP requires. The child is killed
+//! (whole process group) when the handle drops.
 #![forbid(unsafe_code)]
 
 use std::collections::HashMap;
@@ -47,11 +49,15 @@ pub struct Launch {
 const INHERITED: &[&str] = &["PATH", "HOME", "LANG", "TMPDIR", "USER", "SHELL"];
 
 type Pending = Arc<Mutex<HashMap<String, oneshot::Sender<PermissionDecision>>>>;
-type Sink = Arc<Mutex<Option<mpsc::Sender<AgentEvent>>>>;
+/// ACP session id -> event channel of the prompt currently running in it.
+type Sinks = Arc<Mutex<HashMap<String, mpsc::Sender<AgentEvent>>>>;
 
 enum Cmd {
-    Prompt { text: String, events: mpsc::Sender<AgentEvent> },
-    Cancel,
+    Prompt { key: String, text: String, events: mpsc::Sender<AgentEvent> },
+}
+
+fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|p| p.into_inner())
 }
 
 /// A running ACP agent with one session.
@@ -88,39 +94,35 @@ impl AcpAgent {
             tokio::spawn(drain_stderr(stderr));
         }
 
-        let (cmd_tx, cmd_rx) = mpsc::channel::<Cmd>(8);
+        let (cmd_tx, cmd_rx) = mpsc::channel::<Cmd>(32);
         let pending: Pending = Arc::default();
-        let sink: Sink = Arc::default();
         let transport = ByteStreams::new(stdin.compat_write(), stdout.compat());
-        tokio::spawn(run_connection(transport, launch, cmd_rx, pending.clone(), sink));
+        tokio::spawn(run_connection(transport, launch, cmd_rx, pending.clone()));
         Ok(Self { cmd: cmd_tx, pending, child: Mutex::new(child) })
     }
 
-    /// Send one prompt; events stream until a `Done`.
-    pub async fn prompt(&self, text: impl Into<String>) -> Result<mpsc::Receiver<AgentEvent>, AcpError> {
+    /// Send one prompt in the session named `key` (created on first use);
+    /// events stream until a `Done`.
+    pub async fn prompt(&self, key: impl Into<String>, text: impl Into<String>) -> Result<mpsc::Receiver<AgentEvent>, AcpError> {
         let (tx, rx) = mpsc::channel(64);
-        self.cmd.send(Cmd::Prompt { text: text.into(), events: tx }).await.map_err(|_| AcpError::Gone)?;
+        self.cmd.send(Cmd::Prompt { key: key.into(), text: text.into(), events: tx }).await.map_err(|_| AcpError::Gone)?;
         Ok(rx)
     }
 
     /// Answer a `PermissionAsked` event.
     pub fn decide(&self, request_id: &str, decision: PermissionDecision) -> bool {
-        self.pending.lock().unwrap_or_else(|p| p.into_inner()).remove(request_id).is_some_and(|tx| tx.send(decision).is_ok())
+        lock(&self.pending).remove(request_id).is_some_and(|tx| tx.send(decision).is_ok())
     }
 
     /// Kill the agent and every process it started (it leads its own process group).
     pub fn kill(&self) {
-        let mut child = self.child.lock().unwrap_or_else(|p| p.into_inner());
+        let mut child = lock(&self.child);
         #[cfg(unix)]
         if let Some(pid) = child.id() {
             let _ = std::process::Command::new("kill").args(["-KILL", &format!("-{pid}")])
                 .stdout(Stdio::null()).stderr(Stdio::null()).status();
         }
         let _ = child.start_kill();
-    }
-
-    pub async fn cancel(&self) {
-        let _ = self.cmd.send(Cmd::Cancel).await;
     }
 }
 
@@ -132,8 +134,8 @@ async fn drain_stderr(stderr: tokio::process::ChildStderr) {
     }
 }
 
-fn emit(sink: &Sink, ev: AgentEvent) {
-    if let Some(tx) = sink.lock().unwrap_or_else(|p| p.into_inner()).as_ref() {
+fn emit(sinks: &Sinks, session: &str, ev: AgentEvent) {
+    if let Some(tx) = lock(sinks).get(session) {
         // Progress may be dropped under backpressure; Done is sent separately and awaited.
         let _ = tx.try_send(ev);
     }
@@ -169,13 +171,13 @@ async fn run_connection<W, R>(
     launch: Launch,
     mut cmd_rx: mpsc::Receiver<Cmd>,
     pending: Pending,
-    sink: Sink,
 ) where
     W: futures::AsyncWrite + Send + 'static,
     R: futures::AsyncRead + Send + 'static,
 {
-    let sink_n = sink.clone();
-    let sink_p = sink.clone();
+    let sinks: Sinks = Arc::default();
+    let sinks_n = sinks.clone();
+    let sinks_p = sinks.clone();
     let pending_p = pending.clone();
     let result = agent_client_protocol::Client
         .builder()
@@ -183,7 +185,7 @@ async fn run_connection<W, R>(
         .on_receive_notification(
             async move |n: SessionNotification, _cx| {
                 if let Some(ev) = map_update(n.update) {
-                    emit(&sink_n, ev);
+                    emit(&sinks_n, &n.session_id.to_string(), ev);
                 }
                 Ok(())
             },
@@ -191,10 +193,12 @@ async fn run_connection<W, R>(
         )
         .on_receive_request(
             async move |req: RequestPermissionRequest, responder, cx| {
-                let id = req.tool_call.tool_call_id.to_string();
+                let session = req.session_id.to_string();
+                // Tool-call ids are only unique within a session.
+                let id = format!("{session}/{}", req.tool_call.tool_call_id);
                 let (tx, rx) = oneshot::channel();
-                pending_p.lock().unwrap_or_else(|p| p.into_inner()).insert(id.clone(), tx);
-                emit(&sink_p, AgentEvent::PermissionAsked {
+                lock(&pending_p).insert(id.clone(), tx);
+                emit(&sinks_p, &session, AgentEvent::PermissionAsked {
                     request_id: id,
                     title: req.tool_call.fields.title.clone().unwrap_or_default(),
                     options: req.options.iter().map(|o| PermissionChoice {
@@ -218,27 +222,39 @@ async fn run_connection<W, R>(
         )
         .connect_with(transport, async move |conn: ConnectionTo<Agent>| {
             conn.send_request(InitializeRequest::new(ProtocolVersion::V1)).block_task().await?;
-            let session: SessionId = conn
-                .send_request(NewSessionRequest::new(launch.cwd.clone()))
-                .block_task()
-                .await?
-                .session_id;
-            while let Some(cmd) = cmd_rx.recv().await {
-                let Cmd::Prompt { text, events } = cmd else { continue };
-                *sink.lock().unwrap_or_else(|p| p.into_inner()) = Some(events.clone());
-                let _ = events.send(AgentEvent::Phase { phase: TaskPhase::Working }).await;
-                let req = PromptRequest::new(session.clone(), vec![ContentBlock::Text(TextContent::new(text))]);
-                let done = match tokio::time::timeout(launch.prompt_timeout, conn.send_request(req).block_task()).await {
-                    Ok(Ok(r)) => AgentEvent::Done {
-                        phase: TaskPhase::Completed,
-                        stop_reason: Some(format!("{:?}", r.stop_reason).to_lowercase()),
+            // Disco context key -> (ACP session, per-session turn lock).
+            let mut sessions: HashMap<String, (SessionId, Arc<tokio::sync::Mutex<()>>)> = HashMap::new();
+            while let Some(Cmd::Prompt { key, text, events }) = cmd_rx.recv().await {
+                let (session, turn) = match sessions.get(&key) {
+                    Some(s) => s.clone(),
+                    None => match conn.send_request(NewSessionRequest::new(launch.cwd.clone())).block_task().await {
+                        Ok(r) => sessions.entry(key).or_insert((r.session_id, Arc::default())).clone(),
+                        Err(e) => {
+                            let _ = events.send(AgentEvent::Done { phase: TaskPhase::Failed, stop_reason: Some(e.to_string()) }).await;
+                            continue;
+                        }
                     },
-                    Ok(Err(e)) => AgentEvent::Done { phase: TaskPhase::Failed, stop_reason: Some(e.to_string()) },
-                    Err(_) => AgentEvent::Done { phase: TaskPhase::Failed, stop_reason: Some("timeout".into()) },
                 };
-                pending.lock().unwrap_or_else(|p| p.into_inner()).clear();
-                *sink.lock().unwrap_or_else(|p| p.into_inner()) = None;
-                let _ = events.send(done).await;
+                let (conn, sinks, pending, timeout) = (conn.clone(), sinks.clone(), pending.clone(), launch.prompt_timeout);
+                tokio::spawn(async move {
+                    let _turn = turn.lock().await;
+                    let sid = session.to_string();
+                    lock(&sinks).insert(sid.clone(), events.clone());
+                    let _ = events.send(AgentEvent::Phase { phase: TaskPhase::Working }).await;
+                    let req = PromptRequest::new(session, vec![ContentBlock::Text(TextContent::new(text))]);
+                    let done = match tokio::time::timeout(timeout, conn.send_request(req).block_task()).await {
+                        Ok(Ok(r)) => AgentEvent::Done {
+                            phase: TaskPhase::Completed,
+                            stop_reason: Some(format!("{:?}", r.stop_reason).to_lowercase()),
+                        },
+                        Ok(Err(e)) => AgentEvent::Done { phase: TaskPhase::Failed, stop_reason: Some(e.to_string()) },
+                        Err(_) => AgentEvent::Done { phase: TaskPhase::Failed, stop_reason: Some("timeout".into()) },
+                    };
+                    let prefix = format!("{sid}/");
+                    lock(&pending).retain(|k, _| !k.starts_with(&prefix));
+                    lock(&sinks).remove(&sid);
+                    let _ = events.send(done).await;
+                });
             }
             Ok(())
         })

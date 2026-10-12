@@ -27,7 +27,11 @@ async fn main() -> agent_client_protocol::Result<()> {
             agent_client_protocol::on_receive_request!(),
         )
         .on_receive_request(
-            async move |_r: NewSessionRequest, responder, _cx| responder.respond(NewSessionResponse::new("s1")),
+            async move |_r: NewSessionRequest, responder, _cx| {
+                static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
+                let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                responder.respond(NewSessionResponse::new(format!("s{n}")))
+            },
             agent_client_protocol::on_receive_request!(),
         )
         .on_receive_request(
@@ -35,6 +39,7 @@ async fn main() -> agent_client_protocol::Result<()> {
                 let cx2 = cx.clone();
                 cx.spawn(async move {
                     let s = r.session_id.clone();
+                    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
                     chunk(&cx2, &s, "hello ")?;
                     chunk(&cx2, &s, "from mock")?;
                     let leaked = std::env::var("DISCO_LEAK_PROBE").is_ok();

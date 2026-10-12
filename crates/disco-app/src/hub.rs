@@ -21,6 +21,10 @@ pub struct LocalSpec {
     pub args: Vec<String>,
     pub cwd: String,
     pub description: String,
+    /// Give this agent its own git worktree (branch `disco/<name>`) so several
+    /// coding agents can work on one repo without overwriting each other.
+    #[serde(default)]
+    pub worktree: bool,
 }
 
 #[derive(Clone)]
@@ -31,16 +35,20 @@ enum Runtime {
 
 pub struct Hub {
     live: Mutex<HashMap<String, Runtime>>,
+    /// Caps simultaneous agent turns across the whole app.
+    slots: Arc<tokio::sync::Semaphore>,
     /// The user's login-shell PATH: GUI apps start with a bare one, so npx and
     /// Homebrew tools would otherwise be invisible.
     user_path: String,
 }
 
+pub const MAX_CONCURRENT: usize = 8;
+
 pub type CredLookup = dyn Fn(&str) -> Option<String> + Send + Sync;
 
 impl Hub {
     pub fn new() -> Self {
-        Self { live: Mutex::default(), user_path: login_path() }
+        Self { live: Mutex::default(), slots: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT)), user_path: login_path() }
     }
 
     async fn runtime(&self, row: &AgentRow, secret: &CredLookup) -> Result<Runtime, String> {
@@ -59,11 +67,14 @@ impl Hub {
             }
             "acp" => {
                 let spec: LocalSpec = row.card_json.as_deref().and_then(|j| serde_json::from_str(j).ok()).ok_or("缺少启动配置")?;
-                let cwd = match spec.cwd.strip_prefix('~') {
+                let mut cwd = match spec.cwd.strip_prefix('~') {
                     _ if spec.cwd.is_empty() => dirs_home(),
                     Some(rest) => dirs_home().join(rest.trim_start_matches('/')),
                     None => PathBuf::from(&spec.cwd),
                 };
+                if spec.worktree && let Some(wt) = ensure_worktree(&cwd, &row.name, &self.user_path) {
+                    cwd = wt;
+                }
                 let launch = Launch {
                     command: spec.command,
                     args: spec.args,
@@ -88,6 +99,7 @@ impl Hub {
         text: &str,
         on_event: impl Fn(&AgentEvent),
     ) -> Result<String, String> {
+        let _slot = self.slots.acquire().await.map_err(|e| e.to_string())?;
         let rt = self.runtime(row, secret).await?;
         let mut answer = String::new();
         let mut finish = |ev: AgentEvent| -> Option<Result<(), String>> {
@@ -109,7 +121,7 @@ impl Hub {
                 out.unwrap_or(Ok(()))
             }
             Runtime::Acp(a) => {
-                let mut rx = a.prompt(text).await.map_err(|e| e.to_string())?;
+                let mut rx = a.prompt(context, text).await.map_err(|e| e.to_string())?;
                 let mut out = Some(Err("agent 进程已退出".into()));
                 while let Some(ev) = rx.recv().await {
                     if let Some(r) = finish(ev) { out = Some(r); break; }
@@ -146,6 +158,30 @@ impl Hub {
         }
         all.len()
     }
+}
+
+/// If `dir` is inside a git repo, return (creating on first use) a worktree for
+/// `name` at `<repo>/.disco-worktrees/<name>` on branch `disco/<name>`.
+fn ensure_worktree(dir: &std::path::Path, name: &str, path: &str) -> Option<PathBuf> {
+    let git = |args: &[&str], cwd: &std::path::Path| {
+        std::process::Command::new("git").args(args).current_dir(cwd).env("PATH", path)
+            .stdin(std::process::Stdio::null()).stderr(std::process::Stdio::null()).output().ok()
+            .filter(|o| o.status.success())
+    };
+    let top = PathBuf::from(String::from_utf8(git(&["rev-parse", "--show-toplevel"], dir)?.stdout).ok()?.trim());
+    let wt = top.join(".disco-worktrees").join(name);
+    if !wt.exists() {
+        let branch = format!("disco/{name}");
+        let wt_s = wt.to_string_lossy().into_owned();
+        git(&["worktree", "add", "-B", &branch, &wt_s], &top)?;
+        // Keep the worktrees out of the user's `git status`.
+        let exclude = top.join(".git/info/exclude");
+        let cur = std::fs::read_to_string(&exclude).unwrap_or_default();
+        if !cur.lines().any(|l| l.trim() == ".disco-worktrees/") {
+            let _ = std::fs::write(&exclude, format!("{cur}{}.disco-worktrees/\n", if cur.ends_with('\n') || cur.is_empty() { "" } else { "\n" }));
+        }
+    }
+    Some(wt)
 }
 
 fn dirs_home() -> PathBuf {

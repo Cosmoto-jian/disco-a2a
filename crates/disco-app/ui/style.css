@@ -8,7 +8,6 @@
     --bubble:#2c2c2f; --hover:#2c2c30; --sel:#2f3160; }
 }
 * { box-sizing:border-box; }
-[hidden] { display:none !important; }
 html, body { height:100%; margin:0; }
 body { display:grid; grid-template-columns:68px 290px 1fr; font:13.5px/1.5 -apple-system, BlinkMacSystemFont, "PingFang SC", sans-serif; color:var(--fg); background:var(--main); overflow:hidden; -webkit-user-select:none; user-select:none; }
 button { font:inherit; color:inherit; cursor:pointer; }
@@ -70,8 +69,8 @@ body.paused #kill { color:#fff; background:var(--red); }
 .m.me .b { background:var(--me); color:var(--me-fg); }
 .m.sys { align-self:center; max-width:90%; color:var(--mute); font-size:12px; }
 .b p { margin:0 0 6px; } .b p:last-child { margin:0; }
-.b pre { margin:6px 0; padding:9px 11px; border-radius:8px; background:rgba(127,127,127,.14); overflow:auto; font:12px/1.45 ui-monospace, Menlo, monospace; }
-.b code { font:12px ui-monospace, Menlo, monospace; background:rgba(127,127,127,.16); padding:1px 4px; border-radius:4px; }
+.b pre { margin:6px 0; padding:9px 11px; border-radius:8px; background:rgba(0,0,0,.06); overflow:auto; font:12px/1.45 ui-monospace, Menlo, monospace; }
+.b code { font:12px ui-monospace, Menlo, monospace; background:rgba(0,0,0,.06); padding:1px 4px; border-radius:4px; }
 .b pre code { background:none; padding:0; }
 .m.me .b code, .m.me .b pre { background:rgba(255,255,255,.18); }
 .b ul, .b ol { margin:4px 0; padding-left:20px; }

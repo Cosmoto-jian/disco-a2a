@@ -4,6 +4,7 @@ const { listen } = window.__TAURI__.event;
 const $ = (s, r = document) => r.querySelector(s);
 
 // ---------- state
+// typing: thread -> Set(agent); live: "thread|agent" -> streaming bubble
 const S = { tab: "chats", thread: null, ov: null, tpl: [], typing: {}, live: {}, perms: {}, q: "" };
 const COLORS = ["#5865f2", "#d97757", "#10a37f", "#7c5cff", "#e5484d", "#3b82f6", "#f59e0b", "#14b8a6"];
 
@@ -91,7 +92,7 @@ function renderList() {
 }
 function threadRow(t, head, fallback) {
   const isGroup = t.startsWith("group:"); const name = threadName(t);
-  const typing = S.typing[t];
+  const typing = S.typing[t]?.size ? [...S.typing[t]].join("、") : "";
   const live = !isGroup && S.ov.agents.find((a) => `dm:${a.name}` === t)?.live;
   return h("li", { class: S.thread === t ? "on" : "", onclick: () => openThread(t) },
     avatar(name, { group: isGroup, live }),
@@ -115,7 +116,7 @@ async function openThread(t) {
       isGroup ? h("button", { class: "btn", onclick: () => groupDialog(g) }, "成员") : null),
     h("div", { id: "log" }),
     h("div", { id: "composer" },
-      h("textarea", { id: "input", rows: 1, placeholder: isGroup ? "发到群里，用 @名字 指定 agent" : `给 ${name} 发消息` }),
+      h("textarea", { id: "input", rows: 1, placeholder: isGroup ? "发到群里：@名字 指定 agent，同时 @ 多个或 @all 并行执行" : `给 ${name} 发消息` }),
       h("div", { class: "hint" }, "↩ 发送 · ⇧↩ 换行")));
   const ta = $("#input");
   ta.addEventListener("input", () => { ta.style.height = "auto"; ta.style.height = ta.scrollHeight + "px"; });
@@ -127,7 +128,7 @@ async function openThread(t) {
   if (S.thread !== t) return;
   for (const m of msgs) $("#log").append(bubble(m.author, m.body));
   for (const p of Object.values(S.perms)) if (p.thread === t) $("#log").append(permCard(p));
-  if (S.live[t]) $("#log").append(S.live[t].el);
+  for (const [k, v] of Object.entries(S.live)) if (k.startsWith(t + "|")) $("#log").append(v.el);
   scrollLog();
 }
 function bubble(author, body) {
@@ -158,30 +159,34 @@ async function decide(p, optionId) {
 }
 
 // ---------- events
+const liveKey = (thread, agent) => `${thread}|${agent}`;
 listen("message", ({ payload: m }) => {
-  if (m.author !== "me" && S.live[m.thread]) { S.live[m.thread].el.remove(); delete S.live[m.thread]; }
+  const k = liveKey(m.thread, m.author);
+  if (S.live[k]) { S.live[k].el.remove(); delete S.live[k]; }
   const head = S.ov.heads.find((x) => x.thread === m.thread);
   if (head) Object.assign(head, m); else S.ov.heads.unshift(m);
   if (S.thread === m.thread) { $("#log").append(bubble(m.author, m.body)); scrollLog(); }
   renderList();
 });
 listen("typing", ({ payload: { thread, agent, on } }) => {
-  if (on) S.typing[thread] = agent; else delete S.typing[thread];
-  if (on && !S.live[thread]) {
+  const set = (S.typing[thread] ??= new Set());
+  on ? set.add(agent) : set.delete(agent);
+  const k = liveKey(thread, agent);
+  if (on && !S.live[k]) {
     const b = h("div", { class: "b" }, h("span", { class: "typing-dots" }, h("i"), h("i"), h("i")));
-    S.live[thread] = { agent, text: "", b, el: h("div", { class: "m" }, avatar(agent, { small: true }), h("div", {}, h("div", { class: "who" }, agent), b)) };
-    if (S.thread === thread) { $("#log").append(S.live[thread].el); scrollLog(); }
+    S.live[k] = { text: "", b, el: h("div", { class: "m" }, avatar(agent, { small: true }), h("div", {}, h("div", { class: "who" }, agent), b)) };
+    if (S.thread === thread) { $("#log").append(S.live[k].el); scrollLog(); }
   }
-  if (!on && S.live[thread] && !S.live[thread].text) { S.live[thread].el.remove(); delete S.live[thread]; }
+  if (!on && S.live[k] && !S.live[k].text) { S.live[k].el.remove(); delete S.live[k]; }
   renderList();
 });
 listen("stream", ({ payload: { thread, agent, event } }) => {
-  const live = S.live[thread];
+  const live = S.live[liveKey(thread, agent)];
   if (event.type === "text_chunk" && live) {
     live.text += event.text; live.b.innerHTML = md(live.text);
     if (S.thread === thread) scrollLog();
   } else if (event.type === "tool" && S.thread === thread && event.title) {
-    const chip = h("div", { class: "chip" }, `🔧 ${event.title}`);
+    const chip = h("div", { class: "chip" }, `🔧 ${agent} · ${event.title}`);
     live ? live.el.before(chip) : $("#log").append(chip);
   } else if (event.type === "permission_asked") {
     const p = { ...event, agent, thread }; S.perms[event.request_id] = p;
@@ -208,10 +213,17 @@ function agentDialog(t) {
     h("label", {}, "鉴权头（可选）", h("input", { name: "header_name", placeholder: "authorization" })),
     h("label", {}, "鉴权值（可选，存入钥匙串）", h("input", { name: "header_value", type: "password", placeholder: "Bearer …" })));
   if (t.kind === "command") fields.push(h("label", {}, "启动命令", h("input", { name: "command", required: true, placeholder: "my-agent --acp" })));
-  if (t.kind !== "a2a") fields.push(h("label", {}, "工作目录（可选，默认主目录）", h("input", { name: "cwd", placeholder: "~/code/project" })));
+  if (t.kind !== "a2a") {
+    const wt = h("input", { type: "checkbox", name: "worktree" });
+    const count = h("input", { name: "count", type: "number", min: 1, max: 8, value: 1, oninput: () => { wt.checked = Number(count.value) > 1; } });
+    fields.push(
+      h("label", {}, "工作目录（可选，默认主目录）", h("input", { name: "cwd", placeholder: "~/code/project" })),
+      h("label", {}, "实例数量（同时拉多个，命名为 名称、名称-2 …）", count),
+      h("div", { class: "checks" }, h("label", {}, wt, "每个实例使用独立 git worktree（多实例改同一仓库时推荐）")));
+  }
   dialog(fields, "添加", async (f) => {
-    await invoke("add_agent", { spec: { template: t.id, name: f.name, url: f.url ?? null, headerName: f.header_name || null, headerValue: f.header_value || null, command: f.command ?? null, cwd: f.cwd || null } });
-    await load(); S.tab = "chats"; setTab("chats"); openThread(`dm:${f.name.trim()}`);
+    await invoke("add_agent", { spec: { template: t.id, name: f.name, url: f.url ?? null, headerName: f.header_name || null, headerValue: f.header_value || null, command: f.command ?? null, cwd: f.cwd || null, count: Number(f.count || 1), worktree: f.worktree === "on" } });
+    await load(); setTab("chats"); openThread(`dm:${f.name.trim()}`);
   });
 }
 async function removeAgent(name) {
