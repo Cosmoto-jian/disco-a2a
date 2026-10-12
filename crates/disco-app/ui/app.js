@@ -6,7 +6,7 @@ const $ = (s, r = document) => r.querySelector(s);
 // ---------- state
 // typing: thread -> Set(agent); live: "thread|agent" -> streaming bubble
 // msgs: thread -> cached messages, so switching chats renders instantly.
-const S = { tab: "chats", thread: null, ov: null, tpl: [], typing: {}, live: {}, inbox: [], q: "", msgs: {}, found: null };
+const S = { tab: "chats", thread: null, ov: null, tpl: [], typing: {}, live: {}, inbox: [], team: {}, q: "", msgs: {}, found: null };
 const REDUCED = matchMedia("(prefers-reduced-motion: reduce)").matches;
 const COLORS = ["#5865f2", "#d97757", "#10a37f", "#7c5cff", "#e5484d", "#3b82f6", "#f59e0b", "#14b8a6"];
 
@@ -164,11 +164,12 @@ async function openThread(t) {
       h("div", {}, h("h2", { title: a ? "双击重命名" : "", ondblclick: a ? (e) => inlineRename(e.currentTarget, a.name) : null }, name), h("small", {}, sub)), h("span", { class: "sp" }),
       a && a.kind === "acp" ? h("div", { id: "cfgs" }) : null,
       !peer ? h("button", { class: "btn space-btn", title: "待办和群文档（agent 也能读写）", onclick: () => toggleSpace(t) }, "待办 · 文档", h("span", { class: "count", id: "todo-count" })) : null,
+      isGroup ? h("button", { class: "btn", title: "让成员分工并行处理一个任务，最后由组长汇总", onclick: () => { const i = $("#input"); if (!i.value.startsWith("/team ")) i.value = `/team ${i.value}`; i.focus(); i.dispatchEvent(new Event("input")); } }, "团队") : null,
       isGroup ? h("button", { class: "btn", onclick: () => groupDialog(g) }, "成员") : null,
       a ? h("button", { class: "icon-btn", title: "更多", onclick: (e) => agentMenu(e.currentTarget, a.name) }, "⋯") : null),
     h("div", { id: "log" }),
     peer ? h("div", { class: "peer-note" }, "这是对方的会话，你只能旁观。需要你批准的操作会在这里弹出。") : h("div", { id: "composer" },
-      h("textarea", { id: "input", rows: 1, placeholder: isGroup ? "发到群里：@名字 指定 agent，@all 让所有人一起" : `给 ${name} 发消息` }),
+      h("textarea", { id: "input", rows: 1, placeholder: isGroup ? "发到群里：@名字 指定 agent，@all 一起回答，/team 任务 分工协作" : `给 ${name} 发消息` }),
       sendButton()));
   $("#pane").classList.remove("enter"); void $("#pane").offsetWidth; $("#pane").classList.add("enter");
   const ta = $("#input") ?? h("textarea");
@@ -184,6 +185,7 @@ async function openThread(t) {
   ta.focus();
   if (a && a.kind === "acp") loadConfigs(name, t);
   if (!peer) loadSpace(t);
+  if (isGroup) invoke("team_state", { thread: t }).then((st) => { if (st) { S.team[t] = st; renderTeam(t); } }).catch(() => {});
   const draw = (msgs) => {
     const log = $("#log"); if (!log || S.thread !== t) return;
     log.replaceChildren(...msgs.map((m) => bubble(m.author, m.body)));
@@ -199,9 +201,49 @@ async function openThread(t) {
   if (!Array.isArray(had) || had.length !== fresh.length) draw(fresh);
 }
 // ---------- space: the thread's shared to-dos and doc (agents edit them through Disco tools)
+// ---------- team mode: activity strip over the composer + blackboard drawer
+const TEAM_STAGE = { plan: "正在拆分任务", work: "成员并行处理中", summary: "组长正在汇总", done: "已完成", failed: "未完成" };
+function renderTeam(t) {
+  const st = S.team[t]; const old = $("#team");
+  if (S.thread !== t || !st || st.dismissed) { old?.remove(); return; }
+  const active = ["plan", "work", "summary"].includes(st.stage);
+  const roles = st.roles.map((r) => h("span", { class: `tr ${r.state}`, title: `${r.task}${r.last ? `\n正在：${r.last}` : ""}` },
+    h("i"), `${r.agent}·${r.role}`, r.state === "working" && r.last ? h("small", {}, r.last) : null));
+  const el = h("div", { id: "team", class: active ? "active" : st.stage },
+    h("b", {}, "🧩 ", TEAM_STAGE[st.stage] ?? st.stage), h("div", { class: "roles" }, ...roles),
+    h("button", { class: "btn sm", onclick: () => toggleBoard(t) }, "黑板"),
+    active ? null : h("button", { class: "icon-btn", title: "收起", onclick: () => { st.dismissed = true; renderTeam(t); } }, "×"));
+  if (old) old.replaceWith(el); else $("#composer")?.before(el);
+}
+listen("team", ({ payload: st }) => {
+  const prev = S.team[st.thread];
+  S.team[st.thread] = st;
+  renderTeam(st.thread);
+  if ($("#space.board") && S.thread === st.thread && prev?.stage !== st.stage) loadBoard(st.thread);
+});
+function toggleBoard(t) {
+  const open = $("#space");
+  if (open) { const was = open.classList.contains("board"); open.remove(); $(".space-btn")?.classList.remove("on"); if (was) return; }
+  const box = h("aside", { id: "space", class: "board" });
+  box.style.top = `${$("#pane .head")?.offsetHeight ?? 0}px`;
+  $("#pane").append(box);
+  loadBoard(t);
+}
+async function loadBoard(t, pick) {
+  const files = await invoke("team_files", { thread: t }).catch(() => []);
+  const box = $("#space.board"); if (!box || S.thread !== t) return;
+  const label = (n) => n === "summary.md" ? "结论" : n === "context.md" ? "简报" : n.replace(/^findings\//, "").replace(/\.md$/, "");
+  const cur = files.find(([n]) => n === pick) ?? files[0];
+  const doc = h("div", { class: "doc md" }); doc.innerHTML = cur ? md(cur[1]) : '<p class="mute">还没有团队任务。在群里发「/team 任务」开始。</p>';
+  box.replaceChildren(
+    h("div", { class: "sp-head" }, h("b", {}, "团队黑板"), h("span", { class: "sp" }), h("button", { class: "icon-btn", title: "关闭", onclick: () => box.remove() }, "×")),
+    h("div", { class: "bseg" }, ...files.map(([n]) => h("button", { class: cur && cur[0] === n ? "on" : "", onclick: () => loadBoard(t, n) }, label(n)))),
+    doc);
+}
+
 function toggleSpace(t) {
   const open = $("#space");
-  if (open) { open.remove(); $(".space-btn")?.classList.remove("on"); return; }
+  if (open) { const board = open.classList.contains("board"); open.remove(); $(".space-btn")?.classList.remove("on"); if (!board) return; }
   const box = h("aside", { id: "space" });
   box.style.top = `${$("#pane .head")?.offsetHeight ?? 0}px`;
   $("#pane").append(box);
@@ -722,7 +764,7 @@ async function groupDialog(g) {
 // ---------- settings
 async function loadMemories(box) {
   const ms = await invoke("memories").catch(() => []);
-  box.replaceChildren(...(ms.length ? ms.map((m) => h("li", {}, h("b", {}, m.scope === "all" ? "所有 agent" : m.scope), h("span", { style: "flex:1" }, m.text),
+  box.replaceChildren(...(ms.length ? ms.map((m) => h("li", {}, h("b", {}, m.scope === "all" ? "所有 agent" : m.scope.startsWith("group-") ? (S.ov.groups.find((g) => `group-${g.id}` === m.scope)?.name ?? "群") : m.scope), h("small", { class: "mute" }, m.topic), h("span", { style: "flex:1" }, m.text),
     h("button", { class: "btn", onclick: async () => { await invoke("forget", { key: m.key }); loadMemories(box); } }, "删除"))) : [h("li", {}, h("span", {}, "还没有记忆"))]));
 }
 const inputStyle = "flex:1;height:32px;border:1px solid var(--line);border-radius:8px;padding:0 10px;background:var(--list);color:var(--fg)";

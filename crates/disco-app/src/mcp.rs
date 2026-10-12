@@ -144,8 +144,10 @@ fn tools() -> Value {
           "inputSchema": { "type": "object", "properties": { "group": group } } },
         { "name": "doc_write", "description": "写群文档。mode=append 在末尾追加（默认），replace 整篇替换。改动前先 doc_read。",
           "inputSchema": { "type": "object", "properties": { "content": { "type": "string" }, "mode": { "type": "string", "enum": ["append", "replace"] }, "group": group }, "required": ["content"] } },
-        { "name": "remember", "description": "保存一条长期记忆，以后的新会话都会看到。scope=self 只给你自己（默认），all 给所有 agent。只记持久的事实和偏好。",
-          "inputSchema": { "type": "object", "properties": { "text": { "type": "string" }, "scope": { "type": "string", "enum": ["self", "all"] } }, "required": ["text"] } },
+        { "name": "remember", "description": "保存一条长期记忆，以后的新会话都会看到。scope：self 只给你自己（默认），group 给当前群的所有成员，all 给所有 agent。topic 是主题（如 code-style、user-prefs），同主题的记忆存在一起。只记持久的事实和偏好。",
+          "inputSchema": { "type": "object", "properties": { "text": { "type": "string" }, "scope": { "type": "string", "enum": ["self", "group", "all"] }, "topic": { "type": "string" } }, "required": ["text"] } },
+        { "name": "memory_read", "description": "读长期记忆：不给 topic 时返回该层的索引（MEMORY.md），给 topic 返回该主题的全部记忆。",
+          "inputSchema": { "type": "object", "properties": { "scope": { "type": "string", "enum": ["self", "group", "all"] }, "topic": { "type": "string" } } } },
     ])
 }
 
@@ -166,7 +168,10 @@ impl Call<'_> {
     fn place(&self) -> Place {
         if self.context == format!("dm:{}", self.agent) { return Place::Dm; }
         if self.context.starts_with("ask:") { return Place::Ask; }
-        if let Some(id) = self.context.strip_prefix("group:")
+        // Team sessions (`team:group:<id>:<agent>`) live in their group too.
+        let ctx = self.context.strip_prefix("team:").unwrap_or(self.context);
+        if let Some(rest) = ctx.strip_prefix("group:")
+            && let id = rest.split(':').next().unwrap_or(rest)
             && let Some(g) = self.my_groups().into_iter().find(|g| g.id == id)
         {
             return Place::Group(g);
@@ -213,11 +218,25 @@ impl Call<'_> {
             "doc_write" => self.doc_write(args),
             "remember" => {
                 let text = s(args, "text").ok_or("text 不能为空")?;
-                let all = s(args, "scope") == Some("all");
-                self.core.remember(if all { "all" } else { self.agent }, text);
-                Ok(format!("已记住{}", if all { "（所有 agent 可见）" } else { "" }))
+                let (scope, label) = self.mem_scope(args)?;
+                self.core.remember_topic(&scope, s(args, "topic"), text);
+                Ok(format!("已记住（{label}）"))
+            }
+            "memory_read" => {
+                let (scope, _) = self.mem_scope(args)?;
+                let doc = self.core.memory_read(&scope, s(args, "topic"));
+                Ok(if doc.trim().is_empty() { "（还没有记忆）".into() } else { doc })
             }
             n => Err(format!("没有工具 {n}")),
+        }
+    }
+
+    /// The memory layer a call names: `(scope dir, label)`.
+    fn mem_scope(&self, args: &Value) -> Result<(String, &'static str), String> {
+        match s(args, "scope") {
+            Some("all") => Ok(("all".into(), "所有 agent 可见")),
+            Some("group") => crate::memory::group_of(self.context).map(|g| (g, "本群成员可见")).ok_or_else(|| "当前不在群里，不能用 scope=group".into()),
+            _ => Ok((self.agent.to_owned(), "只有你自己可见")),
         }
     }
 

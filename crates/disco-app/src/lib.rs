@@ -5,6 +5,8 @@
 mod hub;
 mod inbox;
 mod mcp;
+mod memory;
+mod team;
 pub use mcp::stdio_proxy as mcp_stdio;
 mod share;
 mod templates;
@@ -35,11 +37,9 @@ const SET_AGENT_CH: &str = "agent_channel/";
 const AGENT_CATEGORY: &str = "Disco Agents";
 const GROUP_CATEGORY: &str = "Disco 群聊";
 /// Memory notes live in settings as `mem/<scope>/<millis>`; scope is `all` or an agent name.
-const MEM: &str = "mem/";
-/// Memory handed to a session is capped so it never slows the first turn.
-const MEM_BUDGET: usize = 4000;
+pub(crate) const MEM: &str = "mem/";
 /// A line an agent starts with this is saved to its memory.
-const MEM_TAG: &str = "【记住】";
+pub(crate) const MEM_TAG: &str = "【记住】";
 /// Hand-off rounds and total agent turns allowed per human message in a group.
 const MAX_WAVES: usize = 4;
 const MAX_TURNS: usize = 12;
@@ -126,6 +126,8 @@ pub struct Core {
     seen: Mutex<HashMap<String, i64>>,
     /// Everything waiting on the user (see inbox.rs).
     inbox: Arc<inbox::Inbox>,
+    /// Team runs per group (see team.rs).
+    teams: team::Teams,
     /// The Tailscale share server (see share.rs).
     server: Mutex<share::Server>,
     app: AppHandle,
@@ -170,8 +172,11 @@ impl Core {
         let row = self.agent(agent)?;
         let first = self.primed.lock().unwrap_or_else(|p| p.into_inner()).insert(format!("{agent}|{context}"));
         let with_mem;
-        let prompt = if first { with_mem = format!("{}{prompt}", self.memory_preamble(agent)); with_mem.as_str() } else { prompt };
-        let _ = self.app.emit("typing", TypingEvt { thread: thread.into(), agent: agent.into(), on: true });
+        let prompt = if first { with_mem = format!("{}{prompt}", self.memory_preamble(agent, context)); with_mem.as_str() } else { prompt };
+        // Team members work behind the scenes: no bubbles, only the activity strip
+        // (permission prompts still reach the inbox).
+        let hidden = context.starts_with("team:");
+        if !hidden { let _ = self.app.emit("typing", TypingEvt { thread: thread.into(), agent: agent.into(), on: true }); }
         let app = self.app.clone();
         let (t, a) = (thread.to_owned(), agent.to_owned());
         let asked = Mutex::new(Vec::new());
@@ -183,49 +188,18 @@ impl Core {
                     self.inbox_permission(&t, &a, request_id, title, options);
                     asked.lock().unwrap_or_else(|p| p.into_inner()).push(request_id.clone());
                 }
+                if hidden {
+                    if let AgentEvent::Tool { title, .. } = ev && !title.is_empty() { self.team_activity(&t, &a, title); }
+                    return;
+                }
                 let _ = app.emit("stream", StreamEvt { thread: t.clone(), agent: a.clone(), event: ev.clone() });
             })
             .await;
         self.inbox_expire(&asked.into_inner().unwrap_or_else(|p| p.into_inner()));
-        let _ = self.app.emit("typing", TypingEvt { thread: thread.into(), agent: agent.into(), on: false });
+        if !hidden { let _ = self.app.emit("typing", TypingEvt { thread: thread.into(), agent: agent.into(), on: false }); }
         if matches!(&res, Err(e) if e.contains("进程已退出")) { self.forget_sessions(Some(agent)); }
         let _ = self.db().audit("disco", Some(agent), "prompt", if res.is_ok() { "ok" } else { "error" });
         res
-    }
-
-    /// What a new session is told first: the saved notes for everyone and for this
-    /// agent (newest kept when over budget), and how to save new ones.
-    fn memory_preamble(&self, agent: &str) -> String {
-        let db = self.db();
-        let mut notes: Vec<(String, String)> = ["all", agent].iter()
-            .flat_map(|sc| db.settings_with_prefix(&format!("{MEM}{sc}/")).unwrap_or_default()).collect();
-        drop(db);
-        notes.sort_by(|a, b| b.0.cmp(&a.0));
-        let mut kept = Vec::new();
-        let mut used = 0;
-        for (_, t) in notes {
-            used += t.len() + 3;
-            if used > MEM_BUDGET { break; }
-            kept.push(t);
-        }
-        kept.reverse();
-        let mut out = String::from("【Disco 长期记忆】\n");
-        for t in &kept { out.push_str("- "); out.push_str(t); out.push('\n'); }
-        out.push_str(&format!("（需要长期记住的事实或偏好，单独一行以「{MEM_TAG}」开头写出，Disco 会保存。）\n"));
-        if self.hub.mcp_port.get().is_some() && self.agent(agent).is_ok_and(|r| r.transport == "acp") {
-            out.push_str("（你有 disco 工具：overview 看自己在哪，post 发到群或通知用户，ask 请教其他 agent，ask_user 向用户提问（选择或确认），todo_add/todo_list/todo_done 管待办，doc_read/doc_write 读写群文档，remember 保存长期记忆。）\n");
-        }
-        out.push('\n');
-        out
-    }
-
-    fn remember(&self, scope: &str, text: &str) {
-        let text = text.trim();
-        if text.is_empty() { return; }
-        let mut ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_micros()).unwrap_or(0);
-        let db = self.db();
-        while db.setting(&format!("{MEM}{scope}/{ts:020}")).is_some() { ts += 1; }
-        let _ = db.set_setting(&format!("{MEM}{scope}/{ts:020}"), text);
     }
 
     /// Save every `【记住】` line of an agent's answer to its memory.
@@ -242,7 +216,7 @@ impl Core {
         let rest = rest.trim();
         if rest.is_empty() { return false; }
         self.remember(scope, rest);
-        self.post_message(thread, "system", &format!("已记住{}：{rest}", if scope == "all" { "（所有 agent）" } else { "" }));
+        self.post_message(thread, "system", &format!("已记住{}：{rest}", if scope == "all" { "（所有 agent）" } else if scope.starts_with("group-") { "（本群）" } else { "" }));
         true
     }
 
@@ -345,7 +319,7 @@ impl Core {
         // A member agent posting through its Disco tools: only the members it @s answer.
         let by_agent = g.members.contains(&author);
         self.post_message(&thread, &author, &text);
-        if !by_agent && self.user_remember(&thread, "all", &text) { return; }
+        if !by_agent && self.user_remember(&thread, &format!("group-{channel}"), &text) { return; }
         if !from_discord && !channel.starts_with("local-") && let Some(d) = self.discord_rest() {
             let hook = if by_agent { g.webhook_ref.as_deref().and_then(secret_get) } else { None };
             let (ch, author, text) = (channel.clone(), author.clone(), text.clone());
@@ -355,6 +329,10 @@ impl Core {
                     None => d.post(&ch, &format!("**{author}**：{text}")).await,
                 };
             });
+        }
+        if !by_agent && let Some(task) = team::command(&text) {
+            self.team(&g, task).await;
+            return;
         }
         let mut wave = mentions(&text, &g.members, by_agent.then_some(author.as_str()));
         if wave.is_empty() && !by_agent && let Some(lead) = g.lead_agent.clone().or_else(|| g.members.first().cloned()) {
@@ -544,21 +522,11 @@ async fn choose_path(file: Option<bool>) -> Option<String> {
     }).await.ok().flatten()
 }
 
-#[derive(Serialize)]
-struct Memory { key: String, scope: String, text: String }
+#[tauri::command]
+fn memories(core: St<'_>) -> Vec<memory::Note> { core.memory_list() }
 
 #[tauri::command]
-fn memories(core: St<'_>) -> CmdResult<Vec<Memory>> {
-    Ok(core.db().settings_with_prefix(MEM).map_err(err)?.into_iter().map(|(k, text)| {
-        let scope = k.split('/').next().unwrap_or("").to_owned();
-        Memory { key: k, scope, text }
-    }).collect())
-}
-
-#[tauri::command]
-fn forget(core: St<'_>, key: String) -> CmdResult<()> {
-    core.db().set_setting(&format!("{MEM}{key}"), "").map_err(err)
-}
+fn forget(core: St<'_>, key: String) -> CmdResult<()> { core.memory_forget(&key) }
 
 /// Split a command line on spaces, keeping "double" or 'single' quoted parts together.
 fn split_args(line: &str) -> Vec<String> {
@@ -716,7 +684,7 @@ async fn rename_agent(core: St<'_>, name: String, new_name: String) -> CmdResult
         core.db().upsert_agent(&row).map_err(err)?;
     }
     core.db().rename_agent(&name, &new).map_err(err)?;
-    core.db().rename_setting_prefix(&format!("{MEM}{name}/"), &format!("{MEM}{new}/")).map_err(err)?;
+    core.memory_rename(&name, &new);
     if let Some(ch) = core.agent_channel(&name) {
         core.db().set_setting(&format!("{SET_AGENT_CH}{name}"), "").map_err(err)?;
         core.db().set_setting(&format!("{SET_AGENT_CH}{new}"), &ch).map_err(err)?;
@@ -778,6 +746,12 @@ async fn set_agent_config(core: St<'_>, agent: String, id: String, value: String
     core.db().upsert_agent(&row).map_err(err)?;
     core.hub.set_config(&agent, &id, &value).await
 }
+
+#[tauri::command]
+fn team_state(core: St<'_>, thread: String) -> Option<team::State> { core.team_state(&thread) }
+
+#[tauri::command]
+fn team_files(core: St<'_>, thread: String) -> Vec<(String, String)> { core.team_files(&thread) }
 
 #[tauri::command]
 fn inbox(core: St<'_>) -> Vec<inbox::Item> { core.inbox.list() }
@@ -1097,6 +1071,7 @@ pub fn run() {
                 primed: Mutex::default(),
                 seen: Mutex::default(),
                 inbox: Arc::default(),
+                teams: team::Teams::default(),
                 server: Mutex::default(),
                 app: app.handle().clone(),
             });
@@ -1105,6 +1080,7 @@ pub fn run() {
                 let _ = core.db().set_setting(SET_TOKEN_SAVED, "1");
             }
             if core.db().setting(SET_TOKEN_SAVED).is_some() { connect_discord(core.clone()); }
+            core.memory_migrate();
             mcp::start(core.clone());
             core.warm(None);
             if !core.shares().is_empty() { core.serve_shares(); }
@@ -1120,7 +1096,7 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
-            overview, detect_agents, conda_envs, choose_path, memories, forget, add_agent, remove_agent, rename_agent, stop_reply, messages, send, inbox, inbox_answer, agent_configs, set_agent_config,
+            overview, detect_agents, conda_envs, choose_path, memories, forget, add_agent, remove_agent, rename_agent, stop_reply, messages, send, inbox, inbox_answer, team_state, team_files, agent_configs, set_agent_config,
             stop_all, resume, save_discord_token, discord_connect, discord_settings, discord_sync, diagnose, open_url, discord_channels, save_group, delete_group,
             check_update, install_update, space, todo_new, todo_set, todo_remove, doc_save, reveal_doc, share::share_status, share::create_share, share::share_invite, share::revoke_share, share::accept_invite
         ])
