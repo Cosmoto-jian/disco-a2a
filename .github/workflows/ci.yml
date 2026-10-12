@@ -14,7 +14,7 @@ jobs:
         with: { components: clippy }
       - uses: Swatinem/rust-cache@v2
       - if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev
       - if: runner.os == 'macOS'
         run: brew install protobuf
       - run: cargo clippy --workspace --all-targets -- -D warnings
