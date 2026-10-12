@@ -5,7 +5,9 @@ const $ = (s, r = document) => r.querySelector(s);
 
 // ---------- state
 // typing: thread -> Set(agent); live: "thread|agent" -> streaming bubble
-const S = { tab: "chats", thread: null, ov: null, tpl: [], typing: {}, live: {}, perms: {}, q: "" };
+// msgs: thread -> cached messages, so switching chats renders instantly.
+const S = { tab: "chats", thread: null, ov: null, tpl: [], typing: {}, live: {}, perms: {}, q: "", msgs: {}, found: null };
+const REDUCED = matchMedia("(prefers-reduced-motion: reduce)").matches;
 const COLORS = ["#5865f2", "#d97757", "#10a37f", "#7c5cff", "#e5484d", "#3b82f6", "#f59e0b", "#14b8a6"];
 
 // ---------- tiny helpers
@@ -58,8 +60,9 @@ function md(src) {
 // made errors invisible in earlier builds.
 function toast(msg, ms = 4000, action) {
   const t = h("div", { class: "toast" }, String(msg), action ? h("button", { onclick: () => { t.remove(); action[1](); } }, action[0]) : null);
+  document.querySelector(".toast")?.remove();
   document.body.append(t);
-  setTimeout(() => t.remove(), ms);
+  setTimeout(() => { t.classList.add("out"); setTimeout(() => t.remove(), 200); }, ms);
 }
 function ask(question, okText = "确定") {
   return new Promise((resolve) => {
@@ -85,7 +88,12 @@ const threadName = (t) => t.startsWith("dm:") ? t.slice(3)
   : (S.ov.groups.find((g) => `group:${g.id}` === t)?.name ?? "群聊");
 
 // ---------- list column
+// Coalesce list redraws: typing/stream events can fire many times per frame.
+let listRaf = 0;
 function renderList() {
+  if (!listRaf) listRaf = requestAnimationFrame(() => { listRaf = 0; drawList(); });
+}
+function drawList() {
   const ul = $("#items"); ul.replaceChildren();
   $("#list-add").hidden = !(S.tab === "groups" || S.tab === "agents");
   const q = S.q.toLowerCase();
@@ -114,7 +122,7 @@ function threadRow(t, head, fallback) {
   const isGroup = t.startsWith("group:"); const name = threadName(t);
   const typing = S.typing[t]?.size ? [...S.typing[t]].join("、") : "";
   const live = !isGroup && S.ov.agents.find((a) => `dm:${a.name}` === t)?.live;
-  return h("li", { class: S.thread === t ? "on" : "", onclick: () => openThread(t) },
+  return h("li", { class: S.thread === t ? "on" : "", onclick: () => openThread(t), onmouseenter: () => prefetch(t) },
     avatar(name, { group: isGroup, live }),
     h("div", { class: "meta" },
       h("div", { class: "row" }, h("span", { class: "name" }, name), h("span", { class: "time" }, when(head?.ts))),
@@ -123,7 +131,18 @@ function threadRow(t, head, fallback) {
 }
 
 // ---------- conversation
+function sendButton() {
+  const b = h("button", { id: "send", class: "send", type: "button", title: "发送（↩）", disabled: true, onclick: () => sendMsg() });
+  b.innerHTML = '<svg viewBox="0 0 24 24"><path d="M12 19V5M5.5 11.5 12 5l6.5 6.5"/></svg>';
+  return b;
+}
+function prefetch(t) {
+  if (S.msgs[t] || S.msgs[t] === null) return;
+  S.msgs[t] = null; // in flight
+  invoke("messages", { thread: t }).then((m) => { S.msgs[t] = m; }).catch(() => { delete S.msgs[t]; });
+}
 async function openThread(t) {
+  if (S.thread === t && $("#log")) return;
   S.thread = t; renderList();
   const isGroup = t.startsWith("group:"); const name = threadName(t);
   const peer = peerOf(t);
@@ -133,16 +152,20 @@ async function openThread(t) {
   const pane = $("#pane");
   pane.replaceChildren(
     h("div", { class: "head", "data-tauri-drag-region": true }, avatar(name, { group: isGroup }),
-      h("div", {}, h("h2", {}, name), h("small", {}, sub)), h("span", { class: "sp" }),
+      h("div", {}, h("h2", { title: a ? "双击重命名" : "", ondblclick: a ? (e) => inlineRename(e.currentTarget, a.name) : null }, name), h("small", {}, sub)), h("span", { class: "sp" }),
       a && a.kind === "acp" ? h("div", { id: "cfgs" }) : null,
       isGroup ? h("button", { class: "btn", onclick: () => groupDialog(g) }, "成员") : null,
       a ? h("button", { class: "icon-btn", title: "更多", onclick: (e) => agentMenu(e.currentTarget, a.name) }, "⋯") : null),
     h("div", { id: "log" }),
     peer ? h("div", { class: "peer-note" }, "这是对方的会话，你只能旁观。需要你批准的操作会在这里弹出。") : h("div", { id: "composer" },
-      h("textarea", { id: "input", rows: 1, placeholder: isGroup ? "发到群里：@名字 指定 agent，同时 @ 多个或 @all 并行执行" : `给 ${name} 发消息` }),
-      h("div", { class: "hint" }, "↩ 发送 · ⇧↩ 换行")));
+      h("textarea", { id: "input", rows: 1, placeholder: isGroup ? "发到群里：@名字 指定 agent，@all 让所有人一起" : `给 ${name} 发消息` }),
+      sendButton()));
+  $("#pane").classList.remove("enter"); void $("#pane").offsetWidth; $("#pane").classList.add("enter");
   const ta = $("#input") ?? h("textarea");
-  ta.addEventListener("input", () => { ta.style.height = "auto"; ta.style.height = ta.scrollHeight + "px"; });
+  ta.addEventListener("input", () => {
+    ta.style.height = "auto"; ta.style.height = ta.scrollHeight + "px";
+    const btn = $("#send"); if (btn) btn.disabled = !ta.value.trim();
+  });
   const mention = isGroup ? mentionPicker(ta, () => g.members) : null;
   ta.addEventListener("keydown", (e) => {
     if (mention?.key(e)) return;
@@ -150,12 +173,19 @@ async function openThread(t) {
   });
   ta.focus();
   if (a && a.kind === "acp") loadConfigs(name, t);
-  const msgs = await invoke("messages", { thread: t });
-  if (S.thread !== t) return;
-  for (const m of msgs) $("#log").append(bubble(m.author, m.body));
-  for (const p of Object.values(S.perms)) if (p.thread === t) $("#log").append(permCard(p));
-  for (const [k, v] of Object.entries(S.live)) if (k.startsWith(t + "|")) $("#log").append(v.el);
-  scrollLog();
+  const draw = (msgs) => {
+    const log = $("#log"); if (!log || S.thread !== t) return;
+    log.replaceChildren(...msgs.map((m) => bubble(m.author, m.body)));
+    for (const p of Object.values(S.perms)) if (p.thread === t) log.append(permCard(p));
+    for (const [k, v] of Object.entries(S.live)) if (k.startsWith(t + "|")) log.append(v.el);
+    log.scrollTop = log.scrollHeight;
+  };
+  if (Array.isArray(S.msgs[t])) draw(S.msgs[t]);
+  const fresh = await invoke("messages", { thread: t }).catch(() => null);
+  if (!fresh) return;
+  const had = S.msgs[t];
+  S.msgs[t] = fresh;
+  if (!Array.isArray(had) || had.length !== fresh.length) draw(fresh);
 }
 // Model picker: only the agent's own model list (ACP session config, category "model").
 async function loadConfigs(agent, t) {
@@ -200,30 +230,31 @@ function agentMenu(anchor, name) {
   const local = S.ov.agents.find((a) => a.name === name)?.kind !== "a2a";
   popover(anchor, [
     ...(local ? [{ label: "共享给朋友…", run: () => shareDialog(name) }] : []),
-    { label: "重命名…", run: () => renameAgent(name) },
+    { label: "重命名", run: async () => {
+      if (S.thread !== `dm:${name}`) { setTab("chats"); await openThread(`dm:${name}`); }
+      const h2 = $(".head h2"); if (h2) inlineRename(h2, name);
+    } },
     { label: "删除 Agent…", danger: true, run: () => removeAgent(name) },
   ]);
 }
-function renameAgent(name) {
-  const d = $("#dlg"), form = $("#dlg-form");
-  const input = h("input", { value: name, maxlength: 32, spellcheck: false });
-  const err = h("div", { class: "err" });
-  const go = h("button", { class: "btn pri", type: "submit" }, "保存");
-  form.replaceChildren(h("h3", {}, "重命名 Agent"),
-    h("label", {}, "新名称（字母、数字、- 或 _）", input), err,
-    h("div", { class: "actions" }, h("button", { class: "btn", type: "button", onclick: () => d.close() }, "取消"), go));
-  form.onsubmit = async (e) => {
-    e.preventDefault();
-    const next = input.value.trim();
-    if (next === name) return d.close();
-    go.disabled = true; err.textContent = "";
+// Rename in place: the title becomes editable; ↩ saves, Esc or blur-without-change cancels.
+function inlineRename(el, name) {
+  if (el.isContentEditable) return;
+  el.contentEditable = "plaintext-only"; el.classList.add("editing"); el.focus();
+  getSelection().selectAllChildren(el);
+  const done = async (save) => {
+    el.removeEventListener("keydown", key); el.removeEventListener("blur", blur);
+    el.contentEditable = "false"; el.classList.remove("editing");
+    const next = el.textContent.trim();
+    if (!save || !next || next === name) { el.textContent = name; return; }
     try {
       await invoke("rename_agent", { name, newName: next });
-      d.close(); await load();
-      if (S.thread === `dm:${name}`) openThread(`dm:${next}`); else if (S.thread) openThread(S.thread);
-    } catch (e2) { err.textContent = String(e2); go.disabled = false; }
+      delete S.msgs[`dm:${name}`]; await load(); S.thread = null; openThread(`dm:${next}`); toast(`已改名为 ${next}`, 2000);
+    } catch (e) { el.textContent = name; toast(e); }
   };
-  d.showModal(); input.select();
+  const key = (e) => { if (e.key === "Enter" && !e.isComposing) { e.preventDefault(); done(true); } else if (e.key === "Escape") { e.preventDefault(); done(false); } };
+  const blur = () => done(true);
+  el.addEventListener("keydown", key); el.addEventListener("blur", blur);
 }
 function bubble(author, body) {
   if (author === "system") return h("div", { class: "m sys" }, body);
@@ -275,16 +306,31 @@ document.addEventListener("click", async (e) => {
   catch { btn.textContent = "复制失败"; }
   setTimeout(() => { btn.textContent = "复制"; }, 1200);
 });
-function scrollLog() { const l = $("#log"); if (l) l.scrollTop = l.scrollHeight; }
+// Follow new content only when the reader is already near the bottom.
+function scrollLog(force) {
+  const l = $("#log"); if (!l) return;
+  const near = l.scrollHeight - l.scrollTop - l.clientHeight < 140;
+  if (force || near) { l.scrollTo({ top: l.scrollHeight, behavior: REDUCED || !force ? "auto" : "smooth" }); $("#jump")?.remove(); return; }
+  if (!$("#jump")) {
+    const j = h("button", { id: "jump", onclick: () => scrollLog(true) }, "↓ 新消息");
+    l.after(j);
+    l.addEventListener("scroll", function off() { if (l.scrollHeight - l.scrollTop - l.clientHeight < 40) { j.remove(); l.removeEventListener("scroll", off); } });
+  }
+}
 async function sendMsg() {
   const ta = $("#input"); const text = ta.value.trim();
   if (!text || !S.thread) return;
-  ta.value = ""; ta.style.height = "auto";
-  try { await invoke("send", { thread: S.thread, text }); } catch (e) { toast(e); }
+  ta.value = ""; ta.style.height = "auto"; if ($("#send")) $("#send").disabled = true;
+  // Show it now; the backend's echo of the same message confirms it.
+  const t = S.thread;
+  const el = bubble("me", text); el.classList.add("new", "pending"); el.dataset.body = text;
+  $("#log").append(el); scrollLog(true);
+  try { await invoke("send", { thread: t, text }); }
+  catch (e) { el.classList.add("failed"); el.title = String(e); toast(e); }
 }
 
 function permCard(p) {
-  return h("div", { class: "perm", id: `perm-${p.request_id}` },
+  return h("div", { class: "perm new", id: `perm-${p.request_id}` },
     h("b", {}, `${p.agent} 请求执行：${p.title || "工具调用"}`),
     h("div", { class: "opts" }, ...p.options.map((o) => h("button", { class: o.allow ? "allow" : "", onclick: () => decide(p, o.id) }, o.label)),
       h("button", { onclick: () => decide(p, null) }, "取消")));
@@ -295,7 +341,8 @@ async function decide(p, optionId) {
   card?.querySelectorAll("button").forEach((b) => { b.disabled = true; });
   try {
     const ok = await invoke("decide_permission", { agent: p.agent, requestId: p.request_id, optionId });
-    delete S.perms[p.request_id]; card?.remove();
+    delete S.perms[p.request_id];
+    if (card) { card.classList.add("gone"); setTimeout(() => card.remove(), 180); }
     if (!ok) toast("这个请求已经失效（agent 已结束这一轮）");
   } catch (e) { card?.querySelectorAll("button").forEach((b) => { b.disabled = false; }); toast(e); }
 }
@@ -307,7 +354,12 @@ listen("message", ({ payload: m }) => {
   if (S.live[k]) { S.live[k].el.remove(); delete S.live[k]; }
   const head = S.ov.heads.find((x) => x.thread === m.thread);
   if (head) Object.assign(head, m); else S.ov.heads.unshift(m);
-  if (S.thread === m.thread) { $("#log").append(bubble(m.author, m.body)); scrollLog(); }
+  if (Array.isArray(S.msgs[m.thread])) S.msgs[m.thread].push({ author: m.author, body: m.body, ts: m.ts });
+  if (S.thread === m.thread) {
+    const pending = m.author === "me" && [...document.querySelectorAll("#log .m.pending")].find((e) => e.dataset.body === m.body.trim());
+    if (pending) pending.classList.remove("pending");
+    else { const el = bubble(m.author, m.body); el.classList.add("new"); $("#log").append(el); scrollLog(m.author === "me"); }
+  }
   renderList();
 });
 listen("typing", ({ payload: { thread, agent, on } }) => {
@@ -320,11 +372,12 @@ listen("typing", ({ payload: { thread, agent, on } }) => {
       stop.disabled = true; stop.textContent = "正在停止…";
       try { if (!(await invoke("stop_reply", { thread, agent }))) { stop.textContent = "无法停止"; } } catch (e) { toast(e); }
     } }, "停止");
-    S.live[k] = { text: "", b, stop, el: h("div", { class: "m" }, avatar(agent, { small: true }), h("div", {}, h("div", { class: "who" }, agent, stop), b)) };
+    b.classList.add("streaming");
+    S.live[k] = { text: "", b, stop, el: h("div", { class: "m new" }, avatar(agent, { small: true }), h("div", {}, h("div", { class: "who" }, agent, stop), b)) };
     if (S.thread === thread) { $("#log").append(S.live[k].el); scrollLog(); }
   }
   if (!on && S.live[k] && !S.live[k].text) { S.live[k].el.remove(); delete S.live[k]; }
-  if (!on && S.live[k]) S.live[k].stop?.remove();
+  if (!on && S.live[k]) { S.live[k].stop?.remove(); S.live[k].b.classList.remove("streaming"); }
   renderList();
 });
 listen("stream", ({ payload: { thread, agent, event } }) => {
@@ -337,7 +390,7 @@ listen("stream", ({ payload: { thread, agent, event } }) => {
       if (S.thread === thread) scrollLog();
     });
   } else if (event.type === "tool" && S.thread === thread && event.title) {
-    const chip = h("div", { class: "chip" }, `🔧 ${agent} · ${event.title}`);
+    const chip = h("div", { class: "chip new" }, `🔧 ${agent} · ${event.title}`);
     live ? live.el.before(chip) : $("#log").append(chip);
   } else if (event.type === "permission_asked") {
     const p = { ...event, agent, thread }; S.perms[event.request_id] = p;
@@ -361,7 +414,12 @@ async function renderGallery() {
   S.thread = null; renderList();
   const page = h("div", { class: "page add" }, h("h1", {}, "添加 Agent"), h("p", {}, "正在扫描这台 Mac…"));
   $("#pane").replaceChildren(page);
-  const [found, envs] = await Promise.all([invoke("detect_agents").catch(() => []), invoke("conda_envs").catch(() => [])]);
+  $("#pane").classList.remove("enter"); void $("#pane").offsetWidth; $("#pane").classList.add("enter");
+  // Show the last scan at once; rescan in the background and redraw if it changed.
+  const scan = Promise.all([invoke("detect_agents").catch(() => []), invoke("conda_envs").catch(() => [])]);
+  if (!S.found) S.found = await scan;
+  else scan.then((r) => { const changed = JSON.stringify(r) !== JSON.stringify(S.found); S.found = r; if (changed && $(".page.add")) renderGallery(); });
+  const [found, envs] = S.found;
   S.envs = envs;
   const have = found.filter((t) => t.found), miss = found.filter((t) => !t.found);
   const list = h("div", { class: "alist" },
@@ -370,9 +428,9 @@ async function renderGallery() {
     agentRow({ id: "invite", name: "朋友的邀请码", kind: "invite", color: "#10a37f", letter: "@" }, "接入别人通过 Disco 共享的 agent"),
     agentRow({ id: "a2a", name: "远程 A2A agent", kind: "a2a", color: "#5865f2", letter: "A" }, "通过 URL 接入"));
   page.replaceChildren(h("h1", {}, "添加 Agent"),
-    h("p", {}, have.length ? `在这台 Mac 上找到 ${have.length} 个，点一下就能导入。` : "没在这台 Mac 上找到已安装的 agent，可以手动添加。"),
+    h("p", {}, have.length ? `在这台 Mac 上找到 ${have.length} 个。点「导入」一步完成，点整行可调目录和环境。` : "没在这台 Mac 上找到已安装的 agent，可以手动添加。"),
     list,
-    miss.length ? h("p", { class: "muted" }, `装好后会自动出现：${miss.map((t) => t.name).join(" · ")}`) : null);
+    miss.length ? h("p", { class: "muted" }, `装好后会自动出现：${miss.map((t) => t.name).join(" · ")}`) : "");
 }
 function agentRow(t, sub) {
   const row = h("div", { class: "arow" });
@@ -384,9 +442,19 @@ function agentRow(t, sub) {
   } },
     Object.assign(h("div", { class: "av" }, t.letter ?? t.name[0].toUpperCase()), { style: `background:${t.color}` }),
     h("div", { class: "ameta" }, h("b", {}, t.name), h("small", {}, sub)),
-    h("span", { class: "aplus" }, t.kind === "acp" ? "导入" : "添加"));
+    h("span", { class: "aplus", onclick: t.kind === "acp" ? (e) => { e.stopPropagation(); quickImport(t, e.currentTarget); } : null }, t.kind === "acp" ? "导入" : "添加"));
   row.append(head);
   return row;
+}
+// One click: import a detected agent with default settings and open its chat.
+async function quickImport(t, btn) {
+  let name = t.id, i = 2;
+  while (S.ov.agents.some((a) => a.name === name)) name = `${t.id}-${i++}`;
+  btn.textContent = "导入中…"; btn.classList.add("busy");
+  try {
+    await invoke("add_agent", { spec: { template: t.id, name, url: null, headerName: null, headerValue: null, command: null, cwd: null, count: 1, worktree: false, conda: null } });
+    await load(); setTab("chats"); openThread(`dm:${name}`); toast(`已导入 ${name}`, 2000);
+  } catch (e) { btn.textContent = "导入"; btn.classList.remove("busy"); toast(e); }
 }
 function inviteForm() {
   const err = h("div", { class: "err" });
@@ -670,7 +738,11 @@ function dialog(fields, okText, onOk, extra) {
 }
 function blank() {
   S.thread = null;
-  $("#pane").replaceChildren(h("div", { class: "blank" }, h("b", {}, "Disco"), "选一个会话开始，或去 Agent 页添加第一个 agent"));
+  const none = !S.ov?.agents.length;
+  $("#pane").replaceChildren(h("div", { class: "blank" }, h("div", { class: "logo" }, "D"), h("b", {}, "Disco"),
+    none ? h("p", {}, "还没有 agent。") : h("p", {}, "选一个会话开始"),
+    none ? h("button", { class: "btn pri", onclick: () => setTab("agents") }, "添加第一个 agent") : h("div", { class: "keys" },
+      h("span", {}, h("kbd", {}, "⌘K"), " 搜索"), h("span", {}, h("kbd", {}, "⌘1–4"), " 切换"), h("span", {}, h("kbd", {}, "⌘N"), " 新建"))));
   renderList();
 }
 function setTab(tab) {
@@ -685,10 +757,25 @@ document.querySelectorAll(".tab").forEach((b) => b.addEventListener("click", () 
 $("#list-add").onclick = () => (S.tab === "agents" ? renderGallery() : groupDialog(null));
 $("#search").oninput = (e) => { S.q = e.target.value; renderList(); };
 $("#kill").onclick = async () => {
-  if (S.ov.paused) return;
-  if (!(await ask("立即停止所有 agent 并暂停路由？", "全部停止"))) return;
-  const n = await invoke("stop_all"); await load(); toast(`已停止 ${n} 个运行中的 agent`);
+  if (S.ov.paused) { await invoke("resume"); await load(); toast("已恢复", 1500); return; }
+  const n = await invoke("stop_all"); await load();
+  toast(`已停止 ${n} 个 agent，新消息暂不转发`, 6000, ["恢复", async () => { await invoke("resume"); await load(); }]);
 };
 $("#resume").onclick = async () => { await invoke("resume"); await load(); };
+
+// Keyboard: ⌘K search, ⌘1–4 tabs, ⌘N new (group / agent), ↩ in search opens the first hit,
+// and typing anywhere in a chat goes to the composer.
+addEventListener("keydown", (e) => {
+  const mod = e.metaKey || e.ctrlKey;
+  const typingInField = /^(INPUT|TEXTAREA|SELECT)$/.test(document.activeElement?.tagName) || document.activeElement?.isContentEditable;
+  if (mod && e.key.toLowerCase() === "k") { e.preventDefault(); $("#search").focus(); $("#search").select(); return; }
+  if (mod && /^[1-4]$/.test(e.key)) { e.preventDefault(); setTab(["chats", "groups", "agents", "settings"][e.key - 1]); return; }
+  if (mod && e.key.toLowerCase() === "n") { e.preventDefault(); if (S.tab === "agents") renderGallery(); else groupDialog(null); return; }
+  if (!mod && !e.altKey && !typingInField && e.key.length === 1 && $("#input") && !$("#dlg").open) $("#input").focus();
+});
+$("#search").addEventListener("keydown", (e) => {
+  if (e.key === "Escape") { e.target.value = ""; S.q = ""; renderList(); e.target.blur(); }
+  if (e.key === "Enter" && !e.isComposing) { e.preventDefault(); $("#items li:not(.empty)")?.click(); e.target.blur(); }
+});
 
 (async () => { await load(); blank(); })();
