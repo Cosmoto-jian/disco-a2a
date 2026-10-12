@@ -96,3 +96,24 @@ fn agents_upsert_list_delete() {
     assert!(s.delete_agent("echo").unwrap());
     assert!(s.list_agents().unwrap().is_empty());
 }
+
+#[test]
+fn groups_and_messages() {
+    let mut s = Store::open_in_memory().unwrap();
+    let g = GroupRow { id: "c1".into(), guild_id: "g1".into(), name: "lab".into(), lead_agent: Some("planner".into()),
+        webhook_ref: None, members: vec!["coder".into(), "planner".into()] };
+    s.upsert_group(&g).unwrap();
+    let got = s.list_groups().unwrap();
+    assert_eq!(got.len(), 1);
+    let mut m = got[0].members.clone(); m.sort();
+    assert_eq!(m, vec!["coder", "planner"]);
+    for i in 0..5 { s.add_message("group:c1", "me", &format!("m{i}")).unwrap(); }
+    s.add_message("dm:coder", "coder", "hi").unwrap();
+    let last = s.messages("group:c1", 2).unwrap();
+    assert_eq!(last.iter().map(|m| m.body.as_str()).collect::<Vec<_>>(), ["m3", "m4"]);
+    let heads = s.thread_heads().unwrap();
+    assert_eq!(heads[0].0, "dm:coder");
+    assert_eq!(heads.len(), 2);
+    s.audit("me", Some("coder"), "prompt", "ok").unwrap();
+    assert!(s.delete_group("c1").unwrap());
+}

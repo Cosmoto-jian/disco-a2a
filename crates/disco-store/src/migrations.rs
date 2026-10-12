@@ -74,6 +74,30 @@ const STEPS: &[&str] = &[
     END;
     CREATE VIRTUAL TABLE memory_vec USING vec0(embedding float[384]);
     ",
+    // v3: group chats bound to Discord channels, and a message log for every thread
+    r"
+    CREATE TABLE groups (
+        id TEXT PRIMARY KEY,               -- Discord channel id
+        guild_id TEXT NOT NULL,
+        name TEXT NOT NULL,
+        lead_agent TEXT,                   -- answers when nobody is @mentioned
+        webhook_ref TEXT,                  -- Keychain account holding id/token
+        created_at INTEGER NOT NULL DEFAULT (unixepoch())
+    );
+    CREATE TABLE group_members (
+        group_id TEXT NOT NULL REFERENCES groups(id) ON DELETE CASCADE,
+        agent_name TEXT NOT NULL,
+        PRIMARY KEY (group_id, agent_name)
+    );
+    CREATE TABLE messages (
+        id INTEGER PRIMARY KEY,
+        thread TEXT NOT NULL,              -- 'dm:<agent>' or 'group:<channel>'
+        author TEXT NOT NULL,              -- 'me', agent name, or Discord user
+        body TEXT NOT NULL,
+        ts INTEGER NOT NULL DEFAULT (unixepoch())
+    );
+    CREATE INDEX messages_thread ON messages(thread, id);
+    ",
 ];
 
 pub const LATEST: i64 = STEPS.len() as i64;

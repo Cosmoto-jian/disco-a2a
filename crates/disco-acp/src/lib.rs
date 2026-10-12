@@ -58,7 +58,13 @@ enum Cmd {
 pub struct AcpAgent {
     cmd: mpsc::Sender<Cmd>,
     pending: Pending,
-    _child: tokio::process::Child, // kill_on_drop
+    child: Mutex<tokio::process::Child>,
+}
+
+impl Drop for AcpAgent {
+    fn drop(&mut self) {
+        self.kill();
+    }
 }
 
 impl AcpAgent {
@@ -87,7 +93,7 @@ impl AcpAgent {
         let sink: Sink = Arc::default();
         let transport = ByteStreams::new(stdin.compat_write(), stdout.compat());
         tokio::spawn(run_connection(transport, launch, cmd_rx, pending.clone(), sink));
-        Ok(Self { cmd: cmd_tx, pending, _child: child })
+        Ok(Self { cmd: cmd_tx, pending, child: Mutex::new(child) })
     }
 
     /// Send one prompt; events stream until a `Done`.
@@ -100,6 +106,17 @@ impl AcpAgent {
     /// Answer a `PermissionAsked` event.
     pub fn decide(&self, request_id: &str, decision: PermissionDecision) -> bool {
         self.pending.lock().unwrap_or_else(|p| p.into_inner()).remove(request_id).is_some_and(|tx| tx.send(decision).is_ok())
+    }
+
+    /// Kill the agent and every process it started (it leads its own process group).
+    pub fn kill(&self) {
+        let mut child = self.child.lock().unwrap_or_else(|p| p.into_inner());
+        #[cfg(unix)]
+        if let Some(pid) = child.id() {
+            let _ = std::process::Command::new("kill").args(["-KILL", &format!("-{pid}")])
+                .stdout(Stdio::null()).stderr(Stdio::null()).status();
+        }
+        let _ = child.start_kill();
     }
 
     pub async fn cancel(&self) {

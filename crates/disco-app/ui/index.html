@@ -2,46 +2,35 @@
 <html lang="zh-CN">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Disco</title>
 <link rel="stylesheet" href="style.css">
 </head>
 <body>
-<aside>
-  <header><b>Disco</b><span id="status"></span></header>
-  <ul id="agents"></ul>
-  <details id="add">
-    <summary>＋ 添加 A2A Agent</summary>
-    <form id="add-form">
-      <input name="name" placeholder="名称，如 planner" required>
-      <input name="url" placeholder="https://agent.example.com" required>
-      <input name="header_name" placeholder="鉴权头（可选），如 authorization">
-      <input name="header_value" type="password" placeholder="鉴权值（可选），如 Bearer …">
-      <button>连接并添加</button>
-      <small class="err" id="add-err"></small>
-    </form>
-  </details>
-  <details id="discord">
-    <summary>Discord</summary>
-    <form id="discord-form">
-      <input name="token" type="password" placeholder="Bot token（存入钥匙串）">
-      <button>保存</button>
-    </form>
-    <button id="discord-check">验证实时连接</button>
-    <small id="discord-out"></small>
-  </details>
-</aside>
-<main>
-  <div id="empty">左侧选择一个 agent 开始对话</div>
-  <section id="chat" hidden>
-    <h2 id="chat-title"></h2>
-    <div id="log"></div>
-    <form id="send">
-      <textarea name="text" rows="2" placeholder="给 agent 发消息，⌘↩ 发送"></textarea>
-      <button>发送</button>
-    </form>
-  </section>
+<nav id="rail">
+  <div class="drag" data-tauri-drag-region></div>
+  <button class="tab on" data-tab="chats" title="聊天"><svg viewBox="0 0 24 24"><path d="M4 5h16v11H8l-4 4z"/></svg></button>
+  <button class="tab" data-tab="groups" title="群聊"><svg viewBox="0 0 24 24"><circle cx="9" cy="8" r="3.2"/><circle cx="17" cy="9" r="2.6"/><path d="M3 19c0-3.3 2.7-5.5 6-5.5s6 2.2 6 5.5M15 14.2c3 0 6 1.6 6 4.8"/></svg></button>
+  <button class="tab" data-tab="agents" title="Agent"><svg viewBox="0 0 24 24"><rect x="5" y="8" width="14" height="11" rx="3"/><path d="M12 4v4M9 13h.01M15 13h.01M3 13v2M21 13v2"/></svg></button>
+  <span class="grow"></span>
+  <button class="tab" data-tab="settings" title="设置"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M12 2v3M12 19v3M4.2 4.2l2.1 2.1M17.7 17.7l2.1 2.1M2 12h3M19 12h3M4.2 19.8l2.1-2.1M17.7 6.3l2.1-2.1"/></svg></button>
+  <button id="kill" title="全部停止"><svg viewBox="0 0 24 24"><path d="M12 3v8M6.3 6.8a8 8 0 1 0 11.4 0"/></svg></button>
+</nav>
+
+<section id="list">
+  <header data-tauri-drag-region>
+    <input id="search" placeholder="搜索" autocomplete="off">
+    <button id="list-add" class="icon" title="新建" hidden>＋</button>
+  </header>
+  <div id="paused-bar" hidden>已全部停止 <button id="resume">恢复</button></div>
+  <ul id="items"></ul>
+</section>
+
+<main id="main">
+  <div class="topbar" data-tauri-drag-region></div>
+  <div id="pane"></div>
 </main>
+
+<dialog id="dlg"><form method="dialog" id="dlg-form"></form></dialog>
 <script src="app.js"></script>
 </body>
 </html>

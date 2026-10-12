@@ -95,6 +95,25 @@ pub struct AgentRow {
     pub card_json: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MessageRow {
+    pub id: i64,
+    pub author: String,
+    pub body: String,
+    pub ts: i64,
+}
+
+/// A group chat bound to one Discord channel.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GroupRow {
+    pub id: String,
+    pub guild_id: String,
+    pub name: String,
+    pub lead_agent: Option<String>,
+    pub webhook_ref: Option<String>,
+    pub members: Vec<String>,
+}
+
 pub struct Store {
     conn: Connection,
 }
@@ -239,6 +258,78 @@ impl Store {
 
     pub fn delete_agent(&mut self, name: &str) -> Result<bool> {
         Ok(self.conn.execute("DELETE FROM agents WHERE name = ?1", [name])? > 0)
+    }
+
+    pub fn audit(&self, actor: &str, agent: Option<&str>, action: &str, result: &str) -> Result<()> {
+        self.conn.prepare_cached("INSERT INTO audit_log (actor, agent_id, action, result) VALUES (?1, ?2, ?3, ?4)")?
+            .execute(params![actor, agent, action, result])?;
+        Ok(())
+    }
+
+    pub fn add_message(&self, thread: &str, author: &str, body: &str) -> Result<i64> {
+        self.conn.prepare_cached("INSERT INTO messages (thread, author, body) VALUES (?1, ?2, ?3)")?
+            .execute(params![thread, author, body])?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    /// Newest `limit` messages of a thread, oldest first.
+    pub fn messages(&self, thread: &str, limit: u32) -> Result<Vec<MessageRow>> {
+        let mut st = self.conn.prepare_cached(
+            "SELECT id, author, body, ts FROM (SELECT * FROM messages WHERE thread = ?1 ORDER BY id DESC LIMIT ?2) ORDER BY id",
+        )?;
+        let rows = st.query_map(params![thread, limit], |r| {
+            Ok(MessageRow { id: r.get(0)?, author: r.get(1)?, body: r.get(2)?, ts: r.get(3)? })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Last message per thread, for the chat list.
+    pub fn thread_heads(&self) -> Result<Vec<(String, MessageRow)>> {
+        let mut st = self.conn.prepare_cached(
+            "SELECT m.thread, m.id, m.author, m.body, m.ts FROM messages m
+             JOIN (SELECT thread, max(id) AS id FROM messages GROUP BY thread) h ON h.id = m.id
+             ORDER BY m.id DESC",
+        )?;
+        let rows = st.query_map([], |r| {
+            Ok((r.get(0)?, MessageRow { id: r.get(1)?, author: r.get(2)?, body: r.get(3)?, ts: r.get(4)? }))
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    pub fn upsert_group(&mut self, g: &GroupRow) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        tx.execute(
+            "INSERT INTO groups (id, guild_id, name, lead_agent, webhook_ref) VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(id) DO UPDATE SET name = excluded.name, lead_agent = excluded.lead_agent,
+               webhook_ref = coalesce(excluded.webhook_ref, groups.webhook_ref)",
+            params![g.id, g.guild_id, g.name, g.lead_agent, g.webhook_ref],
+        )?;
+        tx.execute("DELETE FROM group_members WHERE group_id = ?1", [&g.id])?;
+        for m in &g.members {
+            tx.execute("INSERT INTO group_members (group_id, agent_name) VALUES (?1, ?2)", params![g.id, m])?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn list_groups(&self) -> Result<Vec<GroupRow>> {
+        let mut st = self.conn.prepare_cached(
+            "SELECT g.id, g.guild_id, g.name, g.lead_agent, g.webhook_ref,
+                    coalesce((SELECT group_concat(agent_name, char(31)) FROM group_members WHERE group_id = g.id), '')
+             FROM groups g ORDER BY g.name",
+        )?;
+        let rows = st.query_map([], |r| {
+            let members: String = r.get(5)?;
+            Ok(GroupRow {
+                id: r.get(0)?, guild_id: r.get(1)?, name: r.get(2)?, lead_agent: r.get(3)?, webhook_ref: r.get(4)?,
+                members: members.split('\u{1f}').filter(|s| !s.is_empty()).map(str::to_owned).collect(),
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    pub fn delete_group(&mut self, id: &str) -> Result<bool> {
+        Ok(self.conn.execute("DELETE FROM groups WHERE id = ?1", [id])? > 0)
     }
 
     pub fn quarantine(&mut self, id: i64) -> Result<()> {

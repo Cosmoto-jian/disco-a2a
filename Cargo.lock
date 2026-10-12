@@ -1013,6 +1013,7 @@ name = "disco-app"
 version = "0.0.1"
 dependencies = [
  "disco-a2a",
+ "disco-acp",
  "disco-discord",
  "disco-store",
  "disco-types",

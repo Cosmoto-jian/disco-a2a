@@ -1,26 +1,28 @@
-//! Disco desktop shell (Tauri 2). The UI only calls the typed commands below;
-//! secrets go straight to the macOS Keychain and never touch SQLite or the webview.
+//! Disco desktop shell (Tauri 2). The webview only calls the typed commands
+//! below; secrets live in the macOS Keychain and never reach SQLite or the UI.
 #![forbid(unsafe_code)]
 
-use std::collections::HashMap;
+mod hub;
+mod templates;
+
+use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use disco_a2a::{Credential, RemoteAgent};
-use disco_store::{AgentRow, Store};
-use disco_types::AgentEvent;
-use futures::StreamExt;
+use disco_discord::{Incoming, Rest};
+use disco_store::{AgentRow, GroupRow, Store};
+use disco_types::{AgentEvent, PermissionDecision};
+use hub::{Hub, LocalSpec};
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, State};
+use tokio::sync::{mpsc, watch};
 
 const KEYCHAIN_SERVICE: &str = "dev.cosmoto.disco";
 const DISCORD_KEY: &str = "discord-bot-token";
-
-struct AppState {
-    store: Mutex<Store>,
-    // Connected clients are cached; resolving a card costs a round trip.
-    agents: tokio::sync::Mutex<HashMap<String, Arc<RemoteAgent>>>,
-}
+/// Agent-to-agent hand-offs allowed per human message in a group.
+const MAX_HOPS: usize = 4;
+const TRANSCRIPT: u32 = 20;
 
 type CmdResult<T> = Result<T, String>;
 
@@ -28,170 +30,398 @@ fn err(e: impl std::fmt::Display) -> String {
     e.to_string()
 }
 
-fn keychain(account: &str) -> CmdResult<keyring::Entry> {
-    keyring::Entry::new(KEYCHAIN_SERVICE, account).map_err(err)
+fn secret_get(account: &str) -> Option<String> {
+    keyring::Entry::new(KEYCHAIN_SERVICE, account).ok()?.get_password().ok()
 }
 
-fn store<'a>(s: &'a State<'_, AppState>) -> std::sync::MutexGuard<'a, Store> {
-    s.store.lock().unwrap_or_else(|p| p.into_inner())
+fn secret_set(account: &str, value: &str) -> CmdResult<()> {
+    keyring::Entry::new(KEYCHAIN_SERVICE, account).map_err(err)?.set_password(value).map_err(err)
 }
 
-#[derive(Serialize)]
-struct Status {
-    schema: i64,
-    vec_version: String,
-    agents: usize,
-    discord_token_saved: bool,
-}
-
-#[tauri::command]
-fn app_status(state: State<'_, AppState>) -> CmdResult<Status> {
-    let s = store(&state);
-    Ok(Status {
-        schema: s.schema_version().map_err(err)?,
-        vec_version: s.vec_version().map_err(err)?,
-        agents: s.list_agents().map_err(err)?.len(),
-        discord_token_saved: keychain(DISCORD_KEY)?.get_password().is_ok(),
-    })
-}
-
-#[derive(Serialize)]
-struct AgentView {
-    name: String,
-    transport: String,
-    endpoint: String,
-    description: String,
-}
-
-#[tauri::command]
-fn list_agents(state: State<'_, AppState>) -> CmdResult<Vec<AgentView>> {
-    Ok(store(&state)
-        .list_agents()
-        .map_err(err)?
-        .into_iter()
-        .map(|a| {
-            let description = a
-                .card_json
-                .as_deref()
-                .and_then(|j| serde_json::from_str::<serde_json::Value>(j).ok())
-                .and_then(|v| v.get("description").and_then(|d| d.as_str()).map(str::to_owned))
-                .unwrap_or_default();
-            AgentView { name: a.name, transport: a.transport, endpoint: a.endpoint, description }
-        })
-        .collect())
-}
-
-fn credential_for(row: &AgentRow) -> Credential {
-    let Some(r) = &row.credential_ref else { return Credential::None };
-    let Ok(secret) = keychain(r).and_then(|e| e.get_password().map_err(err)) else { return Credential::None };
-    match secret.split_once('\n') {
-        Some((name, value)) => Credential::Header { name: name.to_owned(), value: value.to_owned() },
-        None => Credential::None,
+fn secret_del(account: &str) {
+    if let Ok(e) = keyring::Entry::new(KEYCHAIN_SERVICE, account) {
+        let _ = e.delete_credential();
     }
 }
 
-#[tauri::command]
-async fn add_a2a_agent(
-    state: State<'_, AppState>,
-    name: String,
-    url: String,
-    header_name: Option<String>,
-    header_value: Option<String>,
-) -> CmdResult<String> {
-    let name = name.trim().to_owned();
-    if name.is_empty() || !url.starts_with("http") {
-        return Err("名称不能为空，URL 需以 http(s) 开头".into());
-    }
-    let cred = match (header_name.filter(|s| !s.is_empty()), header_value.filter(|s| !s.is_empty())) {
-        (Some(n), Some(v)) => Credential::Header { name: n, value: v },
-        _ => Credential::None,
-    };
-    let agent = RemoteAgent::connect(&url, cred.clone()).await.map_err(err)?;
-    let credential_ref = match &cred {
-        Credential::Header { name: h, value } => {
-            let account = format!("agent/{name}");
-            keychain(&account)?.set_password(&format!("{h}\n{value}")).map_err(err)?;
-            Some(account)
-        }
-        Credential::None => None,
-    };
-    let card_name = agent.card.name.clone();
-    let row = AgentRow {
-        id: uuid::Uuid::new_v4().to_string(),
-        name: name.clone(),
-        transport: "a2a".into(),
-        endpoint: url,
-        credential_ref,
-        card_json: serde_json::to_string(&agent.card).ok(),
-    };
-    store(&state).upsert_agent(&row).map_err(err)?;
-    state.agents.lock().await.insert(name, Arc::new(agent));
-    Ok(card_name)
+struct Discord {
+    rest: Rest,
+    stop: watch::Sender<bool>,
 }
 
-#[tauri::command]
-async fn remove_agent(state: State<'_, AppState>, name: String) -> CmdResult<()> {
-    let removed = {
-        let mut s = store(&state);
-        let cref = s.list_agents().map_err(err)?.into_iter().find(|a| a.name == name).and_then(|a| a.credential_ref);
-        if let Some(c) = cref {
-            let _ = keychain(&c).and_then(|e| e.delete_credential().map_err(err));
+pub struct Core {
+    store: Mutex<Store>,
+    hub: Hub,
+    discord: Mutex<Option<Discord>>,
+    discord_status: Mutex<String>,
+    /// Kill switch: while set, nothing is routed to any agent.
+    paused: AtomicBool,
+    app: AppHandle,
+}
+
+type St<'a> = State<'a, Arc<Core>>;
+
+impl Core {
+    fn db(&self) -> std::sync::MutexGuard<'_, Store> {
+        self.store.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    fn agent(&self, name: &str) -> CmdResult<AgentRow> {
+        self.db().list_agents().map_err(err)?.into_iter().find(|a| a.name == name).ok_or_else(|| format!("没有名为 {name} 的 agent"))
+    }
+
+    fn post_message(&self, thread: &str, author: &str, body: &str) {
+        let ts = {
+            let db = self.db();
+            let _ = db.add_message(thread, author, body);
+            now()
+        };
+        let _ = self.app.emit("message", MessageEvt { thread: thread.into(), author: author.into(), body: body.into(), ts });
+    }
+
+    fn set_discord_status(&self, s: String) {
+        *self.discord_status.lock().unwrap_or_else(|p| p.into_inner()) = s.clone();
+        let _ = self.app.emit("discord-status", s);
+    }
+
+    /// One agent turn: prompt, stream to the UI, return the answer.
+    async fn turn(&self, thread: &str, agent: &str, context: &str, prompt: &str) -> CmdResult<String> {
+        if self.paused.load(Ordering::Relaxed) {
+            return Err("已全部停止".into());
         }
-        s.delete_agent(&name).map_err(err)?
-    };
-    state.agents.lock().await.remove(&name);
-    if removed { Ok(()) } else { Err("未找到该 agent".into()) }
+        let row = self.agent(agent)?;
+        let _ = self.app.emit("typing", TypingEvt { thread: thread.into(), agent: agent.into(), on: true });
+        let app = self.app.clone();
+        let (t, a) = (thread.to_owned(), agent.to_owned());
+        let res = self
+            .hub
+            .ask(&row, &secret_get, context, prompt, move |ev| {
+                let _ = app.emit("stream", StreamEvt { thread: t.clone(), agent: a.clone(), event: ev.clone() });
+            })
+            .await;
+        let _ = self.app.emit("typing", TypingEvt { thread: thread.into(), agent: agent.into(), on: false });
+        let _ = self.db().audit("disco", Some(agent), "prompt", if res.is_ok() { "ok" } else { "error" });
+        res
+    }
+
+    async fn dm(&self, agent: String, text: String) {
+        let thread = format!("dm:{agent}");
+        self.post_message(&thread, "me", &text);
+        match self.turn(&thread, &agent, &thread, &text).await {
+            Ok(answer) => self.post_message(&thread, &agent, answer.trim()),
+            Err(e) => self.post_message(&thread, "system", &format!("{agent} 出错：{e}")),
+        }
+    }
+
+    /// Group routing: @mentioned members answer, otherwise the lead does.
+    /// An answer that @mentions another member hands off to it, up to MAX_HOPS.
+    async fn group(&self, channel: String, author: String, text: String, from_discord: bool) {
+        let Some(g) = self.db().list_groups().ok().and_then(|gs| gs.into_iter().find(|g| g.id == channel)) else { return };
+        let thread = format!("group:{channel}");
+        self.post_message(&thread, &author, &text);
+        if !from_discord && let Some(d) = self.discord_rest() {
+            let _ = d.post(&channel, &format!("**{author}**：{text}")).await;
+        }
+        let mut queue: VecDeque<String> = mentions(&text, &g.members, None).into();
+        if queue.is_empty() && let Some(lead) = g.lead_agent.clone().or_else(|| g.members.first().cloned()) {
+            queue.push_back(lead);
+        }
+        let mut hops = 0;
+        while let Some(agent) = queue.pop_front() {
+            if hops >= MAX_HOPS || self.paused.load(Ordering::Relaxed) { break; }
+            hops += 1;
+            let prompt = self.group_prompt(&g, &thread, &agent);
+            match self.turn(&thread, &agent, &thread, &prompt).await {
+                Ok(answer) => {
+                    let answer = answer.trim().to_owned();
+                    if answer.is_empty() { continue; }
+                    self.post_message(&thread, &agent, &answer);
+                    if let (Some(d), Some(hook)) = (self.discord_rest(), g.webhook_ref.as_deref().and_then(secret_get))
+                        && let Err(e) = d.post_as(&hook, &agent, &answer).await
+                    {
+                        self.post_message(&thread, "system", &format!("Discord 发送失败：{e}"));
+                    }
+                    for next in mentions(&answer, &g.members, Some(&agent)) {
+                        if !queue.contains(&next) { queue.push_back(next); }
+                    }
+                }
+                Err(e) => self.post_message(&thread, "system", &format!("{agent} 出错：{e}")),
+            }
+        }
+    }
+
+    fn group_prompt(&self, g: &GroupRow, thread: &str, me: &str) -> String {
+        let history = self.db().messages(thread, TRANSCRIPT).unwrap_or_default();
+        let mut p = format!(
+            "你是 {me}，正在群聊「{}」里和其他 agent 及人类协作。成员：{}。\n\
+             需要别人接手时，在回复里写 @名字。只输出你要发到群里的那段话，不要复述聊天记录。\n\n最近的聊天记录：\n",
+            g.name,
+            g.members.join("、")
+        );
+        for m in history {
+            let who = if m.author == "me" { "我（人类）" } else { m.author.as_str() };
+            p.push_str(&format!("[{who}] {}\n", m.body));
+        }
+        p
+    }
+
+    fn discord_rest(&self) -> Option<Rest> {
+        self.discord.lock().unwrap_or_else(|p| p.into_inner()).as_ref().map(|d| d.rest.clone())
+    }
+}
+
+/// Members named as `@name` in `text` (case-insensitive), in order, excluding `me`.
+fn mentions(text: &str, members: &[String], me: Option<&str>) -> Vec<String> {
+    let lower = text.to_lowercase();
+    let mut hits: Vec<(usize, &String)> = members
+        .iter()
+        .filter(|m| Some(m.as_str()) != me)
+        .filter_map(|m| lower.find(&format!("@{}", m.to_lowercase())).map(|i| (i, m)))
+        .collect();
+    hits.sort_unstable_by_key(|(i, _)| *i);
+    hits.into_iter().map(|(_, m)| m.clone()).collect()
+}
+
+fn now() -> i64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0)
 }
 
 #[derive(Clone, Serialize)]
-struct AgentEventMsg {
-    agent: String,
-    event: AgentEvent,
+struct MessageEvt { thread: String, author: String, body: String, ts: i64 }
+#[derive(Clone, Serialize)]
+struct StreamEvt { thread: String, agent: String, event: AgentEvent }
+#[derive(Clone, Serialize)]
+struct TypingEvt { thread: String, agent: String, on: bool }
+
+// ------------------------------------------------------------------ commands
+
+#[derive(Serialize)]
+struct AgentView { name: String, kind: String, template: String, detail: String, live: bool }
+#[derive(Serialize)]
+struct GroupView { id: String, name: String, guild_id: String, lead: Option<String>, members: Vec<String> }
+#[derive(Serialize)]
+struct Head { thread: String, author: String, body: String, ts: i64 }
+#[derive(Serialize)]
+struct Overview {
+    agents: Vec<AgentView>,
+    groups: Vec<GroupView>,
+    heads: Vec<Head>,
+    discord_token: bool,
+    discord_status: String,
+    paused: bool,
 }
 
 #[tauri::command]
-async fn prompt_agent(
-    app: AppHandle,
-    state: State<'_, AppState>,
+async fn overview(core: St<'_>) -> CmdResult<Overview> {
+    let (rows, groups, heads) = {
+        let db = core.db();
+        (db.list_agents().map_err(err)?, db.list_groups().map_err(err)?, db.thread_heads().map_err(err)?)
+    };
+    let mut agents = Vec::with_capacity(rows.len());
+    for a in rows {
+        let spec: LocalSpec = a.card_json.as_deref().and_then(|j| serde_json::from_str(j).ok()).unwrap_or_default();
+        let detail = if a.transport == "a2a" {
+            a.card_json.as_deref()
+                .and_then(|j| serde_json::from_str::<serde_json::Value>(j).ok())
+                .and_then(|v| v.get("description")?.as_str().map(str::to_owned))
+                .unwrap_or_else(|| a.endpoint.clone())
+        } else if spec.description.is_empty() { a.endpoint.clone() } else { spec.description };
+        let template = if a.transport == "a2a" { "a2a".into() } else { spec.template };
+        agents.push(AgentView { live: core.hub.is_live(&a.name).await, name: a.name, kind: a.transport, template, detail });
+    }
+    Ok(Overview {
+        agents,
+        groups: groups.into_iter().map(|g| GroupView { id: g.id, name: g.name, guild_id: g.guild_id, lead: g.lead_agent, members: g.members }).collect(),
+        heads: heads.into_iter().map(|(t, m)| Head { thread: t, author: m.author, body: m.body, ts: m.ts }).collect(),
+        discord_token: secret_get(DISCORD_KEY).is_some(),
+        discord_status: core.discord_status.lock().unwrap_or_else(|p| p.into_inner()).clone(),
+        paused: core.paused.load(Ordering::Relaxed),
+    })
+}
+
+#[tauri::command]
+fn templates() -> &'static [templates::Template] {
+    templates::TEMPLATES
+}
+
+fn valid_name(name: &str) -> CmdResult<String> {
+    let n = name.trim();
+    if n.is_empty() || n.len() > 32 || !n.chars().all(|c| c.is_alphanumeric() || c == '-' || c == '_') {
+        return Err("名称只能用字母、数字、- 或 _，最多 32 个字符".into());
+    }
+    Ok(n.to_owned())
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct NewAgent {
+    template: String,
     name: String,
-    context_id: String,
-    text: String,
-) -> CmdResult<()> {
-    let agent = {
-        let mut cache = state.agents.lock().await;
-        match cache.get(&name) {
-            Some(a) => a.clone(),
-            None => {
-                let row = store(&state).list_agents().map_err(err)?.into_iter().find(|a| a.name == name).ok_or("未找到该 agent")?;
-                let a = Arc::new(RemoteAgent::connect(&row.endpoint, credential_for(&row)).await.map_err(err)?);
-                cache.insert(name.clone(), a.clone());
-                a
-            }
+    url: Option<String>,
+    header_name: Option<String>,
+    header_value: Option<String>,
+    command: Option<String>,
+    cwd: Option<String>,
+}
+
+#[tauri::command]
+async fn add_agent(core: St<'_>, spec: NewAgent) -> CmdResult<()> {
+    let NewAgent { template, name, url, header_name, header_value, command, cwd } = spec;
+    let name = valid_name(&name)?;
+    let t = templates::get(&template).ok_or("未知模板")?;
+    let row = match t.kind {
+        "a2a" => {
+            let url = url.filter(|u| u.starts_with("http")).ok_or("URL 需以 http(s) 开头")?;
+            let cred = match (header_name.filter(|s| !s.is_empty()), header_value.filter(|s| !s.is_empty())) {
+                (Some(n), Some(v)) => Credential::Header { name: n, value: v },
+                _ => Credential::None,
+            };
+            let agent = RemoteAgent::connect(&url, cred.clone()).await.map_err(err)?;
+            let credential_ref = if let Credential::Header { name: h, value } = &cred {
+                let account = format!("agent/{name}");
+                secret_set(&account, &format!("{h}\n{value}"))?;
+                Some(account)
+            } else { None };
+            AgentRow { id: uuid::Uuid::new_v4().to_string(), name, transport: "a2a".into(), endpoint: url, credential_ref, card_json: serde_json::to_string(&agent.card).ok() }
+        }
+        kind => {
+            let (cmd, args) = if kind == "command" {
+                let line = command.unwrap_or_default();
+                let mut it = line.split_whitespace().map(str::to_owned);
+                (it.next().ok_or("请填写命令")?, it.collect())
+            } else {
+                (t.command.to_owned(), t.args.iter().map(|s| s.to_string()).collect::<Vec<_>>())
+            };
+            let spec = LocalSpec { template: t.id.into(), command: cmd.clone(), args: args.clone(), cwd: cwd.unwrap_or_default().trim().into(), description: t.blurb.into() };
+            AgentRow { id: uuid::Uuid::new_v4().to_string(), name, transport: "acp".into(), endpoint: std::iter::once(cmd).chain(args).collect::<Vec<_>>().join(" "), credential_ref: None, card_json: serde_json::to_string(&spec).ok() }
         }
     };
-    let mut events = agent.prompt(&context_id, &text).await.map_err(err)?;
-    tokio::spawn(async move {
-        while let Some(event) = events.next().await {
-            let _ = app.emit("agent-event", AgentEventMsg { agent: name.clone(), event });
-        }
-    });
+    core.db().upsert_agent(&row).map_err(err)?;
     Ok(())
 }
 
 #[tauri::command]
-fn save_discord_token(token: String) -> CmdResult<()> {
-    let token = token.trim();
-    if token.len() < 50 {
-        return Err("token 看起来不完整".into());
-    }
-    keychain(DISCORD_KEY)?.set_password(token).map_err(err)
+async fn remove_agent(core: St<'_>, name: String) -> CmdResult<()> {
+    core.hub.drop_agent(&name).await;
+    let row = core.agent(&name)?;
+    if let Some(c) = row.credential_ref { secret_del(&c); }
+    core.db().delete_agent(&name).map_err(err)?;
+    Ok(())
+}
+
+#[derive(Serialize)]
+struct Msg { author: String, body: String, ts: i64 }
+
+#[tauri::command]
+fn messages(core: St<'_>, thread: String) -> CmdResult<Vec<Msg>> {
+    Ok(core.db().messages(&thread, 200).map_err(err)?.into_iter().map(|m| Msg { author: m.author, body: m.body, ts: m.ts }).collect())
 }
 
 #[tauri::command]
-async fn discord_check() -> CmdResult<String> {
-    let token = keychain(DISCORD_KEY)?.get_password().map_err(|_| "还没有保存 Discord token".to_owned())?;
-    let r = disco_discord::gateway_check(token, Duration::from_secs(20)).await?;
-    Ok(format!("已连接：{}，所在服务器 {} 个，READY 用时 {} ms", r.bot_name, r.guilds, r.ready_after.as_millis()))
+fn send(core: St<'_>, thread: String, text: String) -> CmdResult<()> {
+    let text = text.trim().to_owned();
+    if text.is_empty() { return Ok(()); }
+    if core.paused.load(Ordering::Relaxed) { return Err("已全部停止，先点「恢复」".into()); }
+    let core = core.inner().clone();
+    if let Some(agent) = thread.strip_prefix("dm:") {
+        let agent = agent.to_owned();
+        tauri::async_runtime::spawn(async move { core.dm(agent, text).await });
+    } else if let Some(ch) = thread.strip_prefix("group:") {
+        let ch = ch.to_owned();
+        tauri::async_runtime::spawn(async move { core.group(ch, "me".into(), text, false).await });
+    } else {
+        return Err("未知会话".into());
+    }
+    Ok(())
+}
+
+#[tauri::command]
+async fn decide_permission(core: St<'_>, agent: String, request_id: String, option_id: Option<String>) -> CmdResult<bool> {
+    let d = option_id.map_or(PermissionDecision::Cancel, |option_id| PermissionDecision::Select { option_id });
+    Ok(core.hub.decide(&agent, &request_id, d).await)
+}
+
+#[tauri::command]
+async fn stop_all(core: St<'_>) -> CmdResult<usize> {
+    core.paused.store(true, Ordering::Relaxed);
+    let n = core.hub.stop_all().await;
+    core.db().audit("me", None, "kill_switch", &format!("stopped {n}")).map_err(err)?;
+    Ok(n)
+}
+
+#[tauri::command]
+fn resume(core: St<'_>) {
+    core.paused.store(false, Ordering::Relaxed);
+}
+
+#[tauri::command]
+async fn save_discord_token(core: St<'_>, token: String) -> CmdResult<()> {
+    let token = token.trim();
+    if token.len() < 50 { return Err("token 看起来不完整".into()); }
+    secret_set(DISCORD_KEY, token)?;
+    connect_discord(core.inner().clone());
+    Ok(())
+}
+
+#[tauri::command]
+fn discord_connect(core: St<'_>) -> CmdResult<()> {
+    if secret_get(DISCORD_KEY).is_none() { return Err("还没有保存 Discord token".into()); }
+    connect_discord(core.inner().clone());
+    Ok(())
+}
+
+#[derive(Serialize)]
+struct Channel { guild_id: String, guild: String, id: String, name: String }
+
+#[tauri::command]
+async fn discord_channels(core: St<'_>) -> CmdResult<Vec<Channel>> {
+    let rest = core.discord_rest().ok_or("Discord 未连接")?;
+    Ok(rest.text_channels().await?.into_iter().map(|c| Channel { guild_id: c.guild_id, guild: c.guild_name, id: c.channel_id, name: c.channel_name }).collect())
+}
+
+#[tauri::command]
+async fn save_group(core: St<'_>, channel_id: String, guild_id: String, name: String, members: Vec<String>, lead: Option<String>) -> CmdResult<()> {
+    if members.is_empty() { return Err("至少选一个 agent".into()); }
+    let existing = core.db().list_groups().map_err(err)?.into_iter().find(|g| g.id == channel_id).and_then(|g| g.webhook_ref);
+    let webhook_ref = match existing {
+        Some(r) if secret_get(&r).is_some() => Some(r),
+        _ => {
+            let rest = core.discord_rest().ok_or("Discord 未连接")?;
+            let hook = rest.create_webhook(&channel_id).await?;
+            let account = format!("webhook/{channel_id}");
+            secret_set(&account, &hook)?;
+            Some(account)
+        }
+    };
+    let lead = lead.filter(|l| members.contains(l)).or_else(|| members.first().cloned());
+    core.db().upsert_group(&GroupRow { id: channel_id, guild_id, name, lead_agent: lead, webhook_ref, members }).map_err(err)
+}
+
+#[tauri::command]
+fn delete_group(core: St<'_>, id: String) -> CmdResult<()> {
+    secret_del(&format!("webhook/{id}"));
+    core.db().delete_group(&id).map_err(err)?;
+    Ok(())
+}
+
+fn connect_discord(core: Arc<Core>) {
+    let Some(token) = secret_get(DISCORD_KEY) else { return };
+    let (stop_tx, stop_rx) = watch::channel(false);
+    if let Some(old) = core.discord.lock().unwrap_or_else(|p| p.into_inner()).replace(Discord { rest: Rest::new(token.clone()), stop: stop_tx }) {
+        let _ = old.stop.send(true);
+    }
+    core.set_discord_status("连接中…".into());
+    let (tx, mut rx) = mpsc::channel::<Incoming>(64);
+    let c = core.clone();
+    tauri::async_runtime::spawn(disco_discord::run_gateway(token, tx, stop_rx, move |s| c.set_discord_status(s)));
+    tauri::async_runtime::spawn(async move {
+        while let Some(m) = rx.recv().await {
+            let c = core.clone();
+            // Each channel message is handled on its own task so one slow agent
+            // never blocks other groups.
+            tauri::async_runtime::spawn(async move { c.group(m.channel_id, m.author, m.content, true).await });
+        }
+    });
 }
 
 pub fn run() {
@@ -200,19 +430,35 @@ pub fn run() {
         .setup(|app| {
             let dir = app.path().app_data_dir()?;
             std::fs::create_dir_all(&dir)?;
-            let store = Store::open(dir.join("disco.db"))?;
-            app.manage(AppState { store: Mutex::new(store), agents: Default::default() });
+            let core = Arc::new(Core {
+                store: Mutex::new(Store::open(dir.join("disco.db"))?),
+                hub: Hub::new(),
+                discord: Mutex::new(None),
+                discord_status: Mutex::new("未连接".into()),
+                paused: AtomicBool::new(false),
+                app: app.handle().clone(),
+            });
+            if secret_get(DISCORD_KEY).is_some() { connect_discord(core.clone()); }
+            app.manage(core);
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
-            app_status,
-            list_agents,
-            add_a2a_agent,
-            remove_agent,
-            prompt_agent,
-            save_discord_token,
-            discord_check
+            overview, templates, add_agent, remove_agent, messages, send, decide_permission,
+            stop_all, resume, save_discord_token, discord_connect, discord_channels, save_group, delete_group
         ])
         .run(tauri::generate_context!())
         .expect("error while running Disco");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::mentions;
+
+    #[test]
+    fn mention_order_and_self_exclusion() {
+        let m = vec!["planner".to_string(), "coder".to_string(), "reviewer".to_string()];
+        assert_eq!(mentions("@Reviewer 看下，@coder 先写", &m, None), ["reviewer", "coder"]);
+        assert_eq!(mentions("@coder 我自己来 @planner", &m, Some("coder")), ["planner"]);
+        assert!(mentions("没有提到谁", &m, None).is_empty());
+    }
 }
