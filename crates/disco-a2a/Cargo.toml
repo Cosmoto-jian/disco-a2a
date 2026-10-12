@@ -1,0 +1,23 @@
+[package]
+name = "disco-a2a"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+disco-types.workspace = true
+a2a.workspace = true
+a2a-client.workspace = true
+futures.workspace = true
+async-trait = "0.1"
+thiserror.workspace = true
+
+[dev-dependencies]
+a2a-server.workspace = true
+axum.workspace = true
+tokio.workspace = true
+chrono.workspace = true
+
+[lints]
+workspace = true
