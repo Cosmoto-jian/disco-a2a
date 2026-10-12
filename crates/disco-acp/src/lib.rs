@@ -54,6 +54,8 @@ type Sinks = Arc<Mutex<HashMap<String, mpsc::Sender<AgentEvent>>>>;
 
 enum Cmd {
     Prompt { key: String, text: String, events: mpsc::Sender<AgentEvent> },
+    /// Create the session for `key` ahead of the first prompt.
+    Warm { key: String },
 }
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -107,6 +109,11 @@ impl AcpAgent {
         let (tx, rx) = mpsc::channel(64);
         self.cmd.send(Cmd::Prompt { key: key.into(), text: text.into(), events: tx }).await.map_err(|_| AcpError::Gone)?;
         Ok(rx)
+    }
+
+    /// Start the session for `key` now so the first real prompt doesn't pay for it.
+    pub async fn warm(&self, key: impl Into<String>) -> Result<(), AcpError> {
+        self.cmd.send(Cmd::Warm { key: key.into() }).await.map_err(|_| AcpError::Gone)
     }
 
     /// Answer a `PermissionAsked` event.
@@ -224,17 +231,24 @@ async fn run_connection<W, R>(
             conn.send_request(InitializeRequest::new(ProtocolVersion::V1)).block_task().await?;
             // Disco context key -> (ACP session, per-session turn lock).
             let mut sessions: HashMap<String, (SessionId, Arc<tokio::sync::Mutex<()>>)> = HashMap::new();
-            while let Some(Cmd::Prompt { key, text, events }) = cmd_rx.recv().await {
+            while let Some(cmd) = cmd_rx.recv().await {
+                let (key, job) = match cmd {
+                    Cmd::Prompt { key, text, events } => (key, Some((text, events))),
+                    Cmd::Warm { key } => (key, None),
+                };
                 let (session, turn) = match sessions.get(&key) {
                     Some(s) => s.clone(),
                     None => match conn.send_request(NewSessionRequest::new(launch.cwd.clone())).block_task().await {
                         Ok(r) => sessions.entry(key).or_insert((r.session_id, Arc::default())).clone(),
                         Err(e) => {
-                            let _ = events.send(AgentEvent::Done { phase: TaskPhase::Failed, stop_reason: Some(e.to_string()) }).await;
+                            if let Some((_, events)) = job {
+                                let _ = events.send(AgentEvent::Done { phase: TaskPhase::Failed, stop_reason: Some(e.to_string()) }).await;
+                            }
                             continue;
                         }
                     },
                 };
+                let Some((text, events)) = job else { continue };
                 let (conn, sinks, pending, timeout) = (conn.clone(), sinks.clone(), pending.clone(), launch.prompt_timeout);
                 tokio::spawn(async move {
                     let _turn = turn.lock().await;

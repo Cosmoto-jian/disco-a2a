@@ -161,8 +161,10 @@ impl Core {
         let thread = format!("dm:{agent}");
         self.post_message(&thread, &author, &text);
         let mirror = self.agent_channel(&agent).and_then(|ch| Some((self.discord_rest()?, ch)));
-        if !from_discord && let Some((d, ch)) = &mirror {
-            let _ = d.post(ch, &format!("**我**：{text}")).await;
+        // Mirror in the background: the agent must not wait on Discord.
+        if !from_discord && let Some((d, ch)) = mirror.clone() {
+            let line = format!("**我**：{text}");
+            tauri::async_runtime::spawn(async move { let _ = d.post(&ch, &line).await; });
         }
         match self.turn(&thread, &agent, &thread, &text).await {
             Ok(answer) => {
@@ -176,6 +178,19 @@ impl Core {
             }
             Err(e) => self.post_message(&thread, "system", &format!("{agent} 出错：{e}")),
         }
+    }
+
+    /// Start agents and their DM sessions ahead of use (all of them, or `only`).
+    fn warm(self: &Arc<Self>, only: Option<Vec<String>>) {
+        let core = self.clone();
+        tauri::async_runtime::spawn(async move {
+            let Ok(rows) = core.db().list_agents() else { return };
+            let runs = rows.into_iter().filter(|r| only.as_ref().is_none_or(|o| o.contains(&r.name))).map(|r| {
+                let core = core.clone();
+                async move { core.hub.warm(&r, &secret_get, &format!("dm:{}", r.name)).await }
+            });
+            futures::future::join_all(runs).await;
+        });
     }
 
     fn agent_channel(&self, agent: &str) -> Option<String> {
@@ -233,7 +248,8 @@ impl Core {
         let thread = format!("group:{channel}");
         self.post_message(&thread, &author, &text);
         if !from_discord && let Some(d) = self.discord_rest() {
-            let _ = d.post(&channel, &format!("**{author}**：{text}")).await;
+            let (ch, line) = (channel.clone(), format!("**{author}**：{text}"));
+            tauri::async_runtime::spawn(async move { let _ = d.post(&ch, &line).await; });
         }
         let mut wave = mentions(&text, &g.members, None);
         if wave.is_empty() && let Some(lead) = g.lead_agent.clone().or_else(|| g.members.first().cloned()) {
@@ -409,6 +425,7 @@ struct NewAgent {
 #[tauri::command]
 async fn add_agent(core: St<'_>, spec: NewAgent) -> CmdResult<Vec<String>> {
     let names = add_agent_rows(&core, spec).await?;
+    core.inner().warm(Some(names.clone()));
     if core.discord_rest().is_some() {
         let (c, n) = (core.inner().clone(), names.clone());
         tauri::async_runtime::spawn(async move {
@@ -534,6 +551,7 @@ async fn stop_all(core: St<'_>) -> CmdResult<usize> {
 #[tauri::command]
 fn resume(core: St<'_>) {
     core.paused.store(false, Ordering::Relaxed);
+    core.inner().warm(None);
 }
 
 #[tauri::command]
@@ -771,6 +789,7 @@ pub fn run() {
                 let _ = core.db().set_setting(SET_TOKEN_SAVED, "1");
             }
             if core.db().setting(SET_TOKEN_SAVED).is_some() { connect_discord(core.clone()); }
+            core.warm(None);
             app.manage(core);
             let handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {

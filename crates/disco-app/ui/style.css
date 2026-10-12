@@ -1,3 +1,4 @@
+[hidden] { display:none !important; }
 :root {
   color-scheme: light dark;
   --rail:#ececee; --list:#f7f7f8; --main:#ffffff; --line:#e5e5e8; --fg:#1d1d1f; --mute:#8e8e93;

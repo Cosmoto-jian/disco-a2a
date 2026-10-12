@@ -33,8 +33,11 @@ enum Runtime {
     Acp(Arc<AcpAgent>),
 }
 
+type Cell = Arc<tokio::sync::OnceCell<Runtime>>;
+
 pub struct Hub {
-    live: Mutex<HashMap<String, Runtime>>,
+    /// One cell per agent so concurrent first uses (warm-up + a prompt) start it once.
+    live: Mutex<HashMap<String, Cell>>,
     /// Caps simultaneous agent turns across the whole app.
     slots: Arc<tokio::sync::Semaphore>,
     /// The user's login-shell PATH: GUI apps start with a bare one, so npx and
@@ -52,9 +55,26 @@ impl Hub {
     }
 
     async fn runtime(&self, row: &AgentRow, secret: &CredLookup) -> Result<Runtime, String> {
-        if let Some(r) = self.live.lock().await.get(&row.name) {
-            return Ok(r.clone());
+        let cell = self.live.lock().await.entry(row.name.clone()).or_default().clone();
+        let res = cell.get_or_try_init(|| self.start(row, secret)).await.cloned();
+        if res.is_err() { self.forget(&row.name, &cell).await; }
+        res
+    }
+
+    async fn forget(&self, name: &str, cell: &Cell) {
+        let mut live = self.live.lock().await;
+        if live.get(name).is_some_and(|c| Arc::ptr_eq(c, cell)) { live.remove(name); }
+    }
+
+    /// Start an agent (and its session for `context`) in the background, so the
+    /// first message doesn't wait for npx, process start-up and session creation.
+    pub async fn warm(&self, row: &AgentRow, secret: &CredLookup, context: &str) {
+        if let Ok(Runtime::Acp(a)) = self.runtime(row, secret).await {
+            let _ = a.warm(context).await;
         }
+    }
+
+    async fn start(&self, row: &AgentRow, secret: &CredLookup) -> Result<Runtime, String> {
         let rt = match row.transport.as_str() {
             "a2a" => {
                 let cred = row
@@ -82,9 +102,14 @@ impl Hub {
                     "npx" | "node" => "找不到 npx：请先安装 Node.js（https://nodejs.org 或 brew install node），然后重启 Disco".to_owned(),
                     c => format!("找不到命令 {c}：请先安装它，或在终端确认 `which {c}` 有输出"),
                 })?;
+                let mut args = spec.args;
+                // npx otherwise asks the npm registry on every launch (seconds over a VPN).
+                if spec.command == "npx" && !args.iter().any(|a| a == "--prefer-offline") {
+                    args.insert(0, "--prefer-offline".into());
+                }
                 let launch = Launch {
                     command: command.to_string_lossy().into_owned(),
-                    args: spec.args,
+                    args,
                     env: vec![("PATH".into(), self.user_path.clone())],
                     cwd,
                     prompt_timeout: Duration::from_secs(15 * 60),
@@ -93,7 +118,6 @@ impl Hub {
             }
             t => return Err(format!("暂不支持的类型 {t}")),
         };
-        self.live.lock().await.insert(row.name.clone(), rt.clone());
         Ok(rt)
     }
 
@@ -129,30 +153,31 @@ impl Hub {
             }
             Runtime::Acp(a) => {
                 let mut rx = a.prompt(context, text).await.map_err(|e| e.to_string())?;
-                let mut out = Some(Err("agent 进程已退出".into()));
+                let mut out = None;
                 while let Some(ev) = rx.recv().await {
                     if let Some(r) = finish(ev) { out = Some(r); break; }
                 }
-                if matches!(out, Some(Err(_))) { self.live.lock().await.remove(&row.name); }
-                out.unwrap_or(Ok(()))
+                // Only a closed stream means the process died; a failed turn keeps it warm.
+                out.unwrap_or_else(|| Err("agent 进程已退出".into()))
             }
         };
         outcome.map(|()| answer)
     }
 
     pub async fn decide(&self, agent: &str, request_id: &str, d: PermissionDecision) -> bool {
-        match self.live.lock().await.get(agent) {
+        let cell = self.live.lock().await.get(agent).cloned();
+        match cell.as_ref().and_then(|c| c.get()) {
             Some(Runtime::Acp(a)) => a.decide(request_id, d),
             _ => false,
         }
     }
 
     pub async fn is_live(&self, agent: &str) -> bool {
-        self.live.lock().await.contains_key(agent)
+        self.live.lock().await.get(agent).is_some_and(|c| c.initialized())
     }
 
     pub async fn drop_agent(&self, agent: &str) {
-        if let Some(Runtime::Acp(a)) = self.live.lock().await.remove(agent) {
+        if let Some(Runtime::Acp(a)) = self.live.lock().await.remove(agent).as_ref().and_then(|c| c.get()) {
             a.kill();
         }
     }
@@ -160,8 +185,8 @@ impl Hub {
     /// Kill switch: stop every running agent process and forget every client.
     pub async fn stop_all(&self) -> usize {
         let all: Vec<_> = self.live.lock().await.drain().collect();
-        for (_, rt) in &all {
-            if let Runtime::Acp(a) = rt { a.kill(); }
+        for (_, c) in &all {
+            if let Some(Runtime::Acp(a)) = c.get() { a.kill(); }
         }
         all.len()
     }
