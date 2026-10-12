@@ -1,0 +1,29 @@
+:root { color-scheme: light dark; --bg:#f6f6f7; --panel:#fff; --line:#e3e3e6; --fg:#1c1c1e; --mute:#8a8a8e; --acc:#5865f2; }
+@media (prefers-color-scheme: dark) { :root { --bg:#1c1c1e; --panel:#2a2a2d; --line:#3a3a3d; --fg:#f2f2f2; --mute:#9a9aa0; } }
+* { box-sizing: border-box; }
+body { margin:0; height:100vh; display:grid; grid-template-columns:280px 1fr; font:14px -apple-system, "PingFang SC", sans-serif; background:var(--bg); color:var(--fg); }
+aside { border-right:1px solid var(--line); padding:12px; overflow:auto; background:var(--panel); }
+header { display:flex; justify-content:space-between; align-items:center; margin-bottom:12px; font-size:16px; }
+#status { font-size:11px; color:var(--mute); }
+ul { list-style:none; padding:0; margin:0 0 12px; }
+li { padding:8px 10px; border-radius:8px; cursor:pointer; display:flex; justify-content:space-between; gap:6px; }
+li:hover, li.on { background:var(--bg); }
+li small { color:var(--mute); display:block; }
+li .x { color:var(--mute); border:0; background:none; cursor:pointer; }
+details { margin-top:10px; } summary { cursor:pointer; color:var(--mute); }
+form { display:flex; flex-direction:column; gap:6px; margin:8px 0; }
+input, textarea { padding:7px 9px; border:1px solid var(--line); border-radius:7px; background:var(--bg); color:var(--fg); font:inherit; }
+button { padding:7px 10px; border:0; border-radius:7px; background:var(--acc); color:#fff; cursor:pointer; font:inherit; }
+button:disabled { opacity:.5; }
+.err { color:#e5484d; } #discord-out { display:block; margin-top:6px; color:var(--mute); }
+main { display:flex; flex-direction:column; min-width:0; }
+#empty { margin:auto; color:var(--mute); }
+#chat { display:flex; flex-direction:column; height:100%; }
+#chat h2 { margin:0; padding:14px 18px; font-size:15px; border-bottom:1px solid var(--line); }
+#log { flex:1; overflow:auto; padding:16px 18px; display:flex; flex-direction:column; gap:10px; }
+.msg { max-width:75%; padding:9px 12px; border-radius:12px; white-space:pre-wrap; word-break:break-word; }
+.me { align-self:flex-end; background:var(--acc); color:#fff; }
+.bot { align-self:flex-start; background:var(--panel); border:1px solid var(--line); }
+.meta { align-self:flex-start; color:var(--mute); font-size:12px; }
+#send { flex-direction:row; padding:12px 18px; border-top:1px solid var(--line); margin:0; }
+#send textarea { flex:1; resize:none; }
