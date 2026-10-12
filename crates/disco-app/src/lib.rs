@@ -5,6 +5,7 @@
 mod hub;
 mod templates;
 
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -116,6 +117,9 @@ pub struct Core {
     paused: AtomicBool,
     /// `agent|context` pairs whose session already got the memory preamble.
     primed: Mutex<std::collections::HashSet<String>>,
+    /// `agent|thread` -> id of the newest group message that agent's session has seen,
+    /// so later turns send only what is new instead of the whole transcript again.
+    seen: Mutex<HashMap<String, i64>>,
     app: AppHandle,
 }
 
@@ -163,6 +167,7 @@ impl Core {
             })
             .await;
         let _ = self.app.emit("typing", TypingEvt { thread: thread.into(), agent: agent.into(), on: false });
+        if matches!(&res, Err(e) if e.contains("进程已退出")) { self.forget_sessions(Some(agent)); }
         let _ = self.db().audit("disco", Some(agent), "prompt", if res.is_ok() { "ok" } else { "error" });
         res
     }
@@ -248,9 +253,12 @@ impl Core {
         let core = self.clone();
         tauri::async_runtime::spawn(async move {
             let Ok(rows) = core.db().list_agents() else { return };
+            let groups = core.db().list_groups().unwrap_or_default();
             let runs = rows.into_iter().filter(|r| only.as_ref().is_none_or(|o| o.contains(&r.name))).map(|r| {
                 let core = core.clone();
-                async move { core.hub.warm(&r, &secret_get, &format!("dm:{}", r.name)).await }
+                let ctxs: Vec<String> = std::iter::once(format!("dm:{}", r.name))
+                    .chain(groups.iter().filter(|g| g.members.contains(&r.name)).map(|g| format!("group:{}", g.id))).collect();
+                async move { for c in ctxs { core.hub.warm(&r, &secret_get, &c).await; } }
             });
             futures::future::join_all(runs).await;
         });
@@ -362,17 +370,33 @@ impl Core {
 
     fn group_prompt(&self, g: &GroupRow, thread: &str, me: &str) -> String {
         let history = self.db().messages(thread, TRANSCRIPT).unwrap_or_default();
-        let mut p = format!(
-            "你是 {me}，正在群聊「{}」里和其他 agent 及人类协作。成员：{}。\n\
-             需要别人接手时，在回复里写 @名字。只输出你要发到群里的那段话，不要复述聊天记录。\n\n最近的聊天记录：\n",
-            g.name,
-            g.members.join("、")
-        );
-        for m in history {
+        let key = format!("{me}|{thread}");
+        let last = self.seen.lock().unwrap_or_else(|p| p.into_inner()).get(&key).copied();
+        if let Some(newest) = history.last() {
+            self.seen.lock().unwrap_or_else(|p| p.into_inner()).insert(key, newest.id);
+        }
+        let mut p = match last {
+            None => format!(
+                "你是 {me}，正在群聊「{}」里和其他 agent 及人类协作。成员：{}。\n\
+                 需要别人接手时，在回复里写 @名字。只输出你要发到群里的那段话，不要复述聊天记录。\n\n最近的聊天记录：\n",
+                g.name,
+                g.members.join("、")
+            ),
+            // The session already holds everything up to `last`, including our own replies.
+            Some(_) => String::from("群里的新消息：\n"),
+        };
+        for m in history.iter().filter(|m| last.is_none_or(|l| m.id > l) && m.author != me) {
             let who = if m.author == "me" { "我（人类）" } else { m.author.as_str() };
             p.push_str(&format!("[{who}] {}\n", m.body));
         }
         p
+    }
+
+    /// The agent's sessions are gone (stopped or crashed): forget what they had seen.
+    fn forget_sessions(&self, agent: Option<&str>) {
+        let keep = |k: &String| agent.is_some_and(|a| !k.starts_with(&format!("{a}|")));
+        self.primed.lock().unwrap_or_else(|p| p.into_inner()).retain(keep);
+        self.seen.lock().unwrap_or_else(|p| p.into_inner()).retain(|k, _| keep(k));
     }
 
     fn discord_rest(&self) -> Option<Rest> {
@@ -613,7 +637,7 @@ async fn add_agent_rows(core: &Core, spec: NewAgent) -> CmdResult<Vec<String>> {
 #[tauri::command]
 async fn remove_agent(core: St<'_>, name: String) -> CmdResult<()> {
     core.hub.drop_agent(&name).await;
-    core.primed.lock().unwrap_or_else(|p| p.into_inner()).retain(|k| !k.starts_with(&format!("{name}|")));
+    core.forget_sessions(Some(&name));
     let row = core.agent(&name)?;
     if let Some(c) = row.credential_ref { secret_del(&c); }
     core.db().delete_agent(&name).map_err(err)?;
@@ -661,7 +685,7 @@ async fn decide_permission(core: St<'_>, agent: String, request_id: String, opti
 async fn stop_all(core: St<'_>) -> CmdResult<usize> {
     core.paused.store(true, Ordering::Relaxed);
     let n = core.hub.stop_all().await;
-    core.primed.lock().unwrap_or_else(|p| p.into_inner()).clear();
+    core.forget_sessions(None);
     core.db().audit("me", None, "kill_switch", &format!("stopped {n}")).map_err(err)?;
     Ok(n)
 }
@@ -915,6 +939,7 @@ pub fn run() {
                 owners: Mutex::default(),
                 paused: AtomicBool::new(false),
                 primed: Mutex::default(),
+                seen: Mutex::default(),
                 app: app.handle().clone(),
             });
             // Installs from before v0.4 kept only the Keychain entry.

@@ -106,7 +106,7 @@ impl AcpAgent {
     /// Send one prompt in the session named `key` (created on first use);
     /// events stream until a `Done`.
     pub async fn prompt(&self, key: impl Into<String>, text: impl Into<String>) -> Result<mpsc::Receiver<AgentEvent>, AcpError> {
-        let (tx, rx) = mpsc::channel(64);
+        let (tx, rx) = mpsc::channel(512);
         self.cmd.send(Cmd::Prompt { key: key.into(), text: text.into(), events: tx }).await.map_err(|_| AcpError::Gone)?;
         Ok(rx)
     }
@@ -142,7 +142,11 @@ async fn drain_stderr(stderr: tokio::process::ChildStderr) {
 }
 
 fn emit(sinks: &Sinks, session: &str, ev: AgentEvent) {
-    if let Some(tx) = lock(sinks).get(session) {
+    let Some(tx) = lock(sinks).get(session).cloned() else { return };
+    if matches!(ev, AgentEvent::PermissionAsked { .. }) {
+        // Never lose a permission prompt: the turn would hang waiting for an answer.
+        tokio::spawn(async move { let _ = tx.send(ev).await; });
+    } else {
         // Progress may be dropped under backpressure; Done is sent separately and awaited.
         let _ = tx.try_send(ev);
     }

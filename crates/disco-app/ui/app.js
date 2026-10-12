@@ -169,9 +169,14 @@ function permCard(p) {
       h("button", { onclick: () => decide(p, null) }, "取消")));
 }
 async function decide(p, optionId) {
-  delete S.perms[p.request_id];
-  $(`#perm-${p.request_id}`)?.remove();
-  await invoke("decide_permission", { agent: p.agent, requestId: p.request_id, optionId });
+  // request ids contain "/" etc., so look them up by id, not with a CSS selector.
+  const card = document.getElementById(`perm-${p.request_id}`);
+  card?.querySelectorAll("button").forEach((b) => { b.disabled = true; });
+  try {
+    const ok = await invoke("decide_permission", { agent: p.agent, requestId: p.request_id, optionId });
+    delete S.perms[p.request_id]; card?.remove();
+    if (!ok) toast("这个请求已经失效（agent 已结束这一轮）");
+  } catch (e) { card?.querySelectorAll("button").forEach((b) => { b.disabled = false; }); toast(e); }
 }
 
 // ---------- events
@@ -199,8 +204,12 @@ listen("typing", ({ payload: { thread, agent, on } }) => {
 listen("stream", ({ payload: { thread, agent, event } }) => {
   const live = S.live[liveKey(thread, agent)];
   if (event.type === "text_chunk" && live) {
-    live.text += event.text; live.b.innerHTML = md(live.text);
-    if (S.thread === thread) scrollLog();
+    live.text += event.text;
+    // Re-render at most once per frame: long answers arrive in hundreds of chunks.
+    if (!live.raf) live.raf = requestAnimationFrame(() => {
+      live.raf = 0; live.b.innerHTML = md(live.text);
+      if (S.thread === thread) scrollLog();
+    });
   } else if (event.type === "tool" && S.thread === thread && event.title) {
     const chip = h("div", { class: "chip" }, `🔧 ${agent} · ${event.title}`);
     live ? live.el.before(chip) : $("#log").append(chip);
