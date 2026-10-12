@@ -1,0 +1,35 @@
+[package]
+name = "disco-app"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Disco A2A desktop app"
+
+[lib]
+name = "disco_app_lib"
+crate-type = ["rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+disco-types.workspace = true
+disco-store = { path = "../disco-store" }
+disco-a2a = { path = "../disco-a2a" }
+disco-discord = { path = "../disco-discord" }
+tauri = { version = "2", features = [] }
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+futures.workspace = true
+uuid.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+keyring = { version = "3", features = ["apple-native"] }
+
+[target.'cfg(not(target_os = "macos"))'.dependencies]
+keyring = "3"
+
+[lints]
+workspace = true
