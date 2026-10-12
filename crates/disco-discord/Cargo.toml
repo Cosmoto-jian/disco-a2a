@@ -1,0 +1,22 @@
+[package]
+name = "disco-discord"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "discord-spike"
+path = "src/bin/discord_spike.rs"
+test = false
+
+[dependencies]
+twilight-gateway.workspace = true
+twilight-http.workspace = true
+twilight-model.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+
+[lints]
+workspace = true
