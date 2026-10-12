@@ -83,6 +83,18 @@ pub struct Hit {
     pub score: f64,
 }
 
+/// One registered agent. `credential_ref` names a Keychain item, never a secret.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentRow {
+    pub id: String,
+    pub name: String,
+    /// `a2a`, `acp` or `openai`.
+    pub transport: String,
+    pub endpoint: String,
+    pub credential_ref: Option<String>,
+    pub card_json: Option<String>,
+}
+
 pub struct Store {
     conn: Connection,
 }
@@ -196,6 +208,37 @@ impl Store {
             }
         }
         Ok(out)
+    }
+
+    /// Insert or update an agent by unique name.
+    pub fn upsert_agent(&mut self, a: &AgentRow) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO agents (id, name, transport, endpoint, credential_ref, card_json)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(name) DO UPDATE SET transport = excluded.transport,
+               endpoint = excluded.endpoint, credential_ref = excluded.credential_ref,
+               card_json = excluded.card_json",
+            params![a.id, a.name, a.transport, a.endpoint, a.credential_ref, a.card_json],
+        )?;
+        Ok(())
+    }
+
+    pub fn list_agents(&self) -> Result<Vec<AgentRow>> {
+        let mut st = self.conn.prepare_cached(
+            "SELECT id, name, transport, endpoint, credential_ref, card_json FROM agents
+             WHERE enabled = 1 ORDER BY name",
+        )?;
+        let rows = st.query_map([], |r| {
+            Ok(AgentRow {
+                id: r.get(0)?, name: r.get(1)?, transport: r.get(2)?,
+                endpoint: r.get(3)?, credential_ref: r.get(4)?, card_json: r.get(5)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    pub fn delete_agent(&mut self, name: &str) -> Result<bool> {
+        Ok(self.conn.execute("DELETE FROM agents WHERE name = ?1", [name])? > 0)
     }
 
     pub fn quarantine(&mut self, id: i64) -> Result<()> {
