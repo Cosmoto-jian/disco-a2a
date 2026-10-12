@@ -332,6 +332,30 @@ impl Store {
         Ok(self.conn.execute("DELETE FROM groups WHERE id = ?1", [id])? > 0)
     }
 
+    pub fn setting(&self, key: &str) -> Option<String> {
+        self.conn.prepare_cached("SELECT value FROM settings WHERE key = ?1").ok()?
+            .query_row([key], |r| r.get(0)).ok()
+    }
+
+    /// Set `key`; an empty value deletes it.
+    pub fn set_setting(&self, key: &str, value: &str) -> Result<()> {
+        if value.is_empty() {
+            self.conn.execute("DELETE FROM settings WHERE key = ?1", [key])?;
+        } else {
+            self.conn.prepare_cached("INSERT INTO settings (key, value) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value = excluded.value")?
+                .execute([key, value])?;
+        }
+        Ok(())
+    }
+
+    /// All settings whose key starts with `prefix`, as (key without prefix, value).
+    pub fn settings_with_prefix(&self, prefix: &str) -> Result<Vec<(String, String)>> {
+        let mut st = self.conn.prepare_cached("SELECT key, value FROM settings WHERE key >= ?1 AND key < ?2")?;
+        let end = format!("{prefix}\u{10ffff}");
+        let rows = st.query_map([prefix, end.as_str()], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+        Ok(rows.filter_map(|r| r.ok()).map(|(k, v)| (k[prefix.len()..].to_owned(), v)).collect())
+    }
+
     pub fn quarantine(&mut self, id: i64) -> Result<()> {
         self.conn.execute("UPDATE memories SET status = 'quarantined' WHERE id = ?1", [id])?;
         Ok(())

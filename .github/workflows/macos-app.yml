@@ -40,4 +40,8 @@ jobs:
           TAG: ${{ inputs.release_tag || github.ref_name }}
         run: |
           gh release view "$TAG" >/dev/null 2>&1 || gh release create "$TAG" --prerelease --generate-notes --title "Disco $TAG"
-          gh release upload "$TAG" target/universal-apple-darwin/release/bundle/dmg/*.dmg --clobber
+          B=target/universal-apple-darwin/release/bundle
+          VER=$(jq -r .version crates/disco-app/tauri.conf.json)
+          # Updater payload; signed offline by scripts/publish_update.py (no key in CI).
+          tar -czf "Disco_${VER}_universal.app.tar.gz" -C "$B/macos" Disco.app
+          gh release upload "$TAG" "$B"/dmg/*.dmg "Disco_${VER}_universal.app.tar.gz" --clobber

@@ -98,6 +98,13 @@ const STEPS: &[&str] = &[
     );
     CREATE INDEX messages_thread ON messages(thread, id);
     ",
+    // v4: small key/value settings (home guild, Discord allowlist, agent channels)
+    r"
+    CREATE TABLE settings (
+        key TEXT PRIMARY KEY,
+        value TEXT NOT NULL
+    );
+    ",
 ];
 
 pub const LATEST: i64 = STEPS.len() as i64;

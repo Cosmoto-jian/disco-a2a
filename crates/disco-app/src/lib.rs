@@ -19,8 +19,15 @@ use tokio::sync::{mpsc, watch};
 
 const KEYCHAIN_SERVICE: &str = "dev.cosmoto.disco";
 const DISCORD_KEY: &str = "discord-bot-token";
+// Settings keys (SQLite; not secret).
+const SET_TOKEN_SAVED: &str = "discord_token_saved";
 /// Extra Discord user ids (comma-separated) allowed to drive agents, besides the bot owner.
-const DISCORD_ALLOW_KEY: &str = "discord-allow";
+const SET_ALLOW: &str = "discord_allow";
+/// Guild where each agent gets its own channel.
+const SET_HOME_GUILD: &str = "home_guild";
+/// `agent_channel/<agent>` -> Discord channel id of that agent's 1:1 channel.
+const SET_AGENT_CH: &str = "agent_channel/";
+const AGENT_CATEGORY: &str = "Disco Agents";
 /// Hand-off rounds and total agent turns allowed per human message in a group.
 const MAX_WAVES: usize = 4;
 const MAX_TURNS: usize = 12;
@@ -51,9 +58,8 @@ struct Discord {
     stop: watch::Sender<bool>,
 }
 
-fn allow_extra() -> Vec<String> {
-    secret_get(DISCORD_ALLOW_KEY).unwrap_or_default()
-        .split([',', ' ', '\n']).filter(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit())).map(str::to_owned).collect()
+fn parse_ids(s: &str) -> Vec<String> {
+    s.split([',', ' ', '\n', '，']).filter(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit())).map(str::to_owned).collect()
 }
 
 pub struct Core {
@@ -61,6 +67,8 @@ pub struct Core {
     hub: Hub,
     discord: Mutex<Option<Discord>>,
     discord_status: Mutex<String>,
+    /// Discord user ids of the bot application's owner(s); always allowed.
+    owners: Mutex<Vec<String>>,
     /// Kill switch: while set, nothing is routed to any agent.
     paused: AtomicBool,
     app: AppHandle,
@@ -111,17 +119,79 @@ impl Core {
         res
     }
 
-    async fn dm(&self, agent: String, text: String) {
+    /// 1:1 chat. The same thread is mirrored to the agent's own Discord channel
+    /// (when there is one), whichever side the message came from.
+    async fn dm(&self, agent: String, author: String, text: String, from_discord: bool) {
         let thread = format!("dm:{agent}");
-        self.post_message(&thread, "me", &text);
+        self.post_message(&thread, &author, &text);
+        let mirror = self.agent_channel(&agent).and_then(|ch| Some((self.discord_rest()?, ch)));
+        if !from_discord && let Some((d, ch)) = &mirror {
+            let _ = d.post(ch, &format!("**我**：{text}")).await;
+        }
         match self.turn(&thread, &agent, &thread, &text).await {
-            Ok(answer) => self.post_message(&thread, &agent, answer.trim()),
+            Ok(answer) => {
+                let answer = answer.trim();
+                self.post_message(&thread, &agent, answer);
+                if let Some((d, ch)) = &mirror && let Some(hook) = secret_get(&format!("webhook/{ch}"))
+                    && let Err(e) = d.post_as(&hook, &agent, None, answer).await
+                {
+                    self.post_message(&thread, "system", &format!("Discord 发送失败：{e}"));
+                }
+            }
             Err(e) => self.post_message(&thread, "system", &format!("{agent} 出错：{e}")),
         }
     }
 
+    fn agent_channel(&self, agent: &str) -> Option<String> {
+        self.db().setting(&format!("{SET_AGENT_CH}{agent}"))
+    }
+
+    fn allowed(&self, discord_user: &str) -> bool {
+        self.owners.lock().unwrap_or_else(|p| p.into_inner()).iter().any(|o| o == discord_user)
+            || parse_ids(&self.db().setting(SET_ALLOW).unwrap_or_default()).iter().any(|o| o == discord_user)
+    }
+
+    /// Give every agent (or just `only`) its own channel + webhook in the home guild.
+    async fn sync_agent_channels(&self, only: Option<&[String]>) -> CmdResult<usize> {
+        let rest = self.discord_rest().ok_or("Discord 未连接")?;
+        let guild = self.db().setting(SET_HOME_GUILD).ok_or("还没选主服务器")?;
+        let agents = self.db().list_agents().map_err(err)?;
+        let mut n = 0;
+        for a in agents.iter().filter(|a| only.is_none_or(|o| o.contains(&a.name))) {
+            let spec: LocalSpec = a.card_json.as_deref().and_then(|j| serde_json::from_str(j).ok()).unwrap_or_default();
+            let topic = if a.transport == "a2a" { format!("A2A agent · {}", a.endpoint) } else { spec.description.clone() };
+            let (ch, created) = rest.ensure_channel(&guild, AGENT_CATEGORY, &a.name, &topic).await?;
+            let hook_key = format!("webhook/{ch}");
+            if secret_get(&hook_key).is_none() {
+                secret_set(&hook_key, &rest.create_webhook(&ch).await?)?;
+            }
+            self.db().set_setting(&format!("{SET_AGENT_CH}{}", a.name), &ch).map_err(err)?;
+            if created && let Some(hook) = secret_get(&hook_key) {
+                let _ = rest.post_as(&hook, &a.name, None, &format!("我是 **{}**，已加入 Disco。在这个频道直接对我说话即可；在群聊频道里用 @{} 叫我。", a.name, a.name)).await;
+            }
+            n += 1;
+        }
+        Ok(n)
+    }
+
+    /// After the gateway connects: learn the owners, pick a home guild if there is
+    /// only one, and make sure every agent has its channel.
+    async fn on_discord_connected(&self) {
+        let Some(rest) = self.discord_rest() else { return };
+        if let Ok(ids) = rest.owner_ids().await {
+            *self.owners.lock().unwrap_or_else(|p| p.into_inner()) = ids;
+        }
+        let has_home = self.db().setting(SET_HOME_GUILD).is_some();
+        if !has_home && let Ok(gs) = rest.guilds().await && gs.len() == 1 {
+            let _ = self.db().set_setting(SET_HOME_GUILD, &gs[0].id);
+        }
+        if let Err(e) = self.sync_agent_channels(None).await {
+            let _ = self.db().audit("disco", None, "discord.sync", &e);
+        }
+    }
+
     /// Group routing: @mentioned members answer, otherwise the lead does.
-    /// An answer that @mentions another member hands off to it, up to MAX_HOPS.
+    /// An answer that @mentions another member hands off to it, in waves (see MAX_WAVES / MAX_TURNS).
     async fn group(&self, channel: String, author: String, text: String, from_discord: bool) {
         let Some(g) = self.db().list_groups().ok().and_then(|gs| gs.into_iter().find(|g| g.id == channel)) else { return };
         let thread = format!("group:{channel}");
@@ -152,7 +222,7 @@ impl Core {
                             // Post as soon as this agent finishes, not when the wave does.
                             self.post_message(thread, agent, &answer);
                             if let (Some(d), Some(hook)) = (self.discord_rest(), g.webhook_ref.as_deref().and_then(secret_get))
-                                && let Err(e) = d.post_as(&hook, agent, &answer).await
+                                && let Err(e) = d.post_as(&hook, agent, None, &answer).await
                             {
                                 self.post_message(thread, "system", &format!("Discord 发送失败：{e}"));
                             }
@@ -266,7 +336,7 @@ async fn overview(core: St<'_>) -> CmdResult<Overview> {
         agents,
         groups: groups.into_iter().map(|g| GroupView { id: g.id, name: g.name, guild_id: g.guild_id, lead: g.lead_agent, members: g.members }).collect(),
         heads: heads.into_iter().map(|(t, m)| Head { thread: t, author: m.author, body: m.body, ts: m.ts }).collect(),
-        discord_token: secret_get(DISCORD_KEY).is_some(),
+        discord_token: core.db().setting(SET_TOKEN_SAVED).is_some(),
         discord_status: core.discord_status.lock().unwrap_or_else(|p| p.into_inner()).clone(),
         paused: core.paused.load(Ordering::Relaxed),
     })
@@ -302,6 +372,19 @@ struct NewAgent {
 
 #[tauri::command]
 async fn add_agent(core: St<'_>, spec: NewAgent) -> CmdResult<Vec<String>> {
+    let names = add_agent_rows(&core, spec).await?;
+    if core.discord_rest().is_some() {
+        let (c, n) = (core.inner().clone(), names.clone());
+        tauri::async_runtime::spawn(async move {
+            if let Err(e) = c.sync_agent_channels(Some(&n)).await {
+                c.post_message(&format!("dm:{}", n[0]), "system", &format!("没能在 Discord 建频道：{e}"));
+            }
+        });
+    }
+    Ok(names)
+}
+
+async fn add_agent_rows(core: &Core, spec: NewAgent) -> CmdResult<Vec<String>> {
     let NewAgent { template, name, url, header_name, header_value, command, cwd, count, worktree } = spec;
     let name = valid_name(&name)?;
     let t = templates::get(&template).ok_or("未知模板")?;
@@ -364,6 +447,11 @@ async fn remove_agent(core: St<'_>, name: String) -> CmdResult<()> {
     let row = core.agent(&name)?;
     if let Some(c) = row.credential_ref { secret_del(&c); }
     core.db().delete_agent(&name).map_err(err)?;
+    if let Some(ch) = core.agent_channel(&name) {
+        let _ = core.db().set_setting(&format!("{SET_AGENT_CH}{name}"), "");
+        secret_del(&format!("webhook/{ch}"));
+        if let Some(d) = core.discord_rest() { let _ = d.delete_channel(&ch).await; }
+    }
     Ok(())
 }
 
@@ -383,7 +471,7 @@ fn send(core: St<'_>, thread: String, text: String) -> CmdResult<()> {
     let core = core.inner().clone();
     if let Some(agent) = thread.strip_prefix("dm:") {
         let agent = agent.to_owned();
-        tauri::async_runtime::spawn(async move { core.dm(agent, text).await });
+        tauri::async_runtime::spawn(async move { core.dm(agent, "me".into(), text, false).await });
     } else if let Some(ch) = thread.strip_prefix("group:") {
         let ch = ch.to_owned();
         tauri::async_runtime::spawn(async move { core.group(ch, "me".into(), text, false).await });
@@ -414,25 +502,103 @@ fn resume(core: St<'_>) {
 
 #[tauri::command]
 async fn save_discord_token(core: St<'_>, token: String) -> CmdResult<()> {
-    let token = token.trim();
+    let token = token.trim().trim_start_matches("Bot ").to_owned();
     if token.len() < 50 { return Err("token 看起来不完整".into()); }
-    secret_set(DISCORD_KEY, token)?;
+    // Validate before saving so a typo shows up here, not as a silent failure.
+    Rest::new(token.clone()).me().await?;
+    secret_set(DISCORD_KEY, &token)?;
+    core.db().set_setting(SET_TOKEN_SAVED, "1").map_err(err)?;
     connect_discord(core.inner().clone());
     Ok(())
 }
 
+#[derive(Serialize)]
+struct DiscordSettings { home_guild: Option<String>, guilds: Vec<Channel>, allow: String, invite_url: Option<String> }
+
 #[tauri::command]
-fn discord_allow(ids: Option<String>) -> CmdResult<String> {
-    if let Some(ids) = ids {
-        let ids = ids.trim();
-        if ids.is_empty() { secret_del(DISCORD_ALLOW_KEY); } else { secret_set(DISCORD_ALLOW_KEY, ids)?; }
+async fn discord_settings(core: St<'_>, home_guild: Option<String>, allow: Option<String>) -> CmdResult<DiscordSettings> {
+    if let Some(a) = allow { core.db().set_setting(SET_ALLOW, &parse_ids(&a).join(", ")).map_err(err)?; }
+    let changed_home = home_guild.is_some();
+    if let Some(g) = home_guild { core.db().set_setting(SET_HOME_GUILD, &g).map_err(err)?; }
+    if changed_home {
+        let c = core.inner().clone();
+        tauri::async_runtime::spawn(async move { let _ = c.sync_agent_channels(None).await; });
     }
-    Ok(allow_extra().join(", "))
+    let (guilds, invite_url) = match core.discord_rest() {
+        Some(r) => {
+            let gs = r.guilds().await.unwrap_or_default();
+            let id = r.me().await.ok().map(|(id, _)| id);
+            (gs.into_iter().map(|g| Channel { guild_id: g.id.clone(), guild: g.name, id: g.id, name: String::new() }).collect(),
+             id.map(|id| format!("https://discord.com/oauth2/authorize?client_id={id}&scope=bot&permissions={}", disco_discord::BOT_PERMISSIONS)))
+        }
+        None => (Vec::new(), None),
+    };
+    let db = core.db();
+    Ok(DiscordSettings { home_guild: db.setting(SET_HOME_GUILD), guilds, allow: db.setting(SET_ALLOW).unwrap_or_default(), invite_url })
+}
+
+#[tauri::command]
+async fn discord_sync(core: St<'_>) -> CmdResult<usize> {
+    core.sync_agent_channels(None).await
+}
+
+/// Opens Discord pages (bot invite / developer portal) in the default browser.
+#[tauri::command]
+fn open_url(url: String) -> CmdResult<()> {
+    if !(url.starts_with("https://discord.com/") || url.starts_with("https://github.com/Cosmoto-jian/")) {
+        return Err("不允许打开该链接".into());
+    }
+    std::process::Command::new("/usr/bin/open").arg(&url).spawn().map_err(err)?;
+    Ok(())
+}
+
+#[derive(Serialize)]
+struct Check { name: String, ok: bool, detail: String }
+
+/// Step-by-step health check of everything Disco depends on.
+#[tauri::command]
+async fn diagnose(core: St<'_>) -> CmdResult<Vec<Check>> {
+    let mut out = Vec::new();
+    let mut add = |name: &str, r: Result<String, String>| {
+        let (ok, detail) = match r { Ok(d) => (true, d), Err(e) => (false, e) };
+        out.push(Check { name: name.into(), ok, detail });
+    };
+    add("网络代理", Ok(disco_discord::proxy_url().map_or("未检测到，直连".into(), |p| format!("使用系统代理 {p}"))));
+    let probe = "diagnose-probe";
+    add("macOS 钥匙串", secret_set(probe, "ok").and_then(|_| secret_get(probe).filter(|v| v == "ok").ok_or("写入后读不出来".into()))
+        .map(|_| { secret_del(probe); "可读写".into() }));
+    let token = secret_get(DISCORD_KEY);
+    add("Discord Bot token", token.as_ref().map(|_| "已保存".into()).ok_or("还没保存，或钥匙串拒绝访问".into()));
+    if let Some(token) = token {
+        let rest = Rest::new(token.clone());
+        let me = rest.me().await;
+        add("Discord API", me.as_ref().map(|(_, n)| format!("Bot：{n}")).map_err(Clone::clone));
+        add("Discord 实时连接", disco_discord::gateway_check(token, std::time::Duration::from_secs(15)).await
+            .map(|r| format!("READY，用时 {} ms，{} 个服务器", r.ready_after.as_millis(), r.guilds)));
+        if let Ok((bot_id, _)) = me {
+            let home = core.db().setting(SET_HOME_GUILD);
+            match home {
+                Some(g) => add("Bot 权限", rest.bot_permissions(&g, &bot_id).await.and_then(|bits| {
+                    let need = [(1u64 << 4, "管理频道"), (1 << 29, "管理 Webhook"), (1 << 11, "发送消息"), (1 << 10, "查看频道")];
+                    let missing: Vec<&str> = need.iter().filter(|(b, _)| bits & b == 0).map(|(_, n)| *n).collect();
+                    if missing.is_empty() { Ok("权限齐全".into()) } else { Err(format!("缺少：{}，请点「重新授权 Bot」", missing.join("、"))) }
+                })),
+                None => add("主服务器", Err("还没选主服务器".into())),
+            }
+        }
+    }
+    let path = core.hub.user_path.clone();
+    add("Node.js / npx", hub::which("npx", &path).map(|p| p.display().to_string()).ok_or("找不到 npx：Claude Code、Codex、pi 需要先安装 Node.js".into()));
+    for a in core.db().list_agents().map_err(err)?.into_iter().filter(|a| a.transport == "acp") {
+        let cmd = a.endpoint.split_whitespace().next().unwrap_or_default().to_owned();
+        add(&format!("agent {}", a.name), hub::which(&cmd, &path).map(|_| format!("命令 {cmd} 可用")).ok_or(format!("找不到命令 {cmd}")));
+    }
+    Ok(out)
 }
 
 #[tauri::command]
 fn discord_connect(core: St<'_>) -> CmdResult<()> {
-    if secret_get(DISCORD_KEY).is_none() { return Err("还没有保存 Discord token".into()); }
+    if core.db().setting(SET_TOKEN_SAVED).is_none() { return Err("还没有保存 Discord token".into()); }
     connect_discord(core.inner().clone());
     Ok(())
 }
@@ -472,38 +638,88 @@ fn delete_group(core: St<'_>, id: String) -> CmdResult<()> {
 }
 
 fn connect_discord(core: Arc<Core>) {
-    let Some(token) = secret_get(DISCORD_KEY) else { return };
+    let Some(token) = secret_get(DISCORD_KEY) else {
+        core.set_discord_status("读不到 token：请在设置里重新保存（或在钥匙串弹窗中允许）".into());
+        return;
+    };
     let (stop_tx, stop_rx) = watch::channel(false);
     if let Some(old) = core.discord.lock().unwrap_or_else(|p| p.into_inner()).replace(Discord { rest: Rest::new(token.clone()), stop: stop_tx }) {
         let _ = old.stop.send(true);
     }
-    core.set_discord_status("连接中…".into());
     let (tx, mut rx) = mpsc::channel::<Incoming>(64);
     let c = core.clone();
-    tauri::async_runtime::spawn(disco_discord::run_gateway(token, tx, stop_rx, move |s| c.set_discord_status(s)));
-    let rest = core.discord_rest();
+    let online = Arc::new(AtomicBool::new(false));
+    let o = online.clone();
+    tauri::async_runtime::spawn(disco_discord::run_gateway(token, tx, stop_rx, move |s| {
+        let now_online = s.starts_with("在线");
+        if now_online && !o.swap(true, Ordering::Relaxed) {
+            let c2 = c.clone();
+            tauri::async_runtime::spawn(async move { c2.on_discord_connected().await });
+        }
+        if !now_online { o.store(false, Ordering::Relaxed); }
+        c.set_discord_status(s);
+    }));
     tauri::async_runtime::spawn(async move {
-        // Only the bot's owner(s) and explicitly allowed users may drive agents:
-        // anyone else in the guild could otherwise run tools on this Mac.
-        let owners = match rest { Some(r) => r.owner_ids().await.unwrap_or_default(), None => Vec::new() };
         while let Some(m) = rx.recv().await {
-            if !owners.contains(&m.author_id) && !allow_extra().contains(&m.author_id) {
-                let _ = core.db().audit(&format!("discord:{}", m.author_id), None, "group.ignored", "sender not allowed");
+            // Only the bot's owner(s) and explicitly allowed users may drive agents:
+            // anyone else in the guild could otherwise run tools on this Mac.
+            if !core.allowed(&m.author_id) {
+                let _ = core.db().audit(&format!("discord:{}", m.author_id), None, "discord.ignored", "sender not allowed");
                 continue;
             }
             let c = core.clone();
-            // Each channel message is handled on its own task so one slow agent
-            // never blocks other groups. The " (Discord)" suffix keeps a Discord
-            // display name from impersonating the local user ("me") or an agent.
+            // The " (Discord)" suffix keeps a Discord display name from
+            // impersonating the local user ("me") or an agent.
             let author = format!("{} (Discord)", m.author);
-            tauri::async_runtime::spawn(async move { c.group(m.channel_id, author, m.content, true).await });
+            let agent = c.db().settings_with_prefix(SET_AGENT_CH).unwrap_or_default().into_iter().find(|(_, ch)| *ch == m.channel_id).map(|(a, _)| a);
+            // Each message runs on its own task so one slow agent never blocks others.
+            tauri::async_runtime::spawn(async move {
+                match agent {
+                    Some(a) => c.dm(a, author, m.content, true).await,
+                    None => c.group(m.channel_id, author, m.content, true).await,
+                }
+            });
         }
     });
+}
+
+// ---------------------------------------------------------------- self-update
+// Release flow: CI attaches Disco_<ver>_universal.app.tar.gz to the GitHub
+// release; scripts/publish_update.py signs it with the offline updater key and
+// commits updates/latest.json, which every installed copy polls.
+
+#[derive(Serialize, Clone)]
+struct UpdateInfo { current: String, version: Option<String>, notes: String }
+
+async fn find_update(app: &AppHandle) -> CmdResult<UpdateInfo> {
+    use tauri_plugin_updater::UpdaterExt;
+    let found = app.updater().map_err(err)?.check().await.map_err(err)?;
+    Ok(UpdateInfo {
+        current: app.package_info().version.to_string(),
+        version: found.as_ref().map(|u| u.version.clone()),
+        notes: found.and_then(|u| u.body).unwrap_or_default(),
+    })
+}
+
+#[tauri::command]
+async fn check_update(app: AppHandle) -> CmdResult<UpdateInfo> {
+    find_update(&app).await
+}
+
+#[tauri::command]
+async fn install_update(core: St<'_>, app: AppHandle) -> CmdResult<()> {
+    use tauri_plugin_updater::UpdaterExt;
+    let update = app.updater().map_err(err)?.check().await.map_err(err)?.ok_or("已经是最新版本")?;
+    let _ = core.db().audit("me", None, "app.update", &update.version);
+    update.download_and_install(|_, _| {}, || {}).await.map_err(err)?;
+    core.hub.stop_all().await;
+    app.restart();
 }
 
 pub fn run() {
     disco_discord::install_crypto();
     tauri::Builder::default()
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .setup(|app| {
             let dir = app.path().app_data_dir()?;
             std::fs::create_dir_all(&dir)?;
@@ -512,16 +728,30 @@ pub fn run() {
                 hub: Hub::new(),
                 discord: Mutex::new(None),
                 discord_status: Mutex::new("未连接".into()),
+                owners: Mutex::default(),
                 paused: AtomicBool::new(false),
                 app: app.handle().clone(),
             });
-            if secret_get(DISCORD_KEY).is_some() { connect_discord(core.clone()); }
+            // Installs from before v0.4 kept only the Keychain entry.
+            if core.db().setting(SET_TOKEN_SAVED).is_none() && secret_get(DISCORD_KEY).is_some() {
+                let _ = core.db().set_setting(SET_TOKEN_SAVED, "1");
+            }
+            if core.db().setting(SET_TOKEN_SAVED).is_some() { connect_discord(core.clone()); }
             app.manage(core);
+            let handle = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                // Quietly check a few seconds after launch; errors (offline) are ignored.
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                if let Ok(info) = find_update(&handle).await && info.version.is_some() {
+                    let _ = handle.emit("update-available", info);
+                }
+            });
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
             overview, templates, add_agent, remove_agent, messages, send, decide_permission,
-            stop_all, resume, save_discord_token, discord_connect, discord_allow, discord_channels, save_group, delete_group
+            stop_all, resume, save_discord_token, discord_connect, discord_settings, discord_sync, diagnose, open_url, discord_channels, save_group, delete_group,
+            check_update, install_update
         ])
         .run(tauri::generate_context!())
         .expect("error while running Disco");

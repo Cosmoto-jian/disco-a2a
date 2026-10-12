@@ -117,3 +117,17 @@ fn groups_and_messages() {
     s.audit("me", Some("coder"), "prompt", "ok").unwrap();
     assert!(s.delete_group("c1").unwrap());
 }
+
+#[test]
+fn settings_roundtrip() {
+    let s = Store::open_in_memory().unwrap();
+    s.set_setting("agent_channel/coder", "1").unwrap();
+    s.set_setting("agent_channel/coder-2", "2").unwrap();
+    s.set_setting("home_guild", "g").unwrap();
+    assert_eq!(s.setting("home_guild").as_deref(), Some("g"));
+    let mut v = s.settings_with_prefix("agent_channel/").unwrap();
+    v.sort();
+    assert_eq!(v, [("coder".to_string(), "1".to_string()), ("coder-2".to_string(), "2".to_string())]);
+    s.set_setting("home_guild", "").unwrap();
+    assert_eq!(s.setting("home_guild"), None);
+}

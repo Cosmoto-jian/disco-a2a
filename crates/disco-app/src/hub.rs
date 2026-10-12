@@ -39,7 +39,7 @@ pub struct Hub {
     slots: Arc<tokio::sync::Semaphore>,
     /// The user's login-shell PATH: GUI apps start with a bare one, so npx and
     /// Homebrew tools would otherwise be invisible.
-    user_path: String,
+    pub user_path: String,
 }
 
 pub const MAX_CONCURRENT: usize = 8;
@@ -72,11 +72,18 @@ impl Hub {
                     Some(rest) => dirs_home().join(rest.trim_start_matches('/')),
                     None => PathBuf::from(&spec.cwd),
                 };
+                if !cwd.is_dir() {
+                    return Err(format!("工作目录不存在：{}", cwd.display()));
+                }
                 if spec.worktree && let Some(wt) = ensure_worktree(&cwd, &row.name, &self.user_path) {
                     cwd = wt;
                 }
+                let command = which(&spec.command, &self.user_path).ok_or_else(|| match spec.command.as_str() {
+                    "npx" | "node" => "找不到 npx：请先安装 Node.js（https://nodejs.org 或 brew install node），然后重启 Disco".to_owned(),
+                    c => format!("找不到命令 {c}：请先安装它，或在终端确认 `which {c}` 有输出"),
+                })?;
                 let launch = Launch {
-                    command: spec.command,
+                    command: command.to_string_lossy().into_owned(),
                     args: spec.args,
                     env: vec![("PATH".into(), self.user_path.clone())],
                     cwd,
@@ -188,21 +195,43 @@ fn dirs_home() -> PathBuf {
     std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(std::env::temp_dir)
 }
 
+/// The PATH the user's terminal would have. GUI apps start with a bare PATH, and
+/// Node from nvm/volta/fnm usually lives in ~/.zshrc, so ask an interactive login
+/// shell (bounded to 4 s in case an rc file waits for input) and add the usual
+/// install locations as a fallback.
 fn login_path() -> String {
+    const MARK: &str = "__DISCO_PATH__";
     let base = std::env::var("PATH").unwrap_or_default();
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".into());
-    let from_shell = std::process::Command::new(shell)
-        .args(["-lc", "printf %s \"$PATH\""])
-        .stdin(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .unwrap_or_default();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let out = std::process::Command::new(shell)
+            .args(["-ilc", &format!("printf '{MARK}%s{MARK}' \"$PATH\"")])
+            .stdin(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .output();
+        let _ = tx.send(out.ok().and_then(|o| String::from_utf8(o.stdout).ok()).unwrap_or_default());
+    });
+    let raw = rx.recv_timeout(std::time::Duration::from_secs(4)).unwrap_or_default();
+    let from_shell = raw.split(MARK).nth(1).unwrap_or("").to_owned();
+    let home = dirs_home();
+    let mut extra: Vec<String> = [".volta/bin", ".local/bin", ".bun/bin", ".cargo/bin", ".npm-global/bin", "Library/pnpm"]
+        .iter().map(|d| home.join(d).to_string_lossy().into_owned()).collect();
+    // Newest nvm node, if any.
+    if let Ok(rd) = std::fs::read_dir(home.join(".nvm/versions/node")) {
+        let mut v: Vec<_> = rd.filter_map(|e| e.ok()).map(|e| e.path()).collect();
+        v.sort();
+        if let Some(latest) = v.last() { extra.push(latest.join("bin").to_string_lossy().into_owned()); }
+    }
     let mut parts: Vec<&str> = Vec::new();
-    for p in from_shell.split(':').chain(["/opt/homebrew/bin", "/usr/local/bin"]).chain(base.split(':')) {
+    for p in from_shell.split(':').chain(["/opt/homebrew/bin", "/usr/local/bin"]).chain(extra.iter().map(String::as_str)).chain(base.split(':')) {
         if !p.is_empty() && !parts.contains(&p) { parts.push(p); }
     }
     parts.join(":")
+}
+
+/// Full path of `cmd` on `path`, if it is there.
+pub fn which(cmd: &str, path: &str) -> Option<PathBuf> {
+    if cmd.contains('/') { return Some(PathBuf::from(cmd)).filter(|p| p.is_file()); }
+    path.split(':').map(|d| PathBuf::from(d).join(cmd)).find(|p| p.is_file())
 }

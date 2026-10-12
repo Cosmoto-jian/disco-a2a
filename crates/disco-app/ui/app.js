@@ -54,7 +54,23 @@ function md(src) {
     }).join("");
   }).join("");
 }
-const toast = (msg) => alert(msg);
+// In-app toast and confirm: WKWebView may swallow window.alert/confirm, which
+// made errors invisible in earlier builds.
+function toast(msg, ms = 4000) {
+  const t = h("div", { class: "toast" }, String(msg));
+  document.body.append(t);
+  setTimeout(() => t.remove(), ms);
+}
+function ask(question, okText = "确定") {
+  return new Promise((resolve) => {
+    const d = $("#dlg"), form = $("#dlg-form");
+    form.replaceChildren(h("h3", {}, question), h("div", { class: "actions" },
+      h("button", { class: "btn", type: "button", onclick: () => { d.close(); resolve(false); } }, "取消"),
+      h("button", { class: "btn pri", type: "button", onclick: () => { d.close(); resolve(true); } }, okText)));
+    form.onsubmit = (e) => e.preventDefault();
+    d.showModal();
+  });
+}
 
 // ---------- data
 async function load() {
@@ -193,6 +209,14 @@ listen("stream", ({ payload: { thread, agent, event } }) => {
     if (S.thread === thread) { $("#log").append(permCard(p)); scrollLog(); }
   }
 });
+async function installUpdate() {
+  $("#update-bar")?.replaceChildren("正在下载更新…");
+  try { await invoke("install_update"); } catch (e) { toast(`更新失败：${e}`); }
+}
+listen("update-available", ({ payload: u }) => {
+  if ($("#update-bar")) return;
+  $("#items").before(h("div", { id: "update-bar" }, `新版本 ${u.version} 可用 `, h("button", { onclick: installUpdate }, "更新并重启")));
+});
 listen("discord-status", ({ payload }) => { if (S.ov) { S.ov.discord_status = payload; if (S.tab === "settings") renderSettings(); renderList(); } });
 
 // ---------- agents page
@@ -227,7 +251,7 @@ function agentDialog(t) {
   });
 }
 async function removeAgent(name) {
-  if (!confirm(`移除 ${name}？聊天记录会保留。`)) return;
+  if (!(await ask(`移除 ${name}？聊天记录会保留，它的 Discord 频道会被删除。`, "移除"))) return;
   try { await invoke("remove_agent", { name }); if (S.thread === `dm:${name}`) blank(); await load(); } catch (e) { toast(e); }
 }
 
@@ -250,31 +274,77 @@ async function groupDialog(g) {
     const picked = [...form.querySelectorAll("input[name=m]:checked")].map((i) => i.value);
     await invoke("save_group", { channelId, guildId, name: f.name.trim(), members: picked, lead: f.lead || null });
     await load(); openThread(`group:${channelId}`);
-  }, g ? ["删除群聊", async () => { if (confirm("删除这个群聊？Discord 频道不受影响。")) { await invoke("delete_group", { id: g.id }); blank(); await load(); } }] : null);
+  }, g ? ["删除群聊", async () => { if (await ask("删除这个群聊？Discord 频道不受影响。", "删除")) { await invoke("delete_group", { id: g.id }); blank(); await load(); } }] : null);
 }
 
 // ---------- settings
+const inputStyle = "flex:1;height:32px;border:1px solid var(--line);border-radius:8px;padding:0 10px;background:var(--list);color:var(--fg)";
 function renderSettings() {
   S.thread = null;
   const ok = /^在线/.test(S.ov.discord_status);
+  const discordBox = h("div", {});
+  if (S.ov.discord_token) loadDiscordSettings(discordBox);
   $("#pane").replaceChildren(h("div", { class: "page" },
     h("h1", {}, "设置"), h("p", {}, "密钥只存在 macOS 钥匙串里。"),
     h("div", { class: "section" }, h("h3", {}, "Discord"),
       h("div", { class: `status${ok ? " ok" : ""}` }, h("i"), S.ov.discord_status),
       h("form", { style: "display:flex;gap:8px;margin-top:12px", onsubmit: async (e) => {
-        e.preventDefault(); const tok = e.target.token.value;
-        try { await invoke("save_discord_token", { token: tok }); e.target.reset(); await load(); renderSettings(); } catch (er) { toast(er); }
-      } }, h("input", { name: "token", type: "password", placeholder: S.ov.discord_token ? "已保存 · 输入新 token 替换" : "Bot token", style: "flex:1;height:32px;border:1px solid var(--line);border-radius:8px;padding:0 10px;background:var(--list);color:var(--fg)" }),
+        e.preventDefault(); const tok = e.target.token.value; const b = e.target.querySelector("button");
+        b.disabled = true; b.textContent = "验证中…";
+        try { await invoke("save_discord_token", { token: tok }); e.target.reset(); toast("token 有效，已保存"); await load(); renderSettings(); }
+        catch (er) { toast(er, 8000); b.disabled = false; b.textContent = "保存"; }
+      } }, h("input", { name: "token", type: "password", required: true, placeholder: S.ov.discord_token ? "已保存 · 输入新 token 替换" : "粘贴 Bot token", style: inputStyle }),
         h("button", { class: "btn pri" }, "保存")),
       S.ov.discord_token ? h("button", { class: "btn", style: "margin-top:8px", onclick: async () => { try { await invoke("discord_connect"); } catch (e) { toast(e); } } }, "重新连接") : null,
-      h("p", { style: "margin:14px 0 6px;color:var(--mute)" }, "只有 Bot 所有者能在 Discord 里指挥 agent。要允许其他人，填他们的 Discord 用户 ID（逗号分隔）："),
-      h("form", { style: "display:flex;gap:8px", onsubmit: async (e) => {
-        e.preventDefault();
-        try { e.target.ids.value = await invoke("discord_allow", { ids: e.target.ids.value }); toast("已保存"); } catch (er) { toast(er); }
-      } }, (() => { const i = h("input", { name: "ids", placeholder: "例如 123456789012345678", style: "flex:1;height:32px;border:1px solid var(--line);border-radius:8px;padding:0 10px;background:var(--list);color:var(--fg)" }); invoke("discord_allow", {}).then((v) => { i.value = v; }); return i; })(),
-        h("button", { class: "btn" }, "保存"))),
+      discordBox),
+    h("div", { class: "section" }, h("h3", {}, "诊断"),
+      (() => {
+        const list = h("ul", { class: "checks-list" });
+        const btn = h("button", { class: "btn", onclick: async () => {
+          btn.disabled = true; btn.textContent = "检查中…（约 15 秒）"; list.replaceChildren();
+          try {
+            for (const c of await invoke("diagnose")) list.append(h("li", { class: c.ok ? "ok" : "bad" }, h("b", {}, `${c.ok ? "✓" : "✗"} ${c.name}`), h("span", {}, c.detail)));
+          } catch (e) { list.append(h("li", { class: "bad" }, String(e))); }
+          btn.disabled = false; btn.textContent = "重新检查";
+        } }, "一键诊断");
+        return h("div", {}, h("p", { style: "margin:0 0 8px;color:var(--mute)" }, "逐项检查代理、钥匙串、Discord 连接与权限、Node.js 和每个 agent 的启动命令。"), btn, list);
+      })()),
+    h("div", { class: "section" }, h("h3", {}, "更新"),
+      (() => {
+        const line = h("p", { style: "margin:0 0 8px;color:var(--mute)" }, "正在检查…");
+        const btn = h("button", { class: "btn pri", hidden: true, onclick: installUpdate }, "更新并重启");
+        invoke("check_update").then((u) => {
+          line.textContent = u.version ? `当前 ${u.current}，新版本 ${u.version} 可用` : `当前 ${u.current}，已是最新版本`;
+          btn.hidden = !u.version;
+        }).catch((e) => { line.textContent = `检查更新失败：${e}`; });
+        return h("div", {}, line, btn);
+      })()),
     h("div", { class: "section" }, h("h3", {}, "安全"),
       h("p", { style: "margin:0;color:var(--mute)" }, "左下角电源键是一键停止：立刻结束所有本地 agent 进程并暂停所有路由，所有操作写入审计日志。"))));
+}
+
+async function loadDiscordSettings(box) {
+  let d;
+  try { d = await invoke("discord_settings", {}); } catch (e) { box.replaceChildren(h("p", { class: "err" }, String(e))); return; }
+  const guild = h("select", { style: inputStyle, onchange: async () => {
+    try { await invoke("discord_settings", { homeGuild: guild.value }); toast("已切换主服务器，正在为每个 agent 建频道"); } catch (e) { toast(e); }
+  } }, h("option", { value: "" }, d.guilds.length ? "选择服务器" : "Bot 还没加入任何服务器"),
+    ...d.guilds.map((g) => h("option", { value: g.id, selected: g.id === d.home_guild }, g.guild)));
+  const allow = h("input", { value: d.allow, placeholder: "其他可指挥 agent 的 Discord 用户 ID，逗号分隔", style: inputStyle });
+  box.replaceChildren(
+    h("p", { style: "margin:14px 0 6px;color:var(--mute)" }, "主服务器：每个 agent 会在「Disco Agents」分类下有自己的频道，在频道里直接对它说话。"),
+    h("div", { style: "display:flex;gap:8px" }, guild,
+      h("button", { class: "btn", onclick: async (e) => {
+        e.target.disabled = true;
+        try { const n = await invoke("discord_sync"); toast(`已同步 ${n} 个 agent 频道`); } catch (er) { toast(er, 8000); }
+        e.target.disabled = false;
+      } }, "同步频道")),
+    d.invite_url ? h("button", { class: "btn", style: "margin-top:8px", onclick: () => invoke("open_url", { url: d.invite_url }).catch(toast) }, "重新授权 Bot（补齐管理频道等权限）") : null,
+    h("p", { style: "margin:14px 0 6px;color:var(--mute)" }, "只有 Bot 所有者能在 Discord 里指挥 agent。要允许其他人，填他们的用户 ID："),
+    h("div", { style: "display:flex;gap:8px" }, allow,
+      h("button", { class: "btn", onclick: async () => {
+        try { const r = await invoke("discord_settings", { allow: allow.value }); allow.value = r.allow; toast("已保存"); } catch (e) { toast(e); }
+      } }, "保存")));
 }
 
 // ---------- shell
@@ -311,7 +381,7 @@ $("#list-add").onclick = () => (S.tab === "agents" ? renderGallery() : groupDial
 $("#search").oninput = (e) => { S.q = e.target.value; renderList(); };
 $("#kill").onclick = async () => {
   if (S.ov.paused) return;
-  if (!confirm("立即停止所有 agent 并暂停路由？")) return;
+  if (!(await ask("立即停止所有 agent 并暂停路由？", "全部停止"))) return;
   const n = await invoke("stop_all"); await load(); toast(`已停止 ${n} 个运行中的 agent`);
 };
 $("#resume").onclick = async () => { await invoke("resume"); await load(); };

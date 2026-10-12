@@ -1,6 +1,7 @@
 name: ci
 on:
   push:
+    paths-ignore: ["updates/**", "docs/**", "scripts/**", "*.md"]
   workflow_dispatch:
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
