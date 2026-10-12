@@ -25,6 +25,9 @@ pub struct LocalSpec {
     /// coding agents can work on one repo without overwriting each other.
     #[serde(default)]
     pub worktree: bool,
+    /// Conda environment prefix to run in (its bin/ goes first on PATH).
+    #[serde(default)]
+    pub conda: String,
 }
 
 #[derive(Clone)]
@@ -98,7 +101,19 @@ impl Hub {
                 if spec.worktree && let Some(wt) = ensure_worktree(&cwd, &row.name, &self.user_path) {
                     cwd = wt;
                 }
-                let command = which(&spec.command, &self.user_path).ok_or_else(|| match spec.command.as_str() {
+                let mut path = self.user_path.clone();
+                let mut env = Vec::new();
+                if !spec.conda.is_empty() {
+                    let prefix = PathBuf::from(&spec.conda);
+                    if !prefix.join("conda-meta").is_dir() { return Err(format!("conda 环境不存在：{}", spec.conda)); }
+                    path = format!("{}:{path}", prefix.join("bin").display());
+                    let name = if prefix.parent().and_then(|d| d.file_name()).is_some_and(|n| n == "envs") {
+                        prefix.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()
+                    } else { "base".into() };
+                    env.extend([("CONDA_PREFIX".to_owned(), spec.conda.clone()), ("CONDA_DEFAULT_ENV".into(), name), ("CONDA_SHLVL".into(), "1".into())]);
+                }
+                env.push(("PATH".into(), path.clone()));
+                let command = which(&spec.command, &path).ok_or_else(|| match spec.command.as_str() {
                     "npx" | "node" => "找不到 npx：请先安装 Node.js（https://nodejs.org 或 brew install node），然后重启 Disco".to_owned(),
                     c => format!("找不到命令 {c}：请先安装它，或在终端确认 `which {c}` 有输出"),
                 })?;
@@ -110,7 +125,7 @@ impl Hub {
                 let launch = Launch {
                     command: command.to_string_lossy().into_owned(),
                     args,
-                    env: vec![("PATH".into(), self.user_path.clone())],
+                    env,
                     cwd,
                     prompt_timeout: Duration::from_secs(15 * 60),
                 };
@@ -216,7 +231,7 @@ fn ensure_worktree(dir: &std::path::Path, name: &str, path: &str) -> Option<Path
     Some(wt)
 }
 
-fn dirs_home() -> PathBuf {
+pub fn dirs_home() -> PathBuf {
     std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(std::env::temp_dir)
 }
 

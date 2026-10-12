@@ -21,10 +21,10 @@ function h(tag, attrs = {}, ...kids) {
 }
 const esc = (s) => s.replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 function hash(s) { let x = 0; for (const c of s) x = (x * 31 + c.codePointAt(0)) | 0; return Math.abs(x); }
+const BRAND = { "claude-code": "#d97757", codex: "#10a37f", gemini: "#4285f4", qwen: "#615ced", goose: "#111111", opencode: "#3b82f6", hermes: "#7c5cff", dsh: "#4d6bfe", pi: "#e5484d" };
 function colorOf(name) {
   const a = S.ov?.agents.find((a) => a.name === name);
-  const t = a && S.tpl.find((t) => t.id === a.template);
-  return t && t.id !== "command" && t.id !== "a2a" ? t.color : COLORS[hash(name) % COLORS.length];
+  return BRAND[a?.template] ?? COLORS[hash(name) % COLORS.length];
 }
 function avatar(name, { group = false, small = false, live = false } = {}) {
   const el = h("div", { class: `av${small ? " sm" : ""}${group ? " group" : ""}` }, group ? "#" : [...name][0].toUpperCase());
@@ -220,33 +220,51 @@ listen("update-available", ({ payload: u }) => {
 listen("discord-status", ({ payload }) => { if (S.ov) { S.ov.discord_status = payload; if (S.tab === "settings") renderSettings(); renderList(); } });
 
 // ---------- agents page
-function renderGallery() {
+async function renderGallery() {
   S.thread = null; renderList();
-  $("#pane").replaceChildren(h("div", { class: "page" },
-    h("h1", {}, "添加 Agent"),
-    h("p", {}, "本地 agent 通过 ACP 运行，沿用你在这台 Mac 上已登录的账户；远程 agent 通过 A2A 接入。"),
-    h("div", { class: "grid" }, ...S.tpl.map((t) => h("button", { class: "card", onclick: () => agentDialog(t) },
-      Object.assign(h("div", { class: "av" }, t.kind === "a2a" ? "A" : t.kind === "command" ? ">" : t.name[0].toUpperCase()), { style: `background:${t.color}` }),
-      h("div", {}, h("b", {}, t.name), h("small", {}, t.blurb)))))));
+  const page = h("div", { class: "page" }, h("h1", {}, "添加 Agent"), h("p", {}, "正在扫描本机已安装的 agent…"));
+  $("#pane").replaceChildren(page);
+  const found = await invoke("detect_agents").catch(() => []);
+  const card = (t, sub, onclick, letter, off) => h("button", { class: "card" + (off ? " off" : ""), onclick, disabled: !!off },
+    Object.assign(h("div", { class: "av" }, letter ?? t.name[0].toUpperCase()), { style: `background:${t.color}` }),
+    h("div", {}, h("b", {}, t.name), h("small", {}, sub)));
+  const have = found.filter((t) => t.found), miss = found.filter((t) => !t.found);
+  page.replaceChildren(h("h1", {}, "添加 Agent"),
+    h("h3", {}, have.length ? `本机检测到 ${have.length} 个 agent，一键导入` : "本机没有检测到已安装的 agent"),
+    h("div", { class: "grid" }, ...have.map((t) => card(t, t.found, () => agentDialog({ ...t, kind: "acp" })))),
+    h("h3", {}, "自定义添加"),
+    h("div", { class: "grid" },
+      card({ name: "本地 agent 程序", color: "#8a8a8e" }, "任意说 ACP 协议的命令或程序，自选目录和环境", () => agentDialog({ id: "command", name: "本地 agent", kind: "command" }), ">"),
+      card({ name: "A2A 远程 Agent", color: "#5865f2" }, "输入 Agent Card 所在 URL，可选鉴权头", () => agentDialog({ id: "a2a", name: "A2A 远程 Agent", kind: "a2a" }), "A")),
+    miss.length ? h("p", { class: "muted" }, `也支持：${miss.map((t) => t.name).join("、")}（安装后重开此页即可导入）`) : null);
 }
-function agentDialog(t) {
-  const fields = [h("h3", {}, `添加 ${t.name}`),
+async function agentDialog(t) {
+  const fields = [h("h3", {}, t.kind === "acp" ? `导入 ${t.name}` : `添加${t.name}`),
     h("label", {}, "名称", h("input", { name: "name", required: true, value: t.kind === "acp" ? t.id : "", placeholder: "如 coder" }))];
   if (t.kind === "a2a") fields.push(
     h("label", {}, "Agent URL", h("input", { name: "url", required: true, placeholder: "https://agent.example.com" })),
     h("label", {}, "鉴权头（可选）", h("input", { name: "header_name", placeholder: "authorization" })),
     h("label", {}, "鉴权值（可选，存入钥匙串）", h("input", { name: "header_value", type: "password", placeholder: "Bearer …" })));
-  if (t.kind === "command") fields.push(h("label", {}, "启动命令", h("input", { name: "command", required: true, placeholder: "my-agent --acp" })));
+  if (t.kind === "command") {
+    const cmd = h("input", { name: "command", required: true, placeholder: "/path/to/agent --acp" });
+    fields.push(h("label", {}, "启动命令（程序路径加参数）", h("div", { class: "row" }, cmd,
+      h("button", { type: "button", onclick: async () => { const p = await invoke("choose_path", { file: true }); if (p) cmd.value = /\s/.test(p) ? `"${p}"` : p; } }, "选择程序…"))));
+  }
   if (t.kind !== "a2a") {
+    const cwd = h("input", { name: "cwd", placeholder: "默认主目录" });
+    const envs = await invoke("conda_envs").catch(() => []);
+    const conda = h("select", { name: "conda" }, h("option", { value: "" }, "不使用（系统环境）"), ...envs.map((e) => h("option", { value: e.path }, `${e.name} · ${e.path}`)));
     const wt = h("input", { type: "checkbox", name: "worktree" });
     const count = h("input", { name: "count", type: "number", min: 1, max: 8, value: 1, oninput: () => { wt.checked = Number(count.value) > 1; } });
     fields.push(
-      h("label", {}, "工作目录（可选，默认主目录）", h("input", { name: "cwd", placeholder: "~/code/project" })),
-      h("label", {}, "实例数量（同时拉多个，命名为 名称、名称-2 …）", count),
+      h("label", {}, "工作目录", h("div", { class: "row" }, cwd,
+        h("button", { type: "button", onclick: async () => { const p = await invoke("choose_path", {}); if (p) cwd.value = p; } }, "选择文件夹…"))),
+      h("label", {}, envs.length ? "运行环境（conda）" : "运行环境（没有找到 conda 环境）", conda),
+      h("label", {}, "实例数量（命名为 名称、名称-2 …）", count),
       h("div", { class: "checks" }, h("label", {}, wt, "每个实例使用独立 git worktree（多实例改同一仓库时推荐）")));
   }
-  dialog(fields, "添加", async (f) => {
-    await invoke("add_agent", { spec: { template: t.id, name: f.name, url: f.url ?? null, headerName: f.header_name || null, headerValue: f.header_value || null, command: f.command ?? null, cwd: f.cwd || null, count: Number(f.count || 1), worktree: f.worktree === "on" } });
+  dialog(fields, t.kind === "acp" ? "导入" : "添加", async (f) => {
+    await invoke("add_agent", { spec: { template: t.id, name: f.name, url: f.url ?? null, headerName: f.header_name || null, headerValue: f.header_value || null, command: f.command ?? null, cwd: f.cwd || null, count: Number(f.count || 1), worktree: f.worktree === "on", conda: f.conda || null } });
     await load(); setTab("chats"); openThread(`dm:${f.name.trim()}`);
   });
 }
@@ -278,6 +296,11 @@ async function groupDialog(g) {
 }
 
 // ---------- settings
+async function loadMemories(box) {
+  const ms = await invoke("memories").catch(() => []);
+  box.replaceChildren(...(ms.length ? ms.map((m) => h("li", {}, h("b", {}, m.scope === "all" ? "所有 agent" : m.scope), h("span", { style: "flex:1" }, m.text),
+    h("button", { class: "btn", onclick: async () => { await invoke("forget", { key: m.key }); loadMemories(box); } }, "删除"))) : [h("li", {}, h("span", {}, "还没有记忆"))]));
+}
 const inputStyle = "flex:1;height:32px;border:1px solid var(--line);border-radius:8px;padding:0 10px;background:var(--list);color:var(--fg)";
 function renderSettings() {
   S.thread = null;
@@ -297,6 +320,9 @@ function renderSettings() {
         h("button", { class: "btn pri" }, "保存")),
       S.ov.discord_token ? h("button", { class: "btn", style: "margin-top:8px", onclick: async () => { try { await invoke("discord_connect"); } catch (e) { toast(e); } } }, "重新连接") : null,
       discordBox),
+    h("div", { class: "section" }, h("h3", {}, "记忆"),
+      h("p", { style: "margin:0 0 8px;color:var(--mute)" }, "在私聊里说「记住 …」存给这个 agent，在群聊里说存给所有 agent；agent 自己也能用「【记住】」开头的一行记下东西。每次新会话自动带上。"),
+      (() => { const box = h("ul", { class: "checks-list" }); loadMemories(box); return box; })()),
     h("div", { class: "section" }, h("h3", {}, "诊断"),
       (() => {
         const list = h("ul", { class: "checks-list" });
@@ -386,4 +412,4 @@ $("#kill").onclick = async () => {
 };
 $("#resume").onclick = async () => { await invoke("resume"); await load(); };
 
-(async () => { S.tpl = await invoke("templates"); await load(); blank(); })();
+(async () => { await load(); blank(); })();

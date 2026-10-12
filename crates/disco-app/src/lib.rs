@@ -28,6 +28,12 @@ const SET_HOME_GUILD: &str = "home_guild";
 /// `agent_channel/<agent>` -> Discord channel id of that agent's 1:1 channel.
 const SET_AGENT_CH: &str = "agent_channel/";
 const AGENT_CATEGORY: &str = "Disco Agents";
+/// Memory notes live in settings as `mem/<scope>/<millis>`; scope is `all` or an agent name.
+const MEM: &str = "mem/";
+/// Memory handed to a session is capped so it never slows the first turn.
+const MEM_BUDGET: usize = 4000;
+/// A line an agent starts with this is saved to its memory.
+const MEM_TAG: &str = "【记住】";
 /// Hand-off rounds and total agent turns allowed per human message in a group.
 const MAX_WAVES: usize = 4;
 const MAX_TURNS: usize = 12;
@@ -107,6 +113,8 @@ pub struct Core {
     owners: Mutex<Vec<String>>,
     /// Kill switch: while set, nothing is routed to any agent.
     paused: AtomicBool,
+    /// `agent|context` pairs whose session already got the memory preamble.
+    primed: Mutex<std::collections::HashSet<String>>,
     app: AppHandle,
 }
 
@@ -141,6 +149,9 @@ impl Core {
             return Err("已全部停止".into());
         }
         let row = self.agent(agent)?;
+        let first = self.primed.lock().unwrap_or_else(|p| p.into_inner()).insert(format!("{agent}|{context}"));
+        let with_mem;
+        let prompt = if first { with_mem = format!("{}{prompt}", self.memory_preamble(agent)); with_mem.as_str() } else { prompt };
         let _ = self.app.emit("typing", TypingEvt { thread: thread.into(), agent: agent.into(), on: true });
         let app = self.app.clone();
         let (t, a) = (thread.to_owned(), agent.to_owned());
@@ -155,11 +166,61 @@ impl Core {
         res
     }
 
+    /// What a new session is told first: the saved notes for everyone and for this
+    /// agent (newest kept when over budget), and how to save new ones.
+    fn memory_preamble(&self, agent: &str) -> String {
+        let db = self.db();
+        let mut notes: Vec<(String, String)> = ["all", agent].iter()
+            .flat_map(|sc| db.settings_with_prefix(&format!("{MEM}{sc}/")).unwrap_or_default()).collect();
+        drop(db);
+        notes.sort_by(|a, b| b.0.cmp(&a.0));
+        let mut kept = Vec::new();
+        let mut used = 0;
+        for (_, t) in notes {
+            used += t.len() + 3;
+            if used > MEM_BUDGET { break; }
+            kept.push(t);
+        }
+        kept.reverse();
+        let mut out = String::from("【Disco 长期记忆】\n");
+        for t in &kept { out.push_str("- "); out.push_str(t); out.push('\n'); }
+        out.push_str(&format!("（需要长期记住的事实或偏好，单独一行以「{MEM_TAG}」开头写出，Disco 会保存。）\n\n"));
+        out
+    }
+
+    fn remember(&self, scope: &str, text: &str) {
+        let text = text.trim();
+        if text.is_empty() { return; }
+        let mut ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_micros()).unwrap_or(0);
+        let db = self.db();
+        while db.setting(&format!("{MEM}{scope}/{ts:020}")).is_some() { ts += 1; }
+        let _ = db.set_setting(&format!("{MEM}{scope}/{ts:020}"), text);
+    }
+
+    /// Save every `【记住】` line of an agent's answer to its memory.
+    fn remember_from(&self, agent: &str, answer: &str) {
+        for l in answer.lines().filter_map(|l| l.trim().strip_prefix(MEM_TAG)) {
+            self.remember(agent, l);
+        }
+    }
+
+    /// `记住 …` / `/remember …` from the user: save it, no agent turn. Returns true if handled.
+    fn user_remember(&self, thread: &str, scope: &str, text: &str) -> bool {
+        let t = text.trim();
+        let Some(rest) = ["记住：", "记住:", "记住", "/remember ", "/记住 "].iter().find_map(|p| t.strip_prefix(p)) else { return false };
+        let rest = rest.trim();
+        if rest.is_empty() { return false; }
+        self.remember(scope, rest);
+        self.post_message(thread, "system", &format!("已记住{}：{rest}", if scope == "all" { "（所有 agent）" } else { "" }));
+        true
+    }
+
     /// 1:1 chat. The same thread is mirrored to the agent's own Discord channel
     /// (when there is one), whichever side the message came from.
     async fn dm(&self, agent: String, author: String, text: String, from_discord: bool) {
         let thread = format!("dm:{agent}");
         self.post_message(&thread, &author, &text);
+        if self.user_remember(&thread, &agent, &text) { return; }
         let mirror = self.agent_channel(&agent).and_then(|ch| Some((self.discord_rest()?, ch)));
         // Mirror in the background: the agent must not wait on Discord.
         if !from_discord && let Some((d, ch)) = mirror.clone() {
@@ -169,6 +230,7 @@ impl Core {
         match self.turn(&thread, &agent, &thread, &text).await {
             Ok(answer) => {
                 let answer = answer.trim();
+                self.remember_from(&agent, answer);
                 self.post_message(&thread, &agent, answer);
                 if let Some((d, ch)) = &mirror && let Some(hook) = secret_get(&format!("webhook/{ch}"))
                     && let Err(e) = d.post_as(&hook, &agent, None, answer).await
@@ -247,6 +309,7 @@ impl Core {
         let Some(g) = self.db().list_groups().ok().and_then(|gs| gs.into_iter().find(|g| g.id == channel)) else { return };
         let thread = format!("group:{channel}");
         self.post_message(&thread, &author, &text);
+        if self.user_remember(&thread, "all", &text) { return; }
         if !from_discord && let Some(d) = self.discord_rest() {
             let (ch, line) = (channel.clone(), format!("**{author}**：{text}"));
             tauri::async_runtime::spawn(async move { let _ = d.post(&ch, &line).await; });
@@ -271,6 +334,7 @@ impl Core {
                         Ok(answer) => {
                             let answer = answer.trim().to_owned();
                             if answer.is_empty() { return Vec::new(); }
+                            self.remember_from(agent, &answer);
                             // Post as soon as this agent finishes, not when the wave does.
                             self.post_message(thread, agent, &answer);
                             if let (Some(d), Some(hook)) = (self.discord_rest(), g.webhook_ref.as_deref().and_then(secret_get))
@@ -395,8 +459,57 @@ async fn overview(core: St<'_>) -> CmdResult<Overview> {
 }
 
 #[tauri::command]
-fn templates() -> &'static [templates::Template] {
-    templates::TEMPLATES
+fn detect_agents(core: St<'_>) -> Vec<templates::Detected> {
+    templates::detect(&core.hub.user_path)
+}
+
+#[tauri::command]
+fn conda_envs() -> Vec<templates::CondaEnv> {
+    templates::conda_envs(&hub::dirs_home())
+}
+
+/// Native folder (or, with `file`, file) picker via AppleScript, so no extra plugin. None if cancelled.
+#[tauri::command]
+async fn choose_path(file: Option<bool>) -> Option<String> {
+    let script = if file == Some(true) { "POSIX path of (choose file with prompt \"选择 agent 程序\")" } else { "POSIX path of (choose folder with prompt \"选择 agent 的工作目录\")" };
+    tauri::async_runtime::spawn_blocking(move || {
+        let out = std::process::Command::new("osascript")
+            .args(["-e", script])
+            .output().ok()?;
+        let p = String::from_utf8(out.stdout).ok()?.trim().trim_end_matches('/').to_owned();
+        (out.status.success() && !p.is_empty()).then_some(p)
+    }).await.ok().flatten()
+}
+
+#[derive(Serialize)]
+struct Memory { key: String, scope: String, text: String }
+
+#[tauri::command]
+fn memories(core: St<'_>) -> CmdResult<Vec<Memory>> {
+    Ok(core.db().settings_with_prefix(MEM).map_err(err)?.into_iter().map(|(k, text)| {
+        let scope = k.split('/').next().unwrap_or("").to_owned();
+        Memory { key: k, scope, text }
+    }).collect())
+}
+
+#[tauri::command]
+fn forget(core: St<'_>, key: String) -> CmdResult<()> {
+    core.db().set_setting(&format!("{MEM}{key}"), "").map_err(err)
+}
+
+/// Split a command line on spaces, keeping "double" or 'single' quoted parts together.
+fn split_args(line: &str) -> Vec<String> {
+    let (mut out, mut cur, mut quote, mut any) = (Vec::new(), String::new(), None, false);
+    for c in line.chars() {
+        match (quote, c) {
+            (None, '"' | '\'') => { quote = Some(c); any = true; }
+            (Some(q), c) if c == q => quote = None,
+            (None, c) if c.is_whitespace() => { if any { out.push(std::mem::take(&mut cur)); any = false; } }
+            (_, c) => { cur.push(c); any = true; }
+        }
+    }
+    if any { out.push(cur); }
+    out
 }
 
 fn valid_name(name: &str) -> CmdResult<String> {
@@ -420,6 +533,8 @@ struct NewAgent {
     /// Local agents only: how many instances to add (name, name-2, name-3 …).
     count: Option<u8>,
     worktree: Option<bool>,
+    /// Conda environment prefix the agent runs in.
+    conda: Option<String>,
 }
 
 #[tauri::command]
@@ -438,10 +553,10 @@ async fn add_agent(core: St<'_>, spec: NewAgent) -> CmdResult<Vec<String>> {
 }
 
 async fn add_agent_rows(core: &Core, spec: NewAgent) -> CmdResult<Vec<String>> {
-    let NewAgent { template, name, url, header_name, header_value, command, cwd, count, worktree } = spec;
+    let NewAgent { template, name, url, header_name, header_value, command, cwd, count, worktree, conda } = spec;
     let name = valid_name(&name)?;
-    let t = templates::get(&template).ok_or("未知模板")?;
-    let row = match t.kind {
+    let kind = match template.as_str() { "a2a" => "a2a", "command" => "command", _ => "acp" };
+    let row = match kind {
         "a2a" => {
             let url = url.filter(|u| u.starts_with("http")).ok_or("URL 需以 http(s) 开头")?;
             let cred = match (header_name.filter(|s| !s.is_empty()), header_value.filter(|s| !s.is_empty())) {
@@ -459,18 +574,18 @@ async fn add_agent_rows(core: &Core, spec: NewAgent) -> CmdResult<Vec<String>> {
             return Ok(vec![name]);
         }
         kind => {
-            let (cmd, args) = if kind == "command" {
+            let (cmd, args, blurb) = if kind == "command" {
                 let line = command.unwrap_or_default();
-                let mut it = line.split_whitespace().map(str::to_owned);
-                (it.next().ok_or("请填写命令")?, it.collect())
+                let mut it = split_args(&line).into_iter();
+                (it.next().ok_or("请填写命令")?, it.collect(), "自定义 ACP 命令")
             } else {
-                (t.command.to_owned(), t.args.iter().map(|s| s.to_string()).collect::<Vec<_>>())
+                templates::resolve(&template, &core.hub.user_path).ok_or("未知 agent 类型")?
             };
             let n = count.unwrap_or(1).clamp(1, 8) as usize;
             let spec = LocalSpec {
-                template: t.id.into(), command: cmd.clone(), args: args.clone(),
-                cwd: cwd.unwrap_or_default().trim().into(), description: t.blurb.into(),
-                worktree: worktree.unwrap_or(n > 1),
+                template: template.clone(), command: cmd.clone(), args: args.clone(),
+                cwd: cwd.unwrap_or_default().trim().into(), description: blurb.into(),
+                worktree: worktree.unwrap_or(n > 1), conda: conda.unwrap_or_default().trim().into(),
             };
             let endpoint = std::iter::once(cmd).chain(args).collect::<Vec<_>>().join(" ");
             let card = serde_json::to_string(&spec).ok();
@@ -497,6 +612,7 @@ async fn add_agent_rows(core: &Core, spec: NewAgent) -> CmdResult<Vec<String>> {
 #[tauri::command]
 async fn remove_agent(core: St<'_>, name: String) -> CmdResult<()> {
     core.hub.drop_agent(&name).await;
+    core.primed.lock().unwrap_or_else(|p| p.into_inner()).retain(|k| !k.starts_with(&format!("{name}|")));
     let row = core.agent(&name)?;
     if let Some(c) = row.credential_ref { secret_del(&c); }
     core.db().delete_agent(&name).map_err(err)?;
@@ -544,6 +660,7 @@ async fn decide_permission(core: St<'_>, agent: String, request_id: String, opti
 async fn stop_all(core: St<'_>) -> CmdResult<usize> {
     core.paused.store(true, Ordering::Relaxed);
     let n = core.hub.stop_all().await;
+    core.primed.lock().unwrap_or_else(|p| p.into_inner()).clear();
     core.db().audit("me", None, "kill_switch", &format!("stopped {n}")).map_err(err)?;
     Ok(n)
 }
@@ -782,6 +899,7 @@ pub fn run() {
                 discord_status: Mutex::new("未连接".into()),
                 owners: Mutex::default(),
                 paused: AtomicBool::new(false),
+                primed: Mutex::default(),
                 app: app.handle().clone(),
             });
             // Installs from before v0.4 kept only the Keychain entry.
@@ -802,7 +920,7 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
-            overview, templates, add_agent, remove_agent, messages, send, decide_permission,
+            overview, detect_agents, conda_envs, choose_path, memories, forget, add_agent, remove_agent, messages, send, decide_permission,
             stop_all, resume, save_discord_token, discord_connect, discord_settings, discord_sync, diagnose, open_url, discord_channels, save_group, delete_group,
             check_update, install_update
         ])
@@ -813,6 +931,11 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::mentions;
+
+    #[test]
+    fn split_args_quotes() {
+        assert_eq!(super::split_args(r#""/Applications/My Agent/bin/agent" --acp  'a b'"#), vec!["/Applications/My Agent/bin/agent", "--acp", "a b"]);
+    }
 
     #[test]
     fn mention_order_and_self_exclusion() {
