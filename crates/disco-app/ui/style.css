@@ -176,3 +176,13 @@ dialog::backdrop { background:rgba(0,0,0,.28); }
 .mklead { color:var(--mute); background:var(--hover); opacity:0; transition:opacity .12s; } .ptile:hover .mklead { opacity:1; }
 .gwhere { display:flex; align-items:center; gap:10px; margin:18px 0 6px; color:var(--mute); }
 .gwhere small { font-size:12px; flex:none; }
+
+/* model / reasoning / mode pickers in the chat header */
+.cfgs { display: flex; gap: 8px; align-items: center; -webkit-app-region: no-drag; }
+.cfg { display: flex; align-items: center; gap: 0; height: 28px; border: 1px solid var(--line); border-radius: 8px; background: var(--main); overflow: hidden; font-size: 12px; }
+.cfg span { padding: 0 8px; color: var(--mute); border-right: 1px solid var(--line); height: 100%; display: flex; align-items: center; }
+.cfg select { appearance: none; -webkit-appearance: none; border: 0; background: transparent; font: inherit; color: inherit; padding: 0 22px 0 8px; height: 100%; max-width: 170px; cursor: pointer; outline: none;
+  background-image: linear-gradient(45deg, transparent 50%, currentColor 50%), linear-gradient(135deg, currentColor 50%, transparent 50%);
+  background-position: right 11px center, right 7px center; background-size: 4px 4px; background-repeat: no-repeat; }
+.cfg select:disabled { opacity: .5; }
+.cfg-wait { font-size: 12px; color: var(--mute); }

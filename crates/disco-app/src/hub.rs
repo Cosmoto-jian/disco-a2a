@@ -28,6 +28,19 @@ pub struct LocalSpec {
     /// Conda environment prefix to run in (its bin/ goes first on PATH).
     #[serde(default)]
     pub conda: String,
+    /// Chosen session settings (config id -> value id), e.g. the model.
+    #[serde(default)]
+    pub config: std::collections::BTreeMap<String, String>,
+}
+
+/// A setting the agent offers (model, reasoning effort, mode …), for the UI.
+#[derive(Serialize)]
+pub struct ConfigView {
+    pub id: String,
+    pub name: String,
+    pub category: String,
+    pub current: String,
+    pub options: Vec<(String, String)>,
 }
 
 #[derive(Clone)]
@@ -128,6 +141,7 @@ impl Hub {
                     env,
                     cwd,
                     prompt_timeout: Duration::from_secs(15 * 60),
+                    config: spec.config.into_iter().collect(),
                 };
                 Runtime::Acp(Arc::new(AcpAgent::spawn(launch).await.map_err(|e| e.to_string())?))
             }
@@ -177,6 +191,22 @@ impl Hub {
             }
         };
         outcome.map(|()| answer)
+    }
+
+    /// Settings the agent offers; starts it (and its `context` session) if needed.
+    pub async fn configs(&self, row: &AgentRow, secret: &CredLookup, context: &str) -> Result<Vec<ConfigView>, String> {
+        let Runtime::Acp(a) = self.runtime(row, secret).await? else { return Ok(Vec::new()) };
+        let list = a.configs(context).await.map_err(|e| e.to_string())?;
+        Ok(list.into_iter().map(|c| ConfigView { id: c.id, name: c.name, category: c.category, current: c.current, options: c.options }).collect())
+    }
+
+    /// Apply a setting to a running agent (no-op when it isn't running).
+    pub async fn set_config(&self, agent: &str, id: &str, value: &str) -> Result<(), String> {
+        let cell = self.live.lock().await.get(agent).cloned();
+        match cell.as_ref().and_then(|c| c.get()) {
+            Some(Runtime::Acp(a)) => a.set_config(id, value).await.map_err(|e| e.to_string()),
+            _ => Ok(()),
+        }
     }
 
     pub async fn decide(&self, agent: &str, request_id: &str, d: PermissionDecision) -> bool {

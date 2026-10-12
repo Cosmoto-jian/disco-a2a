@@ -16,7 +16,9 @@ use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::schema::v1::{
     ContentBlock, InitializeRequest, NewSessionRequest, PermissionOptionKind, PromptRequest,
     RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
-    SelectedPermissionOutcome, SessionId, SessionNotification, SessionUpdate, TextContent,
+    SelectedPermissionOutcome, SessionConfigKind, SessionConfigOption, SessionConfigOptionCategory,
+    SessionConfigSelectOptions, SessionId, SessionNotification, SessionUpdate,
+    SetSessionConfigOptionRequest, TextContent,
 };
 use agent_client_protocol::{Agent, ByteStreams, ConnectionTo};
 use disco_types::{AgentEvent, PermissionChoice, PermissionDecision, TaskPhase};
@@ -44,6 +46,47 @@ pub struct Launch {
     pub cwd: PathBuf,
     /// Max wall time for one prompt.
     pub prompt_timeout: Duration,
+    /// Session settings to apply to every new session (config id -> value id),
+    /// e.g. `model = "sonnet"`. Ids the agent doesn't offer are ignored.
+    pub config: Vec<(String, String)>,
+}
+
+/// One selectable session setting the agent offers: model, reasoning effort, mode …
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfigChoice {
+    pub id: String,
+    pub name: String,
+    /// `model`, `thought_level`, `mode`, `model_config` or the agent's own word.
+    pub category: String,
+    pub current: String,
+    /// (value id, label)
+    pub options: Vec<(String, String)>,
+}
+
+type Configs = Arc<Mutex<Vec<ConfigChoice>>>;
+
+fn choices(opts: &[SessionConfigOption]) -> Vec<ConfigChoice> {
+    opts.iter()
+        .filter_map(|o| {
+            let SessionConfigKind::Select(s) = &o.kind else { return None };
+            let options = match &s.options {
+                SessionConfigSelectOptions::Ungrouped(v) => v.iter().map(|x| (x.value.0.to_string(), x.name.clone())).collect(),
+                SessionConfigSelectOptions::Grouped(g) => {
+                    g.iter().flat_map(|g| g.options.iter().map(|x| (x.value.0.to_string(), x.name.clone()))).collect()
+                }
+                _ => Vec::new(),
+            };
+            let category = match &o.category {
+                Some(SessionConfigOptionCategory::Model) => "model".to_owned(),
+                Some(SessionConfigOptionCategory::ThoughtLevel) => "thought_level".into(),
+                Some(SessionConfigOptionCategory::Mode) => "mode".into(),
+                Some(SessionConfigOptionCategory::ModelConfig) => "model_config".into(),
+                Some(SessionConfigOptionCategory::Other(c)) => c.clone(),
+                _ => String::new(),
+            };
+            Some(ConfigChoice { id: o.id.0.to_string(), name: o.name.clone(), category, current: s.current_value.0.to_string(), options })
+        })
+        .collect()
 }
 
 const INHERITED: &[&str] = &["PATH", "HOME", "LANG", "TMPDIR", "USER", "SHELL"];
@@ -55,7 +98,9 @@ type Sinks = Arc<Mutex<HashMap<String, mpsc::Sender<AgentEvent>>>>;
 enum Cmd {
     Prompt { key: String, text: String, events: mpsc::Sender<AgentEvent> },
     /// Create the session for `key` ahead of the first prompt.
-    Warm { key: String },
+    Warm { key: String, ready: Option<oneshot::Sender<()>> },
+    /// Change a session setting in every open session (and every later one).
+    Set { id: String, value: String, done: oneshot::Sender<Result<(), String>> },
 }
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -66,6 +111,7 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 pub struct AcpAgent {
     cmd: mpsc::Sender<Cmd>,
     pending: Pending,
+    configs: Configs,
     child: Mutex<tokio::process::Child>,
 }
 
@@ -98,9 +144,10 @@ impl AcpAgent {
 
         let (cmd_tx, cmd_rx) = mpsc::channel::<Cmd>(32);
         let pending: Pending = Arc::default();
+        let configs: Configs = Arc::default();
         let transport = ByteStreams::new(stdin.compat_write(), stdout.compat());
-        tokio::spawn(run_connection(transport, launch, cmd_rx, pending.clone()));
-        Ok(Self { cmd: cmd_tx, pending, child: Mutex::new(child) })
+        tokio::spawn(run_connection(transport, launch, cmd_rx, pending.clone(), configs.clone()));
+        Ok(Self { cmd: cmd_tx, pending, configs, child: Mutex::new(child) })
     }
 
     /// Send one prompt in the session named `key` (created on first use);
@@ -113,7 +160,22 @@ impl AcpAgent {
 
     /// Start the session for `key` now so the first real prompt doesn't pay for it.
     pub async fn warm(&self, key: impl Into<String>) -> Result<(), AcpError> {
-        self.cmd.send(Cmd::Warm { key: key.into() }).await.map_err(|_| AcpError::Gone)
+        self.cmd.send(Cmd::Warm { key: key.into(), ready: None }).await.map_err(|_| AcpError::Gone)
+    }
+
+    /// The settings the agent offers, once the session for `key` exists.
+    pub async fn configs(&self, key: impl Into<String>) -> Result<Vec<ConfigChoice>, AcpError> {
+        let (tx, rx) = oneshot::channel();
+        self.cmd.send(Cmd::Warm { key: key.into(), ready: Some(tx) }).await.map_err(|_| AcpError::Gone)?;
+        let _ = rx.await;
+        Ok(lock(&self.configs).clone())
+    }
+
+    /// Change a setting (e.g. the model) for every session, now and later.
+    pub async fn set_config(&self, id: impl Into<String>, value: impl Into<String>) -> Result<(), AcpError> {
+        let (done, rx) = oneshot::channel();
+        self.cmd.send(Cmd::Set { id: id.into(), value: value.into(), done }).await.map_err(|_| AcpError::Gone)?;
+        rx.await.map_err(|_| AcpError::Gone)?.map_err(AcpError::Protocol)
     }
 
     /// Answer a `PermissionAsked` event.
@@ -182,6 +244,7 @@ async fn run_connection<W, R>(
     launch: Launch,
     mut cmd_rx: mpsc::Receiver<Cmd>,
     pending: Pending,
+    configs: Configs,
 ) where
     W: futures::AsyncWrite + Send + 'static,
     R: futures::AsyncRead + Send + 'static,
@@ -190,11 +253,15 @@ async fn run_connection<W, R>(
     let sinks_n = sinks.clone();
     let sinks_p = sinks.clone();
     let pending_p = pending.clone();
+    let configs_n = configs.clone();
     let result = agent_client_protocol::Client
         .builder()
         .name("disco")
         .on_receive_notification(
             async move |n: SessionNotification, _cx| {
+                if let SessionUpdate::ConfigOptionUpdate(u) = &n.update {
+                    *lock(&configs_n) = choices(&u.config_options);
+                }
                 if let Some(ev) = map_update(n.update) {
                     emit(&sinks_n, &n.session_id.to_string(), ev);
                 }
@@ -235,23 +302,58 @@ async fn run_connection<W, R>(
             conn.send_request(InitializeRequest::new(ProtocolVersion::V1)).block_task().await?;
             // Disco context key -> (ACP session, per-session turn lock).
             let mut sessions: HashMap<String, (SessionId, Arc<tokio::sync::Mutex<()>>)> = HashMap::new();
+            let mut prefs: Vec<(String, String)> = launch.config.clone();
+            // Apply one setting to one session; keeps `configs` in sync with the agent.
+            let set = async |sid: &SessionId, id: &str, value: &str| -> Result<(), String> {
+                let r = conn.send_request(SetSessionConfigOptionRequest::new(sid.clone(), id.to_owned(), value))
+                    .block_task().await.map_err(|e| e.to_string())?;
+                *lock(&configs) = choices(&r.config_options);
+                Ok(())
+            };
             while let Some(cmd) = cmd_rx.recv().await {
-                let (key, job) = match cmd {
-                    Cmd::Prompt { key, text, events } => (key, Some((text, events))),
-                    Cmd::Warm { key } => (key, None),
+                let (key, job, ready) = match cmd {
+                    Cmd::Prompt { key, text, events } => (key, Some((text, events)), None),
+                    Cmd::Warm { key, ready } => (key, None, ready),
+                    Cmd::Set { id, value, done } => {
+                        prefs.retain(|(k, _)| *k != id);
+                        prefs.push((id.clone(), value.clone()));
+                        let mut res = Ok(());
+                        for (sid, _) in sessions.values() {
+                            if let Err(e) = set(sid, &id, &value).await { res = Err(e); }
+                        }
+                        if sessions.is_empty() {
+                            // No session yet: just remember it; the next session picks it up.
+                            for c in lock(&configs).iter_mut().filter(|c| c.id == id) { c.current = value.clone(); }
+                        }
+                        let _ = done.send(res);
+                        continue;
+                    }
                 };
                 let (session, turn) = match sessions.get(&key) {
                     Some(s) => s.clone(),
                     None => match conn.send_request(NewSessionRequest::new(launch.cwd.clone())).block_task().await {
-                        Ok(r) => sessions.entry(key).or_insert((r.session_id, Arc::default())).clone(),
+                        Ok(r) => {
+                            let offered = choices(r.config_options.as_deref().unwrap_or_default());
+                            for (id, value) in &prefs {
+                                if offered.iter().any(|c| c.id == *id && c.current != *value && c.options.iter().any(|(v, _)| v == value))
+                                    && let Err(e) = set(&r.session_id, id, value).await
+                                {
+                                    tracing::warn!("set {id}={value}: {e}");
+                                }
+                            }
+                            if !offered.is_empty() && lock(&configs).is_empty() { *lock(&configs) = offered; }
+                            sessions.entry(key).or_insert((r.session_id, Arc::default())).clone()
+                        }
                         Err(e) => {
                             if let Some((_, events)) = job {
                                 let _ = events.send(AgentEvent::Done { phase: TaskPhase::Failed, stop_reason: Some(e.to_string()) }).await;
                             }
+                            if let Some(r) = ready { let _ = r.send(()); }
                             continue;
                         }
                     },
                 };
+                if let Some(r) = ready { let _ = r.send(()); }
                 let Some((text, events)) = job else { continue };
                 let (conn, sinks, pending, timeout) = (conn.clone(), sinks.clone(), pending.clone(), launch.prompt_timeout);
                 tokio::spawn(async move {

@@ -129,6 +129,7 @@ async function openThread(t) {
   pane.replaceChildren(
     h("div", { class: "head", "data-tauri-drag-region": true }, avatar(name, { group: isGroup }),
       h("div", {}, h("h2", {}, name), h("small", {}, sub)), h("span", { class: "sp" }),
+      a && a.kind === "acp" ? h("div", { id: "cfgs", class: "cfgs" }) : null,
       isGroup ? h("button", { class: "btn", onclick: () => groupDialog(g) }, "成员") : null),
     h("div", { id: "log" }),
     h("div", { id: "composer" },
@@ -140,12 +141,35 @@ async function openThread(t) {
     if (e.key === "Enter" && !e.shiftKey && !e.isComposing) { e.preventDefault(); sendMsg(); }
   });
   ta.focus();
+  if (a && a.kind === "acp") loadConfigs(name, t);
   const msgs = await invoke("messages", { thread: t });
   if (S.thread !== t) return;
   for (const m of msgs) $("#log").append(bubble(m.author, m.body));
   for (const p of Object.values(S.perms)) if (p.thread === t) $("#log").append(permCard(p));
   for (const [k, v] of Object.entries(S.live)) if (k.startsWith(t + "|")) $("#log").append(v.el);
   scrollLog();
+}
+// Model / reasoning / mode pickers, as the agent itself offers them (ACP session config).
+const CFG_ORDER = ["model", "thought_level", "model_config", "mode"];
+const CFG_LABEL = { model: "模型", thought_level: "思考", mode: "模式" };
+async function loadConfigs(agent, t) {
+  const box = $("#cfgs");
+  box.replaceChildren(h("span", { class: "cfg-wait" }, "读取模型…"));
+  let list = [];
+  try { list = await invoke("agent_configs", { agent }); } catch { list = []; }
+  if (S.thread !== t || !box.isConnected) return;
+  list.sort((x, y) => (CFG_ORDER.indexOf(x.category) + 1 || 9) - (CFG_ORDER.indexOf(y.category) + 1 || 9));
+  box.replaceChildren(...list.filter((c) => c.options.length > 1).map((c) => {
+    const sel = h("select", { title: c.name },
+      ...c.options.map(([v, label]) => { const o = h("option", { value: v }, label); o.selected = v === c.current; return o; }));
+    sel.addEventListener("change", async () => {
+      sel.disabled = true;
+      try { await invoke("set_agent_config", { agent, id: c.id, value: sel.value }); toast(`${CFG_LABEL[c.category] ?? c.name}已切换为 ${sel.selectedOptions[0].textContent}`); }
+      catch (e) { toast(e); sel.value = c.current; }
+      sel.disabled = false; c.current = sel.value;
+    });
+    return h("label", { class: "cfg" }, h("span", {}, CFG_LABEL[c.category] ?? c.name), sel);
+  }));
 }
 function bubble(author, body) {
   if (author === "system") return h("div", { class: "m sys" }, body);

@@ -611,6 +611,7 @@ async fn add_agent_rows(core: &Core, spec: NewAgent) -> CmdResult<Vec<String>> {
                 template: template.clone(), command: cmd.clone(), args: args.clone(),
                 cwd: cwd.unwrap_or_default().trim().into(), description: blurb.into(),
                 worktree: worktree.unwrap_or(n > 1), conda: conda.unwrap_or_default().trim().into(),
+                ..Default::default()
             };
             let endpoint = std::iter::once(cmd).chain(args).collect::<Vec<_>>().join(" ");
             let card = serde_json::to_string(&spec).ok();
@@ -673,6 +674,24 @@ fn send(core: St<'_>, thread: String, text: String) -> CmdResult<()> {
         return Err("未知会话".into());
     }
     Ok(())
+}
+
+#[tauri::command]
+async fn agent_configs(core: St<'_>, agent: String) -> CmdResult<Vec<hub::ConfigView>> {
+    let row = core.agent(&agent)?;
+    core.hub.configs(&row, &secret_get, &format!("dm:{agent}")).await
+}
+
+/// Pick a model / reasoning level / mode for an agent: applied to its open sessions
+/// right away and saved so every later session starts with it.
+#[tauri::command]
+async fn set_agent_config(core: St<'_>, agent: String, id: String, value: String) -> CmdResult<()> {
+    let mut row = core.agent(&agent)?;
+    let mut spec: hub::LocalSpec = row.card_json.as_deref().and_then(|j| serde_json::from_str(j).ok()).ok_or("这个 agent 没有可调的设置")?;
+    spec.config.insert(id.clone(), value.clone());
+    row.card_json = Some(serde_json::to_string(&spec).map_err(err)?);
+    core.db().upsert_agent(&row).map_err(err)?;
+    core.hub.set_config(&agent, &id, &value).await
 }
 
 #[tauri::command]
@@ -960,7 +979,7 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
-            overview, detect_agents, conda_envs, choose_path, memories, forget, add_agent, remove_agent, messages, send, decide_permission,
+            overview, detect_agents, conda_envs, choose_path, memories, forget, add_agent, remove_agent, messages, send, decide_permission, agent_configs, set_agent_config,
             stop_all, resume, save_discord_token, discord_connect, discord_settings, discord_sync, diagnose, open_url, discord_channels, save_group, delete_group,
             check_update, install_update
         ])
