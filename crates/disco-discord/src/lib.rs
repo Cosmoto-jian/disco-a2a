@@ -264,6 +264,10 @@ impl Rest {
         Ok(if bits & 8 != 0 { u64::MAX } else { bits })
     }
 
+    pub async fn rename_channel(&self, channel: &str, name: &str) -> Result<(), String> {
+        self.call(reqwest::Method::PATCH, &format!("/channels/{channel}"), Some(json!({"name": channel_slug(name)}))).await.map(|_| ())
+    }
+
     pub async fn delete_channel(&self, channel: &str) -> Result<(), String> {
         self.call(reqwest::Method::DELETE, &format!("/channels/{channel}"), None).await.map(|_| ())
     }

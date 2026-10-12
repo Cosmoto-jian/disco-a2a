@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::schema::v1::{
-    ContentBlock, InitializeRequest, NewSessionRequest, PermissionOptionKind, PromptRequest,
+    CancelNotification, ContentBlock, InitializeRequest, NewSessionRequest, PermissionOptionKind, PromptRequest,
     RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
     SelectedPermissionOutcome, SessionConfigKind, SessionConfigOption, SessionConfigOptionCategory,
     SessionConfigSelectOptions, SessionId, SessionNotification, SessionUpdate,
@@ -99,6 +99,8 @@ enum Cmd {
     Prompt { key: String, text: String, events: mpsc::Sender<AgentEvent> },
     /// Create the session for `key` ahead of the first prompt.
     Warm { key: String, ready: Option<oneshot::Sender<()>> },
+    /// Stop the turn running in the session for `key`.
+    Cancel { key: String },
     /// Change a session setting in every open session (and every later one).
     Set { id: String, value: String, done: oneshot::Sender<Result<(), String>> },
 }
@@ -176,6 +178,12 @@ impl AcpAgent {
         let (done, rx) = oneshot::channel();
         self.cmd.send(Cmd::Set { id: id.into(), value: value.into(), done }).await.map_err(|_| AcpError::Gone)?;
         rx.await.map_err(|_| AcpError::Gone)?.map_err(AcpError::Protocol)
+    }
+
+    /// Stop the reply currently running in the session for `key` (the agent ends
+    /// the turn with `cancelled`; the process and session stay alive).
+    pub async fn cancel(&self, key: impl Into<String>) -> Result<(), AcpError> {
+        self.cmd.send(Cmd::Cancel { key: key.into() }).await.map_err(|_| AcpError::Gone)
     }
 
     /// Answer a `PermissionAsked` event.
@@ -314,6 +322,16 @@ async fn run_connection<W, R>(
                 let (key, job, ready) = match cmd {
                     Cmd::Prompt { key, text, events } => (key, Some((text, events)), None),
                     Cmd::Warm { key, ready } => (key, None, ready),
+                    Cmd::Cancel { key } => {
+                        if let Some((sid, _)) = sessions.get(&key) {
+                            let _ = conn.send_notification(CancelNotification::new(sid.clone()));
+                            // ACP: open permission prompts of that session must be answered "cancelled".
+                            let prefix = format!("{sid}/");
+                            let open: Vec<_> = lock(&pending).extract_if(|k, _| k.starts_with(&prefix)).map(|(_, tx)| tx).collect();
+                            for tx in open { let _ = tx.send(PermissionDecision::Cancel); }
+                        }
+                        continue;
+                    }
                     Cmd::Set { id, value, done } => {
                         prefs.retain(|(k, _)| *k != id);
                         prefs.push((id.clone(), value.clone()));

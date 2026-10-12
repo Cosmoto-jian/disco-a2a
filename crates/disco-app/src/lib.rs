@@ -651,6 +651,42 @@ async fn remove_agent(core: St<'_>, name: String, purge: Option<bool>) -> CmdRes
     Ok(())
 }
 
+/// Rename an agent: history, groups, memories and its Discord channel follow it.
+#[tauri::command]
+async fn rename_agent(core: St<'_>, name: String, new_name: String) -> CmdResult<()> {
+    let new = valid_name(&new_name)?;
+    if new == name { return Ok(()); }
+    let mut row = core.agent(&name)?;
+    if core.db().list_agents().map_err(err)?.iter().any(|a| a.name == new) {
+        return Err(format!("已经有名为 {new} 的 agent"));
+    }
+    core.hub.drop_agent(&name).await;
+    core.forget_sessions(Some(&name));
+    if let Some(mut spec) = row.card_json.as_deref().and_then(|j| serde_json::from_str::<LocalSpec>(j).ok()) {
+        if spec.worktree && spec.worktree_name.is_empty() { spec.worktree_name = name.clone(); }
+        row.card_json = Some(serde_json::to_string(&spec).map_err(err)?);
+        core.db().upsert_agent(&row).map_err(err)?;
+    }
+    core.db().rename_agent(&name, &new).map_err(err)?;
+    core.db().rename_setting_prefix(&format!("{MEM}{name}/"), &format!("{MEM}{new}/")).map_err(err)?;
+    if let Some(ch) = core.agent_channel(&name) {
+        core.db().set_setting(&format!("{SET_AGENT_CH}{name}"), "").map_err(err)?;
+        core.db().set_setting(&format!("{SET_AGENT_CH}{new}"), &ch).map_err(err)?;
+        if let Some(d) = core.discord_rest() {
+            tauri::async_runtime::spawn(async move { let _ = d.rename_channel(&ch, &new).await; });
+        }
+    }
+    let _ = core.db().audit("user", Some(&name), "rename_agent", &new_name);
+    core.inner().warm(Some(vec![new_name.trim().to_owned()]));
+    Ok(())
+}
+
+/// Stop the reply an agent is giving in a thread.
+#[tauri::command]
+async fn stop_reply(core: St<'_>, thread: String, agent: String) -> CmdResult<bool> {
+    Ok(core.hub.cancel(&agent, &thread).await)
+}
+
 #[derive(Serialize)]
 struct Msg { author: String, body: String, ts: i64 }
 
@@ -980,7 +1016,7 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
-            overview, detect_agents, conda_envs, choose_path, memories, forget, add_agent, remove_agent, messages, send, decide_permission, agent_configs, set_agent_config,
+            overview, detect_agents, conda_envs, choose_path, memories, forget, add_agent, remove_agent, rename_agent, stop_reply, messages, send, decide_permission, agent_configs, set_agent_config,
             stop_all, resume, save_discord_token, discord_connect, discord_settings, discord_sync, diagnose, open_url, discord_channels, save_group, delete_group,
             check_update, install_update
         ])

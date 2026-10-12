@@ -43,7 +43,7 @@ function when(ts) {
 function md(src) {
   const parts = esc(src).split(/```(?:[\w-]*)\n?([\s\S]*?)```/g);
   return parts.map((p, i) => {
-    if (i % 2) return `<pre><code>${p.replace(/\n$/, "")}</code></pre>`;
+    if (i % 2) return `<pre><button class="copy" type="button">复制</button><code>${p.replace(/\n$/, "")}</code></pre>`;
     return p.split(/\n{2,}/).map((blk) => {
       const inline = (t) => t.replace(/`([^`]+)`/g, "<code>$1</code>").replace(/\*\*([^*]+)\*\*/g, "<b>$1</b>");
       const lines = blk.split("\n").filter((l) => l.trim());
@@ -138,7 +138,9 @@ async function openThread(t) {
       h("div", { class: "hint" }, "↩ 发送 · ⇧↩ 换行")));
   const ta = $("#input");
   ta.addEventListener("input", () => { ta.style.height = "auto"; ta.style.height = ta.scrollHeight + "px"; });
+  const mention = isGroup ? mentionPicker(ta, () => g.members) : null;
   ta.addEventListener("keydown", (e) => {
+    if (mention?.key(e)) return;
     if (e.key === "Enter" && !e.shiftKey && !e.isComposing) { e.preventDefault(); sendMsg(); }
   });
   ta.focus();
@@ -190,7 +192,31 @@ function popover(anchor, items) {
   addEventListener("mousedown", out, true); addEventListener("keydown", esc, true);
 }
 function agentMenu(anchor, name) {
-  popover(anchor, [{ label: "删除 Agent…", danger: true, run: () => removeAgent(name) }]);
+  popover(anchor, [
+    { label: "重命名…", run: () => renameAgent(name) },
+    { label: "删除 Agent…", danger: true, run: () => removeAgent(name) },
+  ]);
+}
+function renameAgent(name) {
+  const d = $("#dlg"), form = $("#dlg-form");
+  const input = h("input", { value: name, maxlength: 32, spellcheck: false });
+  const err = h("div", { class: "err" });
+  const go = h("button", { class: "btn pri", type: "submit" }, "保存");
+  form.replaceChildren(h("h3", {}, "重命名 Agent"),
+    h("label", {}, "新名称（字母、数字、- 或 _）", input), err,
+    h("div", { class: "actions" }, h("button", { class: "btn", type: "button", onclick: () => d.close() }, "取消"), go));
+  form.onsubmit = async (e) => {
+    e.preventDefault();
+    const next = input.value.trim();
+    if (next === name) return d.close();
+    go.disabled = true; err.textContent = "";
+    try {
+      await invoke("rename_agent", { name, newName: next });
+      d.close(); await load();
+      if (S.thread === `dm:${name}`) openThread(`dm:${next}`); else if (S.thread) openThread(S.thread);
+    } catch (e2) { err.textContent = String(e2); go.disabled = false; }
+  };
+  d.showModal(); input.select();
 }
 function bubble(author, body) {
   if (author === "system") return h("div", { class: "m sys" }, body);
@@ -199,6 +225,49 @@ function bubble(author, body) {
   const col = h("div", {}, !me && S.thread?.startsWith("group:") ? h("div", { class: "who" }, author) : null, b);
   return h("div", { class: `m${me ? " me" : ""}` }, me ? null : avatar(author, { small: true }), col);
 }
+// Typing "@" in a group offers its members; ↑↓ to move, ↩/⇥ to pick, Esc to close.
+function mentionPicker(ta, members) {
+  let box = null, items = [], idx = 0, start = -1;
+  const close = () => { box?.remove(); box = null; };
+  const pick = (name) => {
+    const v = ta.value, end = ta.selectionStart;
+    ta.value = `${v.slice(0, start)}@${name} ${v.slice(end)}`;
+    const caret = start + name.length + 2; ta.setSelectionRange(caret, caret); close(); ta.focus();
+  };
+  const draw = () => box.replaceChildren(...items.map((n, i) => h("button", {
+    class: `pop-item${i === idx ? " hl" : ""}`, onmousedown: (e) => { e.preventDefault(); pick(n); },
+  }, h("span", { class: "mi" }, n === "all" ? h("span", { class: "mi-all" }, "@") : avatar(n, { small: true }), n === "all" ? "所有人" : n))));
+  ta.addEventListener("input", () => {
+    const m = ta.value.slice(0, ta.selectionStart).match(/(^|\s)@([\w-]*)$/);
+    if (!m) return close();
+    start = ta.selectionStart - m[2].length - 1;
+    const q = m[2].toLowerCase();
+    items = [...members().filter((n) => n.toLowerCase().startsWith(q)), ...("all".startsWith(q) ? ["all"] : [])];
+    if (!items.length) return close();
+    idx = 0;
+    if (!box) {
+      box = h("div", { class: "pop mention" }); document.body.append(box);
+      const r = ta.getBoundingClientRect(); box.style.left = `${r.left}px`; box.style.bottom = `${innerHeight - r.top + 6}px`;
+    }
+    draw();
+  });
+  ta.addEventListener("blur", () => setTimeout(close, 100));
+  return { key(e) {
+    if (!box) return false;
+    if (e.key === "ArrowDown" || e.key === "ArrowUp") { idx = (idx + (e.key === "ArrowDown" ? 1 : items.length - 1)) % items.length; draw(); }
+    else if ((e.key === "Enter" || e.key === "Tab") && !e.isComposing) pick(items[idx]);
+    else if (e.key === "Escape") close();
+    else return false;
+    e.preventDefault(); return true;
+  } };
+}
+// Copy buttons on code blocks.
+document.addEventListener("click", async (e) => {
+  const btn = e.target.closest?.("pre > .copy"); if (!btn) return;
+  try { await navigator.clipboard.writeText(btn.nextElementSibling.textContent); btn.textContent = "已复制"; }
+  catch { btn.textContent = "复制失败"; }
+  setTimeout(() => { btn.textContent = "复制"; }, 1200);
+});
 function scrollLog() { const l = $("#log"); if (l) l.scrollTop = l.scrollHeight; }
 async function sendMsg() {
   const ta = $("#input"); const text = ta.value.trim();
@@ -240,10 +309,15 @@ listen("typing", ({ payload: { thread, agent, on } }) => {
   const k = liveKey(thread, agent);
   if (on && !S.live[k]) {
     const b = h("div", { class: "b" }, h("span", { class: "typing-dots" }, h("i"), h("i"), h("i")));
-    S.live[k] = { text: "", b, el: h("div", { class: "m" }, avatar(agent, { small: true }), h("div", {}, h("div", { class: "who" }, agent), b)) };
+    const stop = h("button", { class: "stop-btn", title: "停止这次回复", onclick: async () => {
+      stop.disabled = true; stop.textContent = "正在停止…";
+      try { if (!(await invoke("stop_reply", { thread, agent }))) { stop.textContent = "无法停止"; } } catch (e) { toast(e); }
+    } }, "停止");
+    S.live[k] = { text: "", b, stop, el: h("div", { class: "m" }, avatar(agent, { small: true }), h("div", {}, h("div", { class: "who" }, agent, stop), b)) };
     if (S.thread === thread) { $("#log").append(S.live[k].el); scrollLog(); }
   }
   if (!on && S.live[k] && !S.live[k].text) { S.live[k].el.remove(); delete S.live[k]; }
+  if (!on && S.live[k]) S.live[k].stop?.remove();
   renderList();
 });
 listen("stream", ({ payload: { thread, agent, event } }) => {

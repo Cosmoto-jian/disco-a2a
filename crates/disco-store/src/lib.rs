@@ -256,6 +256,28 @@ impl Store {
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
+    /// Rename an agent everywhere it is referenced: its row, its private thread,
+    /// its authored messages, group membership and leadership.
+    pub fn rename_agent(&mut self, old: &str, new: &str) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        tx.execute("UPDATE agents SET name = ?2 WHERE name = ?1", [old, new])?;
+        tx.execute("UPDATE messages SET thread = ?2 WHERE thread = ?1", [format!("dm:{old}"), format!("dm:{new}")])?;
+        tx.execute("UPDATE messages SET author = ?2 WHERE author = ?1", [old, new])?;
+        tx.execute("UPDATE group_members SET agent_name = ?2 WHERE agent_name = ?1", [old, new])?;
+        tx.execute("UPDATE groups SET lead_agent = ?2 WHERE lead_agent = ?1", [old, new])?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Move every setting under `old` (a key prefix) to the same key under `new`.
+    pub fn rename_setting_prefix(&self, old: &str, new: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE settings SET key = ?2 || substr(key, length(?1) + 1) WHERE substr(key, 1, length(?1)) = ?1",
+            [old, new],
+        )?;
+        Ok(())
+    }
+
     /// Remove an agent and take it out of every group (a group it led loses its lead).
     /// With `purge`, its private chat history goes too.
     pub fn delete_agent(&mut self, name: &str, purge: bool) -> Result<bool> {

@@ -28,6 +28,10 @@ pub struct LocalSpec {
     /// Conda environment prefix to run in (its bin/ goes first on PATH).
     #[serde(default)]
     pub conda: String,
+    /// Worktree directory/branch name; set when the agent is renamed so it keeps its
+    /// existing worktree. Empty means "the agent's name".
+    #[serde(default)]
+    pub worktree_name: String,
     /// Chosen session settings (config id -> value id), e.g. the model.
     #[serde(default)]
     pub config: std::collections::BTreeMap<String, String>,
@@ -111,7 +115,7 @@ impl Hub {
                 if !cwd.is_dir() {
                     return Err(format!("工作目录不存在：{}", cwd.display()));
                 }
-                if spec.worktree && let Some(wt) = ensure_worktree(&cwd, &row.name, &self.user_path) {
+                if spec.worktree && let Some(wt) = ensure_worktree(&cwd, if spec.worktree_name.is_empty() { &row.name } else { &spec.worktree_name }, &self.user_path) {
                     cwd = wt;
                 }
                 let mut path = self.user_path.clone();
@@ -206,6 +210,15 @@ impl Hub {
         match cell.as_ref().and_then(|c| c.get()) {
             Some(Runtime::Acp(a)) => a.set_config(id, value).await.map_err(|e| e.to_string()),
             _ => Ok(()),
+        }
+    }
+
+    /// Stop the reply `agent` is giving in `context`. False if nothing could be stopped.
+    pub async fn cancel(&self, agent: &str, context: &str) -> bool {
+        let cell = self.live.lock().await.get(agent).cloned();
+        match cell.as_ref().and_then(|c| c.get()) {
+            Some(Runtime::Acp(a)) => a.cancel(context).await.is_ok(),
+            _ => false,
         }
     }
 

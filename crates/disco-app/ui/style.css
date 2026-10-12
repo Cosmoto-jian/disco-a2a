@@ -204,3 +204,19 @@ dialog::backdrop { background:rgba(0,0,0,.28); }
 #dlg-form .del-opt { flex-direction:row; align-items:center; gap:8px; margin:6px 0 4px 50px; font-size:13px; color:var(--fg); cursor:pointer; }
 #dlg-form .del-opt input { width:15px; height:15px; margin:0; padding:0; accent-color:var(--red); }
 .btn.danger-fill { background:var(--red); color:#fff; }
+
+/* stop a running reply */
+.stop-btn { margin-left:8px; border:0; border-radius:6px; padding:1px 8px; background:var(--bubble); color:var(--mute); font:inherit; font-size:11px; cursor:pointer; }
+.stop-btn:hover { background:var(--hover); color:var(--red); }
+.stop-btn:disabled { cursor:default; color:var(--mute); }
+/* copy button on code blocks */
+.b pre { position:relative; }
+.b pre .copy { position:absolute; top:6px; right:6px; border:0; border-radius:6px; padding:2px 8px; font:11px system-ui, sans-serif; background:var(--main); color:var(--mute); opacity:0; transition:opacity .15s; cursor:pointer; }
+.b pre:hover .copy { opacity:1; }
+/* @mention picker */
+.pop.mention { min-width:200px; animation:none; }
+.pop-item.hl { background:var(--sel); }
+.mi { display:flex; align-items:center; gap:8px; }
+.mi .av, .mi-all { width:22px; height:22px; font-size:11px; flex:none; }
+.mi-all { display:inline-grid; place-items:center; border-radius:6px; background:var(--acc); color:#fff; font-weight:700; }
+.err:empty { display:none; }

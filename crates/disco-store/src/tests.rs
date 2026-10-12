@@ -93,6 +93,13 @@ fn agents_upsert_list_delete() {
     a.endpoint = "http://y".into();
     s.upsert_agent(&a).unwrap();
     assert_eq!(s.list_agents().unwrap(), vec![a]);
+    s.add_message("dm:echo", "echo", "hi").unwrap();
+    s.set_setting("mem/echo/1", "note").unwrap();
+    s.rename_agent("echo", "echo2").unwrap();
+    s.rename_setting_prefix("mem/echo/", "mem/echo2/").unwrap();
+    assert_eq!(s.messages("dm:echo2", 10).unwrap()[0].author, "echo2");
+    assert_eq!(s.setting("mem/echo2/1").as_deref(), Some("note"));
+    s.rename_agent("echo2", "echo").unwrap();
     assert!(s.delete_agent("echo", true).unwrap());
     assert!(s.list_agents().unwrap().is_empty());
 }
