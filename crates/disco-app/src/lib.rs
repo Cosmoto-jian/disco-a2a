@@ -39,18 +39,54 @@ fn err(e: impl std::fmt::Display) -> String {
     e.to_string()
 }
 
+// All secrets live in ONE Keychain item ("vault", a JSON map) that is read once
+// per launch and cached. With an ad-hoc signed app macOS asks for permission per
+// item, so one item means at most one prompt (choose "Always Allow").
+const VAULT_ACCOUNT: &str = "vault";
+static VAULT: Mutex<Option<std::collections::HashMap<String, String>>> = Mutex::new(None);
+
+fn keychain(account: &str) -> Option<keyring::Entry> {
+    keyring::Entry::new(KEYCHAIN_SERVICE, account).ok()
+}
+
+fn with_vault<R>(f: impl FnOnce(&mut std::collections::HashMap<String, String>) -> R) -> R {
+    let mut guard = VAULT.lock().unwrap_or_else(|p| p.into_inner());
+    let map = guard.get_or_insert_with(|| {
+        let mut m: std::collections::HashMap<String, String> = keychain(VAULT_ACCOUNT)
+            .and_then(|e| e.get_password().ok())
+            .and_then(|j| serde_json::from_str(&j).ok())
+            .unwrap_or_default();
+        // One-time move of the bot token from the per-item layout used before v0.4.1.
+        if !m.contains_key("migrated") {
+            if let Some(t) = keychain(DISCORD_KEY).and_then(|e| e.get_password().ok()) { m.insert(DISCORD_KEY.into(), t); }
+            m.insert("migrated".into(), "1".into());
+            let _ = persist_vault(&m);
+        }
+        m
+    });
+    f(map)
+}
+
+fn persist_vault(m: &std::collections::HashMap<String, String>) -> CmdResult<()> {
+    let json = serde_json::to_string(m).map_err(err)?;
+    keychain(VAULT_ACCOUNT).ok_or("钥匙串不可用")?.set_password(&json).map_err(|e| format!("写入钥匙串失败：{e}"))
+}
+
 fn secret_get(account: &str) -> Option<String> {
-    keyring::Entry::new(KEYCHAIN_SERVICE, account).ok()?.get_password().ok()
+    with_vault(|m| m.get(account).cloned())
 }
 
 fn secret_set(account: &str, value: &str) -> CmdResult<()> {
-    keyring::Entry::new(KEYCHAIN_SERVICE, account).map_err(err)?.set_password(value).map_err(err)
+    with_vault(|m| {
+        m.insert(account.to_owned(), value.to_owned());
+        persist_vault(m)
+    })
 }
 
 fn secret_del(account: &str) {
-    if let Ok(e) = keyring::Entry::new(KEYCHAIN_SERVICE, account) {
-        let _ = e.delete_credential();
-    }
+    with_vault(|m| {
+        if m.remove(account).is_some() { let _ = persist_vault(m); }
+    });
 }
 
 struct Discord {
@@ -564,9 +600,7 @@ async fn diagnose(core: St<'_>) -> CmdResult<Vec<Check>> {
         out.push(Check { name: name.into(), ok, detail });
     };
     add("网络代理", Ok(disco_discord::proxy_url().map_or("未检测到，直连".into(), |p| format!("使用系统代理 {p}"))));
-    let probe = "diagnose-probe";
-    add("macOS 钥匙串", secret_set(probe, "ok").and_then(|_| secret_get(probe).filter(|v| v == "ok").ok_or("写入后读不出来".into()))
-        .map(|_| { secret_del(probe); "可读写".into() }));
+    add("macOS 钥匙串", with_vault(|m| persist_vault(m)).map(|_| "可读写（所有密钥存在一条钥匙串项里）".into()));
     let token = secret_get(DISCORD_KEY);
     add("Discord Bot token", token.as_ref().map(|_| "已保存".into()).ok_or("还没保存，或钥匙串拒绝访问".into()));
     if let Some(token) = token {

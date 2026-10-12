@@ -56,8 +56,8 @@ function md(src) {
 }
 // In-app toast and confirm: WKWebView may swallow window.alert/confirm, which
 // made errors invisible in earlier builds.
-function toast(msg, ms = 4000) {
-  const t = h("div", { class: "toast" }, String(msg));
+function toast(msg, ms = 4000, action) {
+  const t = h("div", { class: "toast" }, String(msg), action ? h("button", { onclick: () => { t.remove(); action[1](); } }, action[0]) : null);
   document.body.append(t);
   setTimeout(() => t.remove(), ms);
 }
@@ -259,7 +259,7 @@ async function removeAgent(name) {
 async function groupDialog(g) {
   if (!S.ov.agents.length) return toast("先添加至少一个 agent");
   let channels = [];
-  try { channels = await invoke("discord_channels"); } catch (e) { return toast(`${e}。请先在设置里连接 Discord。`); }
+  try { channels = await invoke("discord_channels"); } catch (e) { return toast(`${e}：需要先连接 Discord`, 8000, ["去设置", () => setTab("settings")]); }
   const sel = h("select", { name: "channel", required: true, disabled: !!g },
     ...channels.map((c) => h("option", { value: `${c.guild_id}|${c.id}`, selected: g?.id === c.id }, `${c.guild} / #${c.name}`)));
   const members = g?.members ?? [];

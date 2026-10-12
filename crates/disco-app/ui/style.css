@@ -17,7 +17,7 @@ svg { width:22px; height:22px; fill:none; stroke:currentColor; stroke-width:1.7;
 #rail { background:var(--rail); display:flex; flex-direction:column; align-items:center; gap:6px; padding-bottom:14px; }
 #rail .drag { height:44px; width:100%; }
 #rail .grow { flex:1; }
-.tab, #kill { width:42px; height:42px; border:0; border-radius:11px; background:none; color:var(--mute); display:grid; place-items:center; transition:background .15s, color .15s; }
+.tab, #kill { width:48px; height:48px; border:0; border-radius:11px; background:none; color:var(--mute); display:grid; place-items:center; transition:background .15s, color .15s; }
 .tab:hover { background:var(--hover); }
 .tab.on { color:var(--acc); background:var(--sel); }
 #kill:hover { color:var(--red); background:color-mix(in srgb, var(--red) 12%, transparent); }
@@ -118,3 +118,7 @@ dialog::backdrop { background:rgba(0,0,0,.28); }
 .checks-list li b{min-width:150px;font-weight:600}
 .checks-list li.ok b{color:var(--green)} .checks-list li.bad b{color:var(--red)}
 .checks-list li span{color:var(--mute);word-break:break-all}
+.tab { grid-template-rows:auto auto; gap:2px; align-content:center; }
+.tab small { font-size:10px; line-height:1; }
+.tab svg { width:20px; height:20px; }
+.toast button { margin-left:10px; border:0; border-radius:6px; padding:3px 10px; background:var(--acc); color:#fff; cursor:pointer; }
