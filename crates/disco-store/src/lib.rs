@@ -256,8 +256,18 @@ impl Store {
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
-    pub fn delete_agent(&mut self, name: &str) -> Result<bool> {
-        Ok(self.conn.execute("DELETE FROM agents WHERE name = ?1", [name])? > 0)
+    /// Remove an agent and take it out of every group (a group it led loses its lead).
+    /// With `purge`, its private chat history goes too.
+    pub fn delete_agent(&mut self, name: &str, purge: bool) -> Result<bool> {
+        let tx = self.conn.transaction()?;
+        let n = tx.execute("DELETE FROM agents WHERE name = ?1", [name])?;
+        tx.execute("DELETE FROM group_members WHERE agent_name = ?1", [name])?;
+        tx.execute("UPDATE groups SET lead_agent = NULL WHERE lead_agent = ?1", [name])?;
+        if purge {
+            tx.execute("DELETE FROM messages WHERE thread = ?1", [format!("dm:{name}")])?;
+        }
+        tx.commit()?;
+        Ok(n > 0)
     }
 
     pub fn audit(&self, actor: &str, agent: Option<&str>, action: &str, result: &str) -> Result<()> {

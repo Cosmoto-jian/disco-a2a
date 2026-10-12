@@ -177,12 +177,30 @@ dialog::backdrop { background:rgba(0,0,0,.28); }
 .gwhere { display:flex; align-items:center; gap:10px; margin:18px 0 6px; color:var(--mute); }
 .gwhere small { font-size:12px; flex:none; }
 
-/* model / reasoning / mode pickers in the chat header */
-.cfgs { display: flex; gap: 8px; align-items: center; -webkit-app-region: no-drag; }
-.cfg { display: flex; align-items: center; gap: 0; height: 28px; border: 1px solid var(--line); border-radius: 8px; background: var(--main); overflow: hidden; font-size: 12px; }
-.cfg span { padding: 0 8px; color: var(--mute); border-right: 1px solid var(--line); height: 100%; display: flex; align-items: center; }
-.cfg select { appearance: none; -webkit-appearance: none; border: 0; background: transparent; font: inherit; color: inherit; padding: 0 22px 0 8px; height: 100%; max-width: 170px; cursor: pointer; outline: none;
-  background-image: linear-gradient(45deg, transparent 50%, currentColor 50%), linear-gradient(135deg, currentColor 50%, transparent 50%);
-  background-position: right 11px center, right 7px center; background-size: 4px 4px; background-repeat: no-repeat; }
-.cfg select:disabled { opacity: .5; }
-.cfg-wait { font-size: 12px; color: var(--mute); }
+/* model pill in the chat header */
+.model-pill { -webkit-app-region:no-drag; display:inline-flex; align-items:center; gap:7px; height:28px; padding:0 10px 0 11px; border:0; border-radius:999px;
+  background:var(--bubble); color:var(--fg); font:inherit; font-size:12.5px; font-weight:500; cursor:pointer; transition:background .15s; max-width:220px; }
+.model-pill:hover { background:var(--hover); }
+.model-pill .dot { width:6px; height:6px; border-radius:50%; background:var(--green); flex:none; }
+.model-pill .lbl { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.model-pill .chev { width:6px; height:6px; border-right:1.5px solid var(--mute); border-bottom:1.5px solid var(--mute); rotate:45deg; translate:0 -2px; flex:none; }
+.model-pill.busy { opacity:.6; pointer-events:none; }
+.icon-btn { -webkit-app-region:no-drag; width:28px; height:28px; border:0; border-radius:8px; background:none; color:var(--mute); font-size:18px; line-height:1; cursor:pointer; }
+.icon-btn:hover { background:var(--hover); color:var(--fg); }
+/* anchored menu */
+.pop { position:fixed; z-index:50; min-width:180px; max-height:60vh; overflow:auto; padding:5px; border-radius:12px; background:var(--main);
+  border:1px solid var(--line); box-shadow:0 12px 32px rgba(0,0,0,.14), 0 2px 6px rgba(0,0,0,.06); animation:pop-in .12s ease-out; }
+@keyframes pop-in { from { opacity:0; transform:translateY(-4px) scale(.98); } }
+.pop-item { display:flex; width:100%; align-items:center; justify-content:space-between; gap:16px; padding:7px 10px; border:0; border-radius:7px;
+  background:none; color:var(--fg); font:inherit; font-size:13px; text-align:left; cursor:pointer; }
+.pop-item:hover { background:var(--hover); }
+.pop-item.on { font-weight:600; }
+.pop-check { width:9px; height:5px; border-left:2px solid var(--acc); border-bottom:2px solid var(--acc); rotate:-45deg; translate:0 -2px; flex:none; }
+.pop-item.danger { color:var(--red); }
+/* delete dialog */
+.del-head { display:flex; gap:12px; align-items:flex-start; }
+.del-head h3 { margin:2px 0 4px; }
+.del-sub { margin:0; color:var(--mute); font-size:12.5px; line-height:1.5; }
+#dlg-form .del-opt { flex-direction:row; align-items:center; gap:8px; margin:6px 0 4px 50px; font-size:13px; color:var(--fg); cursor:pointer; }
+#dlg-form .del-opt input { width:15px; height:15px; margin:0; padding:0; accent-color:var(--red); }
+.btn.danger-fill { background:var(--red); color:#fff; }

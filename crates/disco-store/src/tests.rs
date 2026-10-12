@@ -93,7 +93,7 @@ fn agents_upsert_list_delete() {
     a.endpoint = "http://y".into();
     s.upsert_agent(&a).unwrap();
     assert_eq!(s.list_agents().unwrap(), vec![a]);
-    assert!(s.delete_agent("echo").unwrap());
+    assert!(s.delete_agent("echo", true).unwrap());
     assert!(s.list_agents().unwrap().is_empty());
 }
 

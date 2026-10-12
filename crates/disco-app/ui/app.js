@@ -98,7 +98,7 @@ function renderList() {
     rows = S.ov.agents.map((a) => h("li", { class: S.thread === `dm:${a.name}` ? "on" : "", onclick: () => openThread(`dm:${a.name}`) },
       avatar(a.name, { live: a.live }),
       h("div", { class: "meta" }, h("div", { class: "name" }, a.name), h("div", { class: "sub" }, a.detail)),
-      h("button", { class: "more", title: "移除", onclick: (e) => { e.stopPropagation(); removeAgent(a.name); } }, "移除")));
+      h("button", { class: "more", title: "更多", onclick: (e) => { e.stopPropagation(); agentMenu(e.currentTarget, a.name); } }, "⋯")));
   } else {
     rows = [h("li", { class: "on" }, avatar("Discord", { small: true }), h("div", { class: "meta" }, h("div", { class: "name" }, "Discord"), h("div", { class: "sub" }, S.ov.discord_status)))];
   }
@@ -129,8 +129,9 @@ async function openThread(t) {
   pane.replaceChildren(
     h("div", { class: "head", "data-tauri-drag-region": true }, avatar(name, { group: isGroup }),
       h("div", {}, h("h2", {}, name), h("small", {}, sub)), h("span", { class: "sp" }),
-      a && a.kind === "acp" ? h("div", { id: "cfgs", class: "cfgs" }) : null,
-      isGroup ? h("button", { class: "btn", onclick: () => groupDialog(g) }, "成员") : null),
+      a && a.kind === "acp" ? h("div", { id: "cfgs" }) : null,
+      isGroup ? h("button", { class: "btn", onclick: () => groupDialog(g) }, "成员") : null,
+      a ? h("button", { class: "icon-btn", title: "更多", onclick: (e) => agentMenu(e.currentTarget, a.name) }, "⋯") : null),
     h("div", { id: "log" }),
     h("div", { id: "composer" },
       h("textarea", { id: "input", rows: 1, placeholder: isGroup ? "发到群里：@名字 指定 agent，同时 @ 多个或 @all 并行执行" : `给 ${name} 发消息` }),
@@ -149,27 +150,47 @@ async function openThread(t) {
   for (const [k, v] of Object.entries(S.live)) if (k.startsWith(t + "|")) $("#log").append(v.el);
   scrollLog();
 }
-// Model / reasoning / mode pickers, as the agent itself offers them (ACP session config).
-const CFG_ORDER = ["model", "thought_level", "model_config", "mode"];
-const CFG_LABEL = { model: "模型", thought_level: "思考", mode: "模式" };
+// Model picker: only the agent's own model list (ACP session config, category "model").
 async function loadConfigs(agent, t) {
   const box = $("#cfgs");
-  box.replaceChildren(h("span", { class: "cfg-wait" }, "读取模型…"));
   let list = [];
   try { list = await invoke("agent_configs", { agent }); } catch { list = []; }
-  if (S.thread !== t || !box.isConnected) return;
-  list.sort((x, y) => (CFG_ORDER.indexOf(x.category) + 1 || 9) - (CFG_ORDER.indexOf(y.category) + 1 || 9));
-  box.replaceChildren(...list.filter((c) => c.options.length > 1).map((c) => {
-    const sel = h("select", { title: c.name },
-      ...c.options.map(([v, label]) => { const o = h("option", { value: v }, label); o.selected = v === c.current; return o; }));
-    sel.addEventListener("change", async () => {
-      sel.disabled = true;
-      try { await invoke("set_agent_config", { agent, id: c.id, value: sel.value }); toast(`${CFG_LABEL[c.category] ?? c.name}已切换为 ${sel.selectedOptions[0].textContent}`); }
-      catch (e) { toast(e); sel.value = c.current; }
-      sel.disabled = false; c.current = sel.value;
-    });
-    return h("label", { class: "cfg" }, h("span", {}, CFG_LABEL[c.category] ?? c.name), sel);
-  }));
+  if (S.thread !== t || !box?.isConnected) return;
+  const c = list.find((x) => x.category === "model") ?? list.find((x) => x.id === "model");
+  if (!c || c.options.length < 2) return;
+  const label = () => c.options.find(([v]) => v === c.current)?.[1] ?? c.current;
+  const pill = h("button", { class: "model-pill", title: "切换模型" }, h("span", { class: "dot" }), h("span", { class: "lbl" }, label()), h("span", { class: "chev" }));
+  pill.onclick = () => popover(pill, c.options.map(([v, name]) => ({
+    label: name, on: v === c.current,
+    run: async () => {
+      if (v === c.current) return;
+      const prev = c.current; c.current = v; pill.querySelector(".lbl").textContent = label(); pill.classList.add("busy");
+      try { await invoke("set_agent_config", { agent, id: c.id, value: v }); }
+      catch (e) { c.current = prev; pill.querySelector(".lbl").textContent = label(); toast(e); }
+      pill.classList.remove("busy");
+    },
+  })));
+  box.replaceChildren(pill);
+}
+
+// A small anchored menu; closes on outside click or Esc.
+function popover(anchor, items) {
+  document.querySelector(".pop")?.remove();
+  const pop = h("div", { class: "pop" }, ...items.map((it) => h("button", {
+    class: `pop-item${it.on ? " on" : ""}${it.danger ? " danger" : ""}`,
+    onclick: () => { close(); it.run(); },
+  }, h("span", {}, it.label), it.on ? h("span", { class: "pop-check" }) : null)));
+  document.body.append(pop);
+  const r = anchor.getBoundingClientRect();
+  pop.style.top = `${r.bottom + 6}px`;
+  pop.style.left = `${Math.max(8, Math.min(r.right - pop.offsetWidth, innerWidth - pop.offsetWidth - 8))}px`;
+  const close = () => { pop.remove(); removeEventListener("mousedown", out, true); removeEventListener("keydown", esc, true); };
+  const out = (e) => { if (!pop.contains(e.target) && !anchor.contains(e.target)) close(); };
+  const esc = (e) => { if (e.key === "Escape") close(); };
+  addEventListener("mousedown", out, true); addEventListener("keydown", esc, true);
+}
+function agentMenu(anchor, name) {
+  popover(anchor, [{ label: "删除 Agent…", danger: true, run: () => removeAgent(name) }]);
 }
 function bubble(author, body) {
   if (author === "system") return h("div", { class: "m sys" }, body);
@@ -332,8 +353,23 @@ function agentForm(t) {
   return h("div", { class: "aform" }, ...parts, h("div", { class: "factions" }, err, go));
 }
 async function removeAgent(name) {
-  if (!(await ask(`移除 ${name}？聊天记录会保留，它的 Discord 频道会被删除。`, "移除"))) return;
-  try { await invoke("remove_agent", { name }); if (S.thread === `dm:${name}`) blank(); await load(); } catch (e) { toast(e); }
+  const d = $("#dlg"), form = $("#dlg-form");
+  const purge = h("input", { type: "checkbox" }); purge.checked = true;
+  const go = h("button", { class: "btn pri danger-fill", type: "button" }, "删除");
+  form.replaceChildren(
+    h("div", { class: "del-head" }, avatar(name), h("div", {}, h("h3", {}, `删除 ${name}？`),
+      h("p", { class: "del-sub" }, "会停止它的进程，把它移出所有群聊，并删除它的 Discord 频道。"))),
+    h("label", { class: "del-opt" }, purge, h("span", {}, "同时清空和它的聊天记录")),
+    h("div", { class: "actions" }, h("button", { class: "btn", type: "button", onclick: () => d.close() }, "取消"), go));
+  form.onsubmit = (e) => e.preventDefault();
+  go.onclick = async () => {
+    go.disabled = true;
+    try {
+      await invoke("remove_agent", { name, purge: purge.checked });
+      d.close(); if (S.thread === `dm:${name}`) blank(); await load(); toast(`已删除 ${name}`);
+    } catch (e) { go.disabled = false; toast(e); }
+  };
+  d.showModal();
 }
 
 // ---------- groups

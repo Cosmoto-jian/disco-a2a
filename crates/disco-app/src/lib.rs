@@ -636,12 +636,13 @@ async fn add_agent_rows(core: &Core, spec: NewAgent) -> CmdResult<Vec<String>> {
 
 
 #[tauri::command]
-async fn remove_agent(core: St<'_>, name: String) -> CmdResult<()> {
+async fn remove_agent(core: St<'_>, name: String, purge: Option<bool>) -> CmdResult<()> {
     core.hub.drop_agent(&name).await;
     core.forget_sessions(Some(&name));
     let row = core.agent(&name)?;
     if let Some(c) = row.credential_ref { secret_del(&c); }
-    core.db().delete_agent(&name).map_err(err)?;
+    core.db().delete_agent(&name, purge.unwrap_or(false)).map_err(err)?;
+    let _ = core.db().audit("user", Some(&name), "remove_agent", "ok");
     if let Some(ch) = core.agent_channel(&name) {
         let _ = core.db().set_setting(&format!("{SET_AGENT_CH}{name}"), "");
         secret_del(&format!("webhook/{ch}"));
