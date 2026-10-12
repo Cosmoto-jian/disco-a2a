@@ -1,0 +1,22 @@
+name: ci
+on:
+  push:
+  workflow_dispatch:
+jobs:
+  test:
+    strategy:
+      matrix:
+        os: [macos-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with: { components: clippy }
+      - uses: Swatinem/rust-cache@v2
+      - if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - if: runner.os == 'macOS'
+        run: brew install protobuf
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: DISCO_LEAK_PROBE=1 cargo test --workspace --release
+      - run: cargo test -p disco-store --release -- --ignored --nocapture
