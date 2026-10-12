@@ -19,6 +19,8 @@ use tokio::sync::{mpsc, watch};
 
 const KEYCHAIN_SERVICE: &str = "dev.cosmoto.disco";
 const DISCORD_KEY: &str = "discord-bot-token";
+/// Extra Discord user ids (comma-separated) allowed to drive agents, besides the bot owner.
+const DISCORD_ALLOW_KEY: &str = "discord-allow";
 /// Hand-off rounds and total agent turns allowed per human message in a group.
 const MAX_WAVES: usize = 4;
 const MAX_TURNS: usize = 12;
@@ -47,6 +49,11 @@ fn secret_del(account: &str) {
 struct Discord {
     rest: Rest,
     stop: watch::Sender<bool>,
+}
+
+fn allow_extra() -> Vec<String> {
+    secret_get(DISCORD_ALLOW_KEY).unwrap_or_default()
+        .split([',', ' ', '\n']).filter(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit())).map(str::to_owned).collect()
 }
 
 pub struct Core {
@@ -415,6 +422,15 @@ async fn save_discord_token(core: St<'_>, token: String) -> CmdResult<()> {
 }
 
 #[tauri::command]
+fn discord_allow(ids: Option<String>) -> CmdResult<String> {
+    if let Some(ids) = ids {
+        let ids = ids.trim();
+        if ids.is_empty() { secret_del(DISCORD_ALLOW_KEY); } else { secret_set(DISCORD_ALLOW_KEY, ids)?; }
+    }
+    Ok(allow_extra().join(", "))
+}
+
+#[tauri::command]
 fn discord_connect(core: St<'_>) -> CmdResult<()> {
     if secret_get(DISCORD_KEY).is_none() { return Err("还没有保存 Discord token".into()); }
     connect_discord(core.inner().clone());
@@ -465,12 +481,22 @@ fn connect_discord(core: Arc<Core>) {
     let (tx, mut rx) = mpsc::channel::<Incoming>(64);
     let c = core.clone();
     tauri::async_runtime::spawn(disco_discord::run_gateway(token, tx, stop_rx, move |s| c.set_discord_status(s)));
+    let rest = core.discord_rest();
     tauri::async_runtime::spawn(async move {
+        // Only the bot's owner(s) and explicitly allowed users may drive agents:
+        // anyone else in the guild could otherwise run tools on this Mac.
+        let owners = match rest { Some(r) => r.owner_ids().await.unwrap_or_default(), None => Vec::new() };
         while let Some(m) = rx.recv().await {
+            if !owners.contains(&m.author_id) && !allow_extra().contains(&m.author_id) {
+                let _ = core.db().audit(&format!("discord:{}", m.author_id), None, "group.ignored", "sender not allowed");
+                continue;
+            }
             let c = core.clone();
             // Each channel message is handled on its own task so one slow agent
-            // never blocks other groups.
-            tauri::async_runtime::spawn(async move { c.group(m.channel_id, m.author, m.content, true).await });
+            // never blocks other groups. The " (Discord)" suffix keeps a Discord
+            // display name from impersonating the local user ("me") or an agent.
+            let author = format!("{} (Discord)", m.author);
+            tauri::async_runtime::spawn(async move { c.group(m.channel_id, author, m.content, true).await });
         }
     });
 }
@@ -495,7 +521,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             overview, templates, add_agent, remove_agent, messages, send, decide_permission,
-            stop_all, resume, save_discord_token, discord_connect, discord_channels, save_group, delete_group
+            stop_all, resume, save_discord_token, discord_connect, discord_allow, discord_channels, save_group, delete_group
         ])
         .run(tauri::generate_context!())
         .expect("error while running Disco");

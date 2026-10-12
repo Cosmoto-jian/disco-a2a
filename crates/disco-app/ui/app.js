@@ -266,7 +266,13 @@ function renderSettings() {
         try { await invoke("save_discord_token", { token: tok }); e.target.reset(); await load(); renderSettings(); } catch (er) { toast(er); }
       } }, h("input", { name: "token", type: "password", placeholder: S.ov.discord_token ? "已保存 · 输入新 token 替换" : "Bot token", style: "flex:1;height:32px;border:1px solid var(--line);border-radius:8px;padding:0 10px;background:var(--list);color:var(--fg)" }),
         h("button", { class: "btn pri" }, "保存")),
-      S.ov.discord_token ? h("button", { class: "btn", style: "margin-top:8px", onclick: async () => { try { await invoke("discord_connect"); } catch (e) { toast(e); } } }, "重新连接") : null),
+      S.ov.discord_token ? h("button", { class: "btn", style: "margin-top:8px", onclick: async () => { try { await invoke("discord_connect"); } catch (e) { toast(e); } } }, "重新连接") : null,
+      h("p", { style: "margin:14px 0 6px;color:var(--mute)" }, "只有 Bot 所有者能在 Discord 里指挥 agent。要允许其他人，填他们的 Discord 用户 ID（逗号分隔）："),
+      h("form", { style: "display:flex;gap:8px", onsubmit: async (e) => {
+        e.preventDefault();
+        try { e.target.ids.value = await invoke("discord_allow", { ids: e.target.ids.value }); toast("已保存"); } catch (er) { toast(er); }
+      } }, (() => { const i = h("input", { name: "ids", placeholder: "例如 123456789012345678", style: "flex:1;height:32px;border:1px solid var(--line);border-radius:8px;padding:0 10px;background:var(--list);color:var(--fg)" }); invoke("discord_allow", {}).then((v) => { i.value = v; }); return i; })(),
+        h("button", { class: "btn" }, "保存"))),
     h("div", { class: "section" }, h("h3", {}, "安全"),
       h("p", { style: "margin:0;color:var(--mute)" }, "左下角电源键是一键停止：立刻结束所有本地 agent 进程并暂停所有路由，所有操作写入审计日志。"))));
 }

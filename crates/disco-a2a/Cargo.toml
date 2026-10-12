@@ -6,6 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+serde_json.workspace = true
 disco-types.workspace = true
 a2a.workspace = true
 a2a-client.workspace = true

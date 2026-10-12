@@ -55,6 +55,7 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use twilight_http::Client;
 use twilight_model::channel::ChannelType;
+use twilight_model::channel::message::AllowedMentions;
 use twilight_model::id::Id;
 use twilight_model::id::marker::{ChannelMarker, WebhookMarker};
 
@@ -63,6 +64,7 @@ use twilight_model::id::marker::{ChannelMarker, WebhookMarker};
 pub struct Incoming {
     pub guild_id: String,
     pub channel_id: String,
+    pub author_id: String,
     pub author: String,
     pub content: String,
 }
@@ -116,6 +118,16 @@ impl Rest {
         Self(Arc::new(Client::new(token)))
     }
 
+    /// Discord user ids that own the bot application (the owner, or every team member).
+    pub async fn owner_ids(&self) -> Result<Vec<String>, String> {
+        let app = self.0.current_user_application().await.map_err(err)?.model().await.map_err(err)?;
+        let mut ids: Vec<String> = app.owner.map(|u| u.id.to_string()).into_iter().collect();
+        if let Some(team) = app.team {
+            ids.extend(team.members.into_iter().map(|m| m.user.id.to_string()));
+        }
+        Ok(ids)
+    }
+
     /// Every text channel in every guild the bot is in.
     pub async fn text_channels(&self) -> Result<Vec<ChannelInfo>, String> {
         let guilds = self.0.current_user_guilds().await.map_err(err)?.model().await.map_err(err)?;
@@ -143,7 +155,8 @@ impl Rest {
         let (wid, token) = webhook.split_once('\n').ok_or("bad webhook ref")?;
         let wid = id::<WebhookMarker>(wid)?;
         for part in chunk(text) {
-            self.0.execute_webhook(wid, token).username(username).content(&part).await.map_err(err)?;
+            // Agent text must never ping @everyone, roles or users.
+            self.0.execute_webhook(wid, token).username(username).allowed_mentions(Some(&AllowedMentions::default())).content(&part).await.map_err(err)?;
         }
         Ok(())
     }
@@ -152,7 +165,7 @@ impl Rest {
     pub async fn post(&self, channel: &str, text: &str) -> Result<(), String> {
         let ch = id::<ChannelMarker>(channel)?;
         for part in chunk(text) {
-            self.0.create_message(ch).content(&part).await.map_err(err)?;
+            self.0.create_message(ch).allowed_mentions(Some(&AllowedMentions::default())).content(&part).await.map_err(err)?;
         }
         Ok(())
     }
@@ -187,6 +200,7 @@ pub async fn run_gateway(
                     let msg = Incoming {
                         guild_id: guild.to_string(),
                         channel_id: m.channel_id.to_string(),
+                        author_id: m.author.id.to_string(),
                         author: m.author.global_name.clone().unwrap_or_else(|| m.author.name.clone()),
                         content: m.content.clone(),
                     };
