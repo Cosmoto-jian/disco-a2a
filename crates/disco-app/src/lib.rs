@@ -192,6 +192,10 @@ impl Core {
         let _ = self.app.emit("message", MessageEvt { thread: thread.into(), author: author.into(), body: body.into(), ts });
     }
 
+    fn discord_status(&self) -> String {
+        self.discord_status.lock().unwrap_or_else(|p| p.into_inner()).clone()
+    }
+
     fn set_discord_status(&self, s: String) {
         *self.discord_status.lock().unwrap_or_else(|p| p.into_inner()) = s.clone();
         let _ = self.app.emit("discord-status", s);
@@ -596,8 +600,10 @@ fn reveal(path: &std::path::Path) -> CmdResult<()> {
 
 /// Open a web page in the default browser.
 fn open_in_browser(url: &str) -> CmdResult<()> {
+    // `explorer <url>` is unreliable for URLs with a query string; the URL
+    // protocol handler opens the default browser the same way a link click does.
     #[cfg(windows)]
-    std::process::Command::new("explorer").arg(url).spawn().map_err(err)?;
+    hub::quiet_cmd("rundll32").args(["url.dll,FileProtocolHandler", url]).spawn().map_err(err)?;
     #[cfg(not(windows))]
     std::process::Command::new("/usr/bin/open").arg(url).spawn().map_err(err)?;
     Ok(())
@@ -906,7 +912,7 @@ async fn save_discord_token(core: St<'_>, token: String) -> CmdResult<()> {
 }
 
 #[derive(Serialize)]
-struct DiscordSettings { home_guild: Option<String>, guilds: Vec<Channel>, allow: String, invite_url: Option<String> }
+struct DiscordSettings { home_guild: Option<String>, guilds: Vec<Channel>, allow: String, invite_url: Option<String>, problem: Option<String> }
 
 #[tauri::command]
 async fn discord_settings(core: St<'_>, home_guild: Option<String>, allow: Option<String>) -> CmdResult<DiscordSettings> {
@@ -917,17 +923,27 @@ async fn discord_settings(core: St<'_>, home_guild: Option<String>, allow: Optio
         let c = core.inner().clone();
         tauri::async_runtime::spawn(async move { let _ = c.sync_agent_channels(None).await; });
     }
-    let (guilds, invite_url) = match core.discord_rest() {
+    // Errors are shown, not swallowed: an empty list must mean "not invited yet".
+    let (guilds, invite_url, problem) = match core.discord_rest() {
         Some(r) => {
-            let gs = r.guilds().await.unwrap_or_default();
-            let id = r.me().await.ok().map(|(id, _)| id);
+            let (gs, me) = tokio::join!(r.guilds(), r.me());
+            let problem = gs.as_ref().err().or(me.as_ref().err()).cloned();
+            let gs = gs.unwrap_or_default();
+            let id = me.ok().map(|(id, _)| id);
             (gs.into_iter().map(|g| Channel { guild_id: g.id.clone(), guild: g.name, id: g.id, name: String::new() }).collect(),
-             id.map(|id| format!("https://discord.com/oauth2/authorize?client_id={id}&scope=bot&permissions={}", disco_discord::BOT_PERMISSIONS)))
+             id.map(|id| format!("https://discord.com/oauth2/authorize?client_id={id}&scope=bot&permissions={}", disco_discord::BOT_PERMISSIONS)),
+             problem)
         }
-        None => (Vec::new(), None),
+        None => (Vec::new(), None, Some(core.discord_status())),
     };
     let db = core.db();
-    Ok(DiscordSettings { home_guild: db.setting(SET_HOME_GUILD), guilds, allow: db.setting(SET_ALLOW).unwrap_or_default(), invite_url })
+    // The bot just joined its first server: make it home and build the channels.
+    if db.setting(SET_HOME_GUILD).is_none() && guilds.len() == 1 {
+        db.set_setting(SET_HOME_GUILD, &guilds[0].id).map_err(err)?;
+        let c = core.inner().clone();
+        tauri::async_runtime::spawn(async move { let _ = c.sync_agent_channels(None).await; });
+    }
+    Ok(DiscordSettings { home_guild: db.setting(SET_HOME_GUILD), guilds, allow: db.setting(SET_ALLOW).unwrap_or_default(), invite_url, problem })
 }
 
 #[tauri::command]

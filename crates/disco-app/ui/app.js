@@ -927,6 +927,17 @@ async function loadDiscordSettings(box) {
     try { await invoke("discord_settings", { homeGuild: v }); toast("已切换主服务器，正在为每个 agent 建频道"); } catch (e) { toast(e); }
   }, d.guilds.length ? "选择服务器" : "Bot 还没加入任何服务器");
   const allow = h("input", { value: d.allow, placeholder: "其他可指挥 agent 的 Discord 用户 ID，逗号分隔", style: inputStyle });
+  if (!d.guilds.length) {
+    // Not invited yet (or Discord unreachable): one clear next step, then watch for the join.
+    const copy = d.invite_url ? h("button", { class: "btn", onclick: (e) => copyText(d.invite_url, e.currentTarget) }, "复制邀请链接") : null;
+    box.replaceChildren(h("div", { class: "warn", style: "margin-top:14px" },
+      d.problem ? h("p", { style: "margin:0 0 8px" }, d.problem) : null,
+      h("p", { style: "margin:0 0 8px" }, d.invite_url ? "Bot 还没加入任何服务器。点下面的按钮，在浏览器里选你的服务器并授权；浏览器没打开的话，复制链接自己打开。" : "暂时连不上 Discord，稍后会自动重试。"),
+      d.invite_url ? h("div", { style: "display:flex;gap:8px" },
+        h("button", { class: "btn pri", onclick: () => invoke("open_url", { url: d.invite_url }).catch(toast) }, "邀请 Bot 进服务器"), copy) : null));
+    setTimeout(() => { if (box.isConnected) loadDiscordSettings(box); }, 4000);
+    return;
+  }
   box.replaceChildren(...[
     h("p", { style: "margin:14px 0 6px;color:var(--mute)" }, "主服务器：每个 agent 会在「Disco Agents」分类下有自己的频道，在频道里直接对它说话。"),
     h("div", { style: "display:flex;gap:8px" }, guild,
