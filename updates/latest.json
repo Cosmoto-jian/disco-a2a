@@ -1,15 +1,15 @@
 {
-  "version": "1.0.0",
-  "notes": "Yobiru 互通、Tailscale 身份与访问规则、唤醒权限、文件交接，以及一批修复",
-  "pub_date": "2026-10-12T17:48:42Z",
+  "version": "1.1.0",
+  "notes": "去掉 Yobiru 兼容，保留 Tailscale 访问规则、免打扰和共享空间文件",
+  "pub_date": "2026-10-13T03:37:18Z",
   "platforms": {
     "darwin-aarch64": {
-      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVUcDdocWFJV0FyVjlyVmRyTUNOOXdvdTNzaEN4RWlGZndZbWlQUmNrMVBVWUhMVU5CcENVVkhXV2Rkb3VwaTA5V0RBZ0x4Qk5Pamp0UkVwaDE0UURBY0pzNDBYbkZBbkFBPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkxODI3MzIyCWZpbGU6RGlzY29fMS4wLjBfdW5pdmVyc2FsLmFwcC50YXIuZ3oKSlVLejRYNkFFN2lCQUJZSnI2eGJLZUxvVUtmVjRQZG5iUTFMRU9FVjdWZ2xYekJTZ0tYRkI5QjdMTVBFOE5hdkd3bmpCQzhPdUFiZlVraTh0Q3BCRFE9PQo=",
-      "url": "https://github.com/Cosmoto-jian/disco-a2a/releases/download/v1.0.0/Disco_1.0.0_universal.app.tar.gz"
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVUcDdocWFJV0FyVi8rSjBnakpYSWREZ2lESW5rZWZ4QnVqajd0MS9oVHhZSXVBUUhqQ1NTUlQybVhtS1lvdzlhSkEzQlU1bngyOXhranFEdXhSZEM3MjFCM2htMlRkWndvPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkxODYyNjM4CWZpbGU6RGlzY29fMS4xLjBfdW5pdmVyc2FsLmFwcC50YXIuZ3oKODhSdXg3OElBSStYUENkS214b1ZJdWpuU1VuekNOYXdvQWMyVFdOQzFJMTZKRkJhenZJWjBiZy92R3hIZ1JHUjZ1dS8xdmVtekdFOFhDcHJjaHFmQnc9PQo=",
+      "url": "https://github.com/Cosmoto-jian/disco-a2a/releases/download/v1.1.0/Disco_1.1.0_universal.app.tar.gz"
     },
     "darwin-x86_64": {
-      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVUcDdocWFJV0FyVjlyVmRyTUNOOXdvdTNzaEN4RWlGZndZbWlQUmNrMVBVWUhMVU5CcENVVkhXV2Rkb3VwaTA5V0RBZ0x4Qk5Pamp0UkVwaDE0UURBY0pzNDBYbkZBbkFBPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkxODI3MzIyCWZpbGU6RGlzY29fMS4wLjBfdW5pdmVyc2FsLmFwcC50YXIuZ3oKSlVLejRYNkFFN2lCQUJZSnI2eGJLZUxvVUtmVjRQZG5iUTFMRU9FVjdWZ2xYekJTZ0tYRkI5QjdMTVBFOE5hdkd3bmpCQzhPdUFiZlVraTh0Q3BCRFE9PQo=",
-      "url": "https://github.com/Cosmoto-jian/disco-a2a/releases/download/v1.0.0/Disco_1.0.0_universal.app.tar.gz"
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVUcDdocWFJV0FyVi8rSjBnakpYSWREZ2lESW5rZWZ4QnVqajd0MS9oVHhZSXVBUUhqQ1NTUlQybVhtS1lvdzlhSkEzQlU1bngyOXhranFEdXhSZEM3MjFCM2htMlRkWndvPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkxODYyNjM4CWZpbGU6RGlzY29fMS4xLjBfdW5pdmVyc2FsLmFwcC50YXIuZ3oKODhSdXg3OElBSStYUENkS214b1ZJdWpuU1VuekNOYXdvQWMyVFdOQzFJMTZKRkJhenZJWjBiZy92R3hIZ1JHUjZ1dS8xdmVtekdFOFhDcHJjaHFmQnc9PQo=",
+      "url": "https://github.com/Cosmoto-jian/disco-a2a/releases/download/v1.1.0/Disco_1.1.0_universal.app.tar.gz"
     }
   }
 }
