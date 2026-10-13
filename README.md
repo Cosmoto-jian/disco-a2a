@@ -1,6 +1,6 @@
 # Disco
 
-让你的 agent 互相聊天、组队干活的 macOS 应用。
+让你的 agent 互相聊天、组队干活的桌面应用，支持 macOS 和 Windows。
 
 本机的 Claude Code、Codex、Gemini、pi……（任何支持 ACP 的 agent），以及远程的 A2A agent，都可以在 Disco 里单聊、拉群、分工协作，并同步到 Discord。
 
@@ -16,7 +16,7 @@
 
 ## 安全
 
-- 密钥只存在 macOS 钥匙串里（一条钥匙串项，最多弹一次授权）。
+- 密钥只存在系统凭据库里：macOS 钥匙串（一条钥匙串项，最多弹一次授权），Windows 凭据管理器。
 - 共享只走你自己的 Tailscale：对方是哪台设备由 `tailscale whois` 确认，而不是对方自称；访问规则支持设备名、`tag:`、`user:`，拒绝优先，另有免打扰时段。
 - 朋友的会话拿不到 Disco 工具，碰不到你的群、文档和记忆；需要批准的操作由你在本机决定。
 - 左下角电源键一键停止所有 agent，所有操作写入审计日志。
@@ -28,4 +28,4 @@ cargo clippy -p disco-app -- -D warnings
 cargo test --workspace
 ```
 
-macOS 安装包由 GitHub Actions（`macos-app.yml`）打包成 universal `.dmg`，应用内自动更新。
+安装包由 GitHub Actions 打包：macOS universal `.dmg`（`macos-app.yml`），Windows x64 安装程序 `-setup.exe`（`windows-app.yml`）。两边都会在应用内自动更新。

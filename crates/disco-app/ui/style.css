@@ -17,6 +17,7 @@ svg { width:22px; height:22px; fill:none; stroke:currentColor; stroke-width:1.7;
 /* rail */
 #rail { background:var(--rail); display:flex; flex-direction:column; align-items:center; gap:6px; padding-bottom:14px; }
 #rail .drag { height:44px; width:100%; }
+.win #rail .drag { height:12px; }
 #rail .grow { flex:1; }
 .tab, #kill { width:48px; height:48px; border:0; border-radius:11px; background:none; color:var(--mute); display:grid; place-items:center; transition:background .15s, color .15s; }
 .tab:hover { background:var(--hover); }

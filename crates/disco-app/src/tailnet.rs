@@ -112,13 +112,13 @@ pub fn is_tailnet(ip: &IpAddr) -> bool {
 
 // ───────────────────────── talking to Tailscale ─────────────────────────
 
-const CLIS: [&str; 4] = ["/Applications/Tailscale.app/Contents/MacOS/Tailscale", "/opt/homebrew/bin/tailscale", "/usr/local/bin/tailscale", "tailscale"];
+const CLIS: [&str; 5] = ["/Applications/Tailscale.app/Contents/MacOS/Tailscale", "/opt/homebrew/bin/tailscale", "/usr/local/bin/tailscale", "C:\\Program Files\\Tailscale\\tailscale.exe", "tailscale"];
 
 fn run(args: &[&str]) -> Option<Value> {
     static WORKS: OnceLock<Mutex<Option<&'static str>>> = OnceLock::new();
     let known = *WORKS.get_or_init(Mutex::default).lock().unwrap_or_else(|p| p.into_inner());
     for c in known.into_iter().chain(CLIS.into_iter().filter(|c| Some(*c) != known)) {
-        let Ok(o) = std::process::Command::new(c).args(args).output() else { continue };
+        let Ok(o) = crate::hub::quiet_cmd(c).args(args).output() else { continue };
         if !o.status.success() { continue; }
         *WORKS.get_or_init(Mutex::default).lock().unwrap_or_else(|p| p.into_inner()) = Some(c);
         return serde_json::from_slice(&o.stdout).ok();
@@ -160,10 +160,10 @@ pub fn nodes() -> Vec<Node> {
 pub fn me() -> Option<Node> {
     if let Some(n) = nodes().into_iter().find(|n| n.me) { return Some(n); }
     // The CLI may be missing (App Store build): find a 100.64/10 address on an interface.
-    let o = std::process::Command::new("ifconfig").output().ok()?;
-    String::from_utf8_lossy(&o.stdout).split_whitespace().collect::<Vec<_>>().windows(2)
-        .find_map(|w| (w[0] == "inet" && w[1].parse::<IpAddr>().is_ok_and(|ip| is_tailnet(&ip))).then(|| w[1].to_owned()))
-        .map(|ip| Node { node: ip.clone(), host: String::new(), ip, online: true, me: true })
+    let o = crate::hub::quiet_cmd(if cfg!(windows) { "ipconfig" } else { "ifconfig" }).output().ok()?;
+    String::from_utf8_lossy(&o.stdout).split(|c: char| c.is_whitespace() || c == '(' || c == '/')
+        .find(|w| w.parse::<IpAddr>().is_ok_and(|ip| is_tailnet(&ip)))
+        .map(|ip| Node { node: ip.to_owned(), host: String::new(), ip: ip.to_owned(), online: true, me: true })
 }
 
 /// Who `ip` is, according to Tailscale (cached for a minute). None if it can't say.

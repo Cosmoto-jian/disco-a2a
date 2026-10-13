@@ -23,6 +23,8 @@ function h(tag, attrs = {}, ...kids) {
 }
 const esc = (s) => s.replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 function hash(s) { let x = 0; for (const c of s) x = (x * 31 + c.codePointAt(0)) | 0; return Math.abs(x); }
+const IS_WIN = navigator.userAgent.includes("Windows");
+if (IS_WIN) document.documentElement.classList.add("win");
 const BRAND = { "claude-code": "#d97757", codex: "#10a37f", gemini: "#4285f4", qwen: "#615ced", goose: "#111111", opencode: "#3b82f6", hermes: "#7c5cff", dsh: "#4d6bfe", pi: "#e5484d" };
 function colorOf(name) {
   const a = S.ov?.agents.find((a) => a.name === name);
@@ -626,7 +628,7 @@ function agentForm(t) {
   if (t.kind === "a2a") {
     url = h("input", { class: "fld", placeholder: "https://agent.example.com", spellcheck: false });
     hn = h("input", { class: "fld", placeholder: "鉴权头（可选），如 authorization" });
-    hv = h("input", { class: "fld", type: "password", placeholder: "鉴权值（可选，存钥匙串）" });
+    hv = h("input", { class: "fld", type: "password", placeholder: IS_WIN ? "鉴权值（可选，存凭据管理器）" : "鉴权值（可选，存钥匙串）" });
     parts.push(h("div", { class: "frow" }, h("span", {}, "URL"), url), h("div", { class: "frow" }, h("span", {}, "鉴权"), hn, hv));
   }
   if (t.kind !== "a2a") {
@@ -680,7 +682,7 @@ async function shareDialog(agent) {
   form.replaceChildren(...[
     h("div", { class: "del-head" }, avatar(agent), h("div", {}, h("h3", {}, `共享 ${agent}`),
       h("p", { class: "del-sub" }, "通过 Tailscale 私有网络共享，只有拿到邀请码的人能用，随时可以撤销。"))),
-    st.problem ? h("div", { class: "warn" }, st.problem, " ", h("button", { type: "button", class: "linkish", onclick: () => invoke("open_url", { url: "https://tailscale.com/download/mac" }) }, "下载 Tailscale")) : null,
+    st.problem ? h("div", { class: "warn" }, st.problem, " ", h("button", { type: "button", class: "linkish", onclick: () => invoke("open_url", { url: "https://tailscale.com/download" }) }, "下载 Tailscale")) : null,
     h("label", {}, "共享给", guest),
     h("label", {}, "权限", modes),
     h("label", {}, "每天最多几条消息（0 = 不限）", limit),
@@ -796,7 +798,7 @@ function renderSettings() {
   const discordBox = h("div", {});
   if (S.ov.discord_token) loadDiscordSettings(discordBox);
   $("#pane").replaceChildren(h("div", { class: "page" },
-    h("h1", {}, "设置"), h("p", {}, "密钥只存在 macOS 钥匙串里。"),
+    h("h1", {}, "设置"), h("p", {}, IS_WIN ? "密钥只存在 Windows 凭据管理器里。" : "密钥只存在 macOS 钥匙串里。"),
     h("div", { class: "section" }, h("h3", {}, "Discord"),
       h("div", { class: `status${ok ? " ok" : ""}` }, h("i"), S.ov.discord_status),
       h("form", { style: "display:flex;gap:8px;margin-top:12px", onsubmit: async (e) => {

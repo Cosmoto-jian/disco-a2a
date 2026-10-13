@@ -101,7 +101,10 @@ fn choices(opts: &[SessionConfigOption]) -> Vec<ConfigChoice> {
         .collect()
 }
 
-const INHERITED: &[&str] = &["PATH", "HOME", "LANG", "TMPDIR", "USER", "SHELL"];
+const INHERITED: &[&str] = &["PATH", "HOME", "LANG", "TMPDIR", "USER", "SHELL",
+    // Windows: Node, npm and most CLIs fail without these.
+    "SystemRoot", "SystemDrive", "windir", "ComSpec", "PATHEXT", "TEMP", "TMP", "USERPROFILE", "USERNAME", "APPDATA", "LOCALAPPDATA",
+    "ProgramData", "ProgramFiles", "ProgramFiles(x86)", "CommonProgramFiles", "HOMEDRIVE", "HOMEPATH", "NUMBER_OF_PROCESSORS", "PROCESSOR_ARCHITECTURE", "OS"];
 
 type Pending = Arc<Mutex<HashMap<String, oneshot::Sender<PermissionDecision>>>>;
 /// ACP session id -> event channel of the prompt currently running in it.
@@ -149,6 +152,8 @@ impl AcpAgent {
             .kill_on_drop(true);
         #[cfg(unix)]
         c.process_group(0);
+        #[cfg(windows)]
+        c.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
         let mut child = c.spawn().map_err(|e| AcpError::Spawn(launch.command.clone(), e))?;
         let stdin = child.stdin.take().ok_or(AcpError::Gone)?;
         let stdout = child.stdout.take().ok_or(AcpError::Gone)?;
@@ -209,6 +214,12 @@ impl AcpAgent {
         #[cfg(unix)]
         if let Some(pid) = child.id() {
             let _ = std::process::Command::new("kill").args(["-KILL", &format!("-{pid}")])
+                .stdout(Stdio::null()).stderr(Stdio::null()).status();
+        }
+        #[cfg(windows)]
+        if let Some(pid) = child.id() {
+            use std::os::windows::process::CommandExt;
+            let _ = std::process::Command::new("taskkill").args(["/T", "/F", "/PID", &pid.to_string()]).creation_flags(0x0800_0000)
                 .stdout(Stdio::null()).stderr(Stdio::null()).status();
         }
         let _ = child.start_kill();

@@ -29,7 +29,7 @@ pub fn install_crypto() {
 // ---------------------------------------------------------------- proxy
 
 /// The proxy to use for HTTPS, as a URL (`http://host:port` or `socks5://host:port`):
-/// environment first, then the macOS system setting (`scutil --proxy`).
+/// environment first, then the system setting (macOS `scutil --proxy`, Windows Internet Options).
 pub fn proxy_url() -> Option<String> {
     for k in ["HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy"] {
         if let Ok(v) = std::env::var(k) && !v.trim().is_empty() {
@@ -45,9 +45,35 @@ fn system_proxy() -> Option<String> {
     parse_scutil(&String::from_utf8_lossy(&out.stdout))
 }
 
-#[cfg(not(target_os = "macos"))]
+/// Windows: the "Internet Options" proxy (what Clash and most VPN apps set).
+#[cfg(windows)]
+fn system_proxy() -> Option<String> {
+    use std::os::windows::process::CommandExt;
+    let out = std::process::Command::new("reg")
+        .args(["query", r"HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings"])
+        .creation_flags(0x0800_0000).output().ok()?;
+    parse_reg(&String::from_utf8_lossy(&out.stdout))
+}
+
+#[cfg(not(any(target_os = "macos", windows)))]
 fn system_proxy() -> Option<String> {
     None
+}
+
+/// `ProxyEnable REG_DWORD 0x1` + `ProxyServer REG_SZ host:port` (or `http=..;https=..`).
+#[cfg_attr(not(windows), allow(dead_code))]
+fn parse_reg(text: &str) -> Option<String> {
+    let get = |k: &str| text.lines().find_map(|l| {
+        let mut w = l.split_whitespace();
+        (w.next()? == k).then(|| w.nth(1).map(str::to_owned)).flatten()
+    });
+    if get("ProxyEnable").as_deref() != Some("0x1") { return None; }
+    let server = get("ProxyServer")?;
+    let pick = server.split(';').find_map(|p| p.strip_prefix("https=")).or_else(|| server.split(';').find_map(|p| p.strip_prefix("http=")))
+        .or_else(|| server.split(';').find_map(|p| p.strip_prefix("socks=").map(|_| p)))
+        .unwrap_or(&server);
+    if let Some(sock) = pick.strip_prefix("socks=") { return Some(format!("socks5://{sock}")); }
+    Some(if pick.contains("://") { pick.to_owned() } else { format!("http://{pick}") })
 }
 
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
@@ -555,6 +581,14 @@ mod tests {
         assert!(parts.iter().all(|p| p.chars().count() <= 2000));
         assert_eq!(parts.concat(), long);
         assert_eq!(chunk("a\nb"), ["a\nb"]);
+    }
+
+    #[test]
+    fn reg_parsing() {
+        let t = "    ProxyEnable    REG_DWORD    0x1\n    ProxyServer    REG_SZ    127.0.0.1:7890\n";
+        assert_eq!(parse_reg(t).as_deref(), Some("http://127.0.0.1:7890"));
+        assert_eq!(parse_reg(&t.replace("0x1", "0x0")), None);
+        assert_eq!(parse_reg("ProxyEnable REG_DWORD 0x1\nProxyServer REG_SZ http=a:1;https=b:2\n").as_deref(), Some("http://b:2"));
     }
 
     #[test]

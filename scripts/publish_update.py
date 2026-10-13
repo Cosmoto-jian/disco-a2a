@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Publish an auto-update: sign the CI-built .app.tar.gz and commit updates/latest.json.
+"""Publish an auto-update: sign the CI-built macOS .app.tar.gz and Windows NSIS
+installer, and write updates/latest.json.
 
 Usage (from disco/, with GitHub credentials injected):
     python3 scripts/publish_update.py 0.4.0 "release notes"
@@ -28,24 +29,24 @@ def gh(path, accept="application/vnd.github+json", out=None):
 def main():
     ver, notes = sys.argv[1], (sys.argv[2] if len(sys.argv) > 2 else "")
     rel = gh(f"/releases/tags/v{ver}")
-    name = f"Disco_{ver}_universal.app.tar.gz"
-    asset = next((a for a in rel["assets"] if a["name"] == name), None)
-    if not asset:
-        sys.exit(f"release v{ver} has no {name} yet (CI still running?)")
+    wanted = {"mac": f"Disco_{ver}_universal.app.tar.gz", "win": f"Disco_{ver}_x64-setup.exe"}
+    signed = {}
     with tempfile.TemporaryDirectory() as d:
-        path = os.path.join(d, name)
-        gh(f"/releases/assets/{asset['id']}", "application/octet-stream", out=path)
-        subprocess.run(["npx", "-y", "@tauri-apps/cli@2", "signer", "sign", "-f", KEY, "-p", "", path],
-                       check=True, capture_output=True)
-        sig = open(path + ".sig").read().strip()
-    url = asset["browser_download_url"]
-    platform = {"signature": sig, "url": url}
+        for key, name in wanted.items():
+            asset = next((a for a in rel["assets"] if a["name"] == name), None)
+            if not asset:
+                sys.exit(f"release v{ver} has no {name} yet (CI still running?)")
+            path = os.path.join(d, name)
+            gh(f"/releases/assets/{asset['id']}", "application/octet-stream", out=path)
+            subprocess.run(["npx", "-y", "@tauri-apps/cli@2", "signer", "sign", "-f", KEY, "-p", "", path],
+                           check=True, capture_output=True)
+            signed[key] = {"signature": open(path + ".sig").read().strip(), "url": asset["browser_download_url"]}
     manifest = {
         "version": ver,
         "notes": notes,
         # RFC 3339, which the Tauri updater requires.
         "pub_date": subprocess.run(["date", "-u", "+%Y-%m-%dT%H:%M:%SZ"], capture_output=True, text=True).stdout.strip(),
-        "platforms": {"darwin-aarch64": platform, "darwin-x86_64": platform},
+        "platforms": {"darwin-aarch64": signed["mac"], "darwin-x86_64": signed["mac"], "windows-x86_64": signed["win"]},
     }
     os.makedirs(os.path.join(ROOT, "updates"), exist_ok=True)
     with open(os.path.join(ROOT, "updates", "latest.json"), "w") as f:

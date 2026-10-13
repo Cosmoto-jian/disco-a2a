@@ -1,0 +1,47 @@
+name: windows-app
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Attach the installer to this release tag (e.g. v1.2.0); empty = build only"
+        required: false
+permissions:
+  contents: write
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ inputs.release_tag }}
+  cancel-in-progress: true
+jobs:
+  bundle:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with: { components: clippy }
+      - uses: Swatinem/rust-cache@v2
+        with: { key: windows }
+      - uses: arduino/setup-protoc@v3
+        with: { repo-token: "${{ secrets.GITHUB_TOKEN }}" }
+      - name: clippy (Windows code paths)
+        run: cargo clippy -p disco-app -p disco-acp -p disco-discord -- -D warnings
+      - name: tauri-cli
+        run: cargo install tauri-cli --version "^2" --locked
+      - name: build NSIS installer
+        working-directory: crates/disco-app
+        run: cargo tauri build --bundles nsis
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Disco-Windows-x64
+          path: target/release/bundle/nsis/*-setup.exe
+          if-no-files-found: error
+      - name: publish to GitHub release
+        if: startsWith(github.ref, 'refs/tags/v') || inputs.release_tag != ''
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.release_tag || github.ref_name }}
+        run: |
+          gh release view "$TAG" >/dev/null 2>&1 || gh release create "$TAG" --prerelease --generate-notes --title "Disco $TAG"
+          # The installer doubles as the updater payload; signed offline by scripts/publish_update.py.
+          gh release upload "$TAG" target/release/bundle/nsis/*-setup.exe --clobber

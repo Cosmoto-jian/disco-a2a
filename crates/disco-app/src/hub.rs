@@ -128,7 +128,8 @@ impl Hub {
                 if !spec.conda.is_empty() {
                     let prefix = PathBuf::from(&spec.conda);
                     if !prefix.join("conda-meta").is_dir() { return Err(format!("conda 环境不存在：{}", spec.conda)); }
-                    path = format!("{}:{path}", prefix.join("bin").display());
+                    let bins = if cfg!(windows) { vec![prefix.clone(), prefix.join("Scripts"), prefix.join("Library").join("bin")] } else { vec![prefix.join("bin")] };
+                    path = join_path(bins.iter().map(|b| b.to_string_lossy().into_owned()).chain(std::iter::once(path)));
                     let name = if prefix.parent().and_then(|d| d.file_name()).is_some_and(|n| n == "envs") {
                         prefix.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()
                     } else { "base".into() };
@@ -136,7 +137,7 @@ impl Hub {
                 }
                 env.push(("PATH".into(), path.clone()));
                 let command = which(&spec.command, &path).ok_or_else(|| match spec.command.as_str() {
-                    "npx" | "node" => "找不到 npx：请先安装 Node.js（https://nodejs.org 或 brew install node），然后重启 Disco".to_owned(),
+                    "npx" | "node" => "找不到 npx：请先安装 Node.js（https://nodejs.org），然后重启 Disco".to_owned(),
                     c => format!("找不到命令 {c}：请先安装它，或在终端确认 `which {c}` 有输出"),
                 })?;
                 let mut args = spec.args;
@@ -276,7 +277,7 @@ impl Hub {
 /// `name` at `<repo>/.disco-worktrees/<name>` on branch `disco/<name>`.
 fn ensure_worktree(dir: &std::path::Path, name: &str, path: &str) -> Option<PathBuf> {
     let git = |args: &[&str], cwd: &std::path::Path| {
-        std::process::Command::new("git").args(args).current_dir(cwd).env("PATH", path)
+        quiet_cmd("git").args(args).current_dir(cwd).env("PATH", path)
             .stdin(std::process::Stdio::null()).stderr(std::process::Stdio::null()).output().ok()
             .filter(|o| o.status.success())
     };
@@ -300,13 +301,37 @@ fn ensure_worktree(dir: &std::path::Path, name: &str, path: &str) -> Option<Path
 }
 
 pub fn dirs_home() -> PathBuf {
-    std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(std::env::temp_dir)
+    std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")).map(PathBuf::from).unwrap_or_else(std::env::temp_dir)
+}
+
+/// PATH list separator of this OS.
+pub const PATH_SEP: char = if cfg!(windows) { ';' } else { ':' };
+
+fn join_path(parts: impl Iterator<Item = String>) -> String {
+    let mut out: Vec<String> = Vec::new();
+    for p in parts.flat_map(|p| p.split(PATH_SEP).map(str::to_owned).collect::<Vec<_>>()) {
+        if !p.is_empty() && !out.contains(&p) { out.push(p); }
+    }
+    out.join(&PATH_SEP.to_string())
+}
+
+/// Windows: a GUI app's PATH is already the user's PATH; add where npm, volta,
+/// scoop and bun put their shims.
+#[cfg(windows)]
+fn login_path() -> String {
+    let env = |k: &str| std::env::var(k).unwrap_or_default();
+    let home = dirs_home();
+    let extra = [format!("{}\\npm", env("APPDATA")), format!("{}\\Volta\\bin", env("LOCALAPPDATA")), format!("{}\\nodejs", env("ProgramFiles")),
+        home.join("scoop\\shims").to_string_lossy().into_owned(), home.join(".bun\\bin").to_string_lossy().into_owned(), home.join(".cargo\\bin").to_string_lossy().into_owned(),
+        home.join(".local\\bin").to_string_lossy().into_owned()];
+    join_path(std::iter::once(env("PATH")).chain(extra))
 }
 
 /// The PATH the user's terminal would have. GUI apps start with a bare PATH, and
 /// Node from nvm/volta/fnm usually lives in ~/.zshrc, so ask an interactive login
 /// shell (bounded to 4 s in case an rc file waits for input) and add the usual
 /// install locations as a fallback.
+#[cfg(not(windows))]
 fn login_path() -> String {
     const MARK: &str = "__DISCO_PATH__";
     let base = std::env::var("PATH").unwrap_or_default();
@@ -331,15 +356,23 @@ fn login_path() -> String {
         v.sort();
         if let Some(latest) = v.last() { extra.push(latest.join("bin").to_string_lossy().into_owned()); }
     }
-    let mut parts: Vec<&str> = Vec::new();
-    for p in from_shell.split(':').chain(["/opt/homebrew/bin", "/usr/local/bin"]).chain(extra.iter().map(String::as_str)).chain(base.split(':')) {
-        if !p.is_empty() && !parts.contains(&p) { parts.push(p); }
-    }
-    parts.join(":")
+    join_path(std::iter::once(from_shell).chain(["/opt/homebrew/bin".into(), "/usr/local/bin".into()]).chain(extra).chain(std::iter::once(base)))
 }
 
 /// Full path of `cmd` on `path`, if it is there.
+/// On Windows `npx` is `npx.cmd`, so the usual executable extensions are tried too.
 pub fn which(cmd: &str, path: &str) -> Option<PathBuf> {
-    if cmd.contains('/') { return Some(PathBuf::from(cmd)).filter(|p| p.is_file()); }
-    path.split(':').map(|d| PathBuf::from(d).join(cmd)).find(|p| p.is_file())
+    let exts: &[&str] = if cfg!(windows) { &["", ".exe", ".cmd", ".bat", ".com"] } else { &[""] };
+    let with_ext = |p: PathBuf| exts.iter().map(|e| PathBuf::from(format!("{}{e}", p.display()))).find(|p| p.is_file());
+    if cmd.contains('/') || cmd.contains('\\') { return with_ext(PathBuf::from(cmd)); }
+    path.split(PATH_SEP).filter(|d| !d.is_empty()).find_map(|d| with_ext(PathBuf::from(d).join(cmd)))
+}
+
+/// A command that never flashes a console window on Windows.
+pub fn quiet_cmd(program: impl AsRef<std::ffi::OsStr>) -> std::process::Command {
+    #[allow(unused_mut)]
+    let mut c = std::process::Command::new(program);
+    #[cfg(windows)]
+    { use std::os::windows::process::CommandExt; c.creation_flags(0x0800_0000); }
+    c
 }

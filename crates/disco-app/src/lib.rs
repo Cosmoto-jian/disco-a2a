@@ -66,8 +66,7 @@ fn keychain(account: &str) -> Option<keyring::Entry> {
 fn with_vault<R>(f: impl FnOnce(&mut std::collections::HashMap<String, String>) -> R) -> R {
     let mut guard = VAULT.lock().unwrap_or_else(|p| p.into_inner());
     let map = guard.get_or_insert_with(|| {
-        let mut m: std::collections::HashMap<String, String> = keychain(VAULT_ACCOUNT)
-            .and_then(|e| e.get_password().ok())
+        let mut m: std::collections::HashMap<String, String> = vault_read()
             .and_then(|j| serde_json::from_str(&j).ok())
             .unwrap_or_default();
         // One-time move of the bot token from the per-item layout used before v0.4.1.
@@ -82,8 +81,44 @@ fn with_vault<R>(f: impl FnOnce(&mut std::collections::HashMap<String, String>) 
 }
 
 fn persist_vault(m: &std::collections::HashMap<String, String>) -> CmdResult<()> {
-    let json = serde_json::to_string(m).map_err(err)?;
-    keychain(VAULT_ACCOUNT).ok_or("钥匙串不可用")?.set_password(&json).map_err(|e| format!("写入钥匙串失败：{e}"))
+    vault_write(&serde_json::to_string(m).map_err(err)?)
+}
+
+#[cfg(not(windows))]
+fn vault_read() -> Option<String> { keychain(VAULT_ACCOUNT)?.get_password().ok() }
+
+#[cfg(not(windows))]
+fn vault_write(json: &str) -> CmdResult<()> {
+    keychain(VAULT_ACCOUNT).ok_or("钥匙串不可用")?.set_password(json).map_err(|e| format!("写入钥匙串失败：{e}"))
+}
+
+// Windows Credential Manager caps one credential at 2560 bytes, so the vault is
+// stored in pieces: `vault`, `vault.1`, `vault.2`, … (no per-item prompts there).
+#[cfg(windows)]
+const VAULT_PIECE: usize = 1000;
+
+#[cfg(windows)]
+fn vault_read() -> Option<String> {
+    let mut out = keychain(VAULT_ACCOUNT)?.get_password().ok()?;
+    for i in 1.. {
+        match keychain(&format!("{VAULT_ACCOUNT}.{i}")).and_then(|e| e.get_password().ok()) { Some(p) => out.push_str(&p), None => break }
+    }
+    Some(out)
+}
+
+#[cfg(windows)]
+fn vault_write(json: &str) -> CmdResult<()> {
+    let chars: Vec<char> = json.chars().collect();
+    let pieces: Vec<String> = chars.chunks(VAULT_PIECE).map(|c| c.iter().collect()).collect();
+    for (i, p) in pieces.iter().enumerate() {
+        let acct = if i == 0 { VAULT_ACCOUNT.to_owned() } else { format!("{VAULT_ACCOUNT}.{i}") };
+        keychain(&acct).ok_or("凭据管理器不可用")?.set_password(p).map_err(|e| format!("写入 Windows 凭据管理器失败：{e}"))?;
+    }
+    for i in pieces.len().max(1).. {
+        let Some(e) = keychain(&format!("{VAULT_ACCOUNT}.{i}")) else { break };
+        if e.delete_credential().is_err() { break; }
+    }
+    Ok(())
 }
 
 fn secret_get(account: &str) -> Option<String> {
@@ -522,17 +557,47 @@ fn conda_envs() -> Vec<templates::CondaEnv> {
     templates::conda_envs(&hub::dirs_home())
 }
 
-/// Native folder (or, with `file`, file) picker via AppleScript, so no extra plugin. None if cancelled.
+/// Native folder (or, with `file`, file) picker: AppleScript on macOS, Windows
+/// Forms through PowerShell on Windows, so no extra plugin. None if cancelled.
 #[tauri::command]
 async fn choose_path(file: Option<bool>) -> Option<String> {
-    let script = if file == Some(true) { "POSIX path of (choose file with prompt \"选择 agent 程序\")" } else { "POSIX path of (choose folder with prompt \"选择 agent 的工作目录\")" };
+    let file = file == Some(true);
     tauri::async_runtime::spawn_blocking(move || {
-        let out = std::process::Command::new("osascript")
-            .args(["-e", script])
-            .output().ok()?;
-        let p = String::from_utf8(out.stdout).ok()?.trim().trim_end_matches('/').to_owned();
+        #[cfg(windows)]
+        let out = {
+            let dialog = if file { "$d=New-Object System.Windows.Forms.OpenFileDialog; $d.Title='选择 agent 程序'; if($d.ShowDialog() -eq 'OK'){[Console]::Out.Write($d.FileName)}" }
+                else { "$d=New-Object System.Windows.Forms.FolderBrowserDialog; $d.Description='选择 agent 的工作目录'; if($d.ShowDialog() -eq 'OK'){[Console]::Out.Write($d.SelectedPath)}" };
+            hub::quiet_cmd("powershell").args(["-NoProfile", "-STA", "-Command", &format!("[Console]::OutputEncoding=[Text.Encoding]::UTF8; Add-Type -AssemblyName System.Windows.Forms; {dialog}")]).output().ok()?
+        };
+        #[cfg(not(windows))]
+        let out = {
+            let script = if file { "POSIX path of (choose file with prompt \"选择 agent 程序\")" } else { "POSIX path of (choose folder with prompt \"选择 agent 的工作目录\")" };
+            std::process::Command::new("osascript").args(["-e", script]).output().ok()?
+        };
+        let p = String::from_utf8(out.stdout).ok()?.trim().trim_end_matches(['/', '\\']).to_owned();
         (out.status.success() && !p.is_empty()).then_some(p)
     }).await.ok().flatten()
+}
+
+/// Show `path` selected in Finder / Explorer.
+fn reveal(path: &std::path::Path) -> CmdResult<()> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        std::process::Command::new("explorer").raw_arg(format!("/select,\"{}\"", path.display())).spawn().map_err(err)?;
+    }
+    #[cfg(not(windows))]
+    std::process::Command::new("/usr/bin/open").arg("-R").arg(path).spawn().map_err(err)?;
+    Ok(())
+}
+
+/// Open a web page in the default browser.
+fn open_in_browser(url: &str) -> CmdResult<()> {
+    #[cfg(windows)]
+    std::process::Command::new("explorer").arg(url).spawn().map_err(err)?;
+    #[cfg(not(windows))]
+    std::process::Command::new("/usr/bin/open").arg(url).spawn().map_err(err)?;
+    Ok(())
 }
 
 #[tauri::command]
@@ -893,8 +958,7 @@ fn doc_save(core: St<'_>, thread: String, content: String) -> CmdResult<()> {
 fn reveal_doc(core: St<'_>, thread: String) -> CmdResult<()> {
     let path = mcp::doc_path(&core, &thread);
     if !path.exists() { mcp::write_doc(&path, "")?; }
-    std::process::Command::new("/usr/bin/open").arg("-R").arg(&path).spawn().map_err(err)?;
-    Ok(())
+    reveal(&path)
 }
 
 /// Show a file Disco keeps (a received or shared file) in Finder. Only paths inside
@@ -906,17 +970,15 @@ fn reveal_path(core: St<'_>, path: String) -> CmdResult<()> {
     if p.components().any(|c| matches!(c, std::path::Component::ParentDir)) || !p.starts_with(&base) || !p.exists() {
         return Err("这个文件不在 Disco 的数据目录里，或已被删除".into());
     }
-    std::process::Command::new("/usr/bin/open").arg("-R").arg(&p).spawn().map_err(err)?;
-    Ok(())
+    reveal(&p)
 }
 
 #[tauri::command]
 fn open_url(url: String) -> CmdResult<()> {
-    if !(url.starts_with("https://discord.com/") || url.starts_with("https://github.com/Cosmoto-jian/")) {
+    if !(url.starts_with("https://discord.com/") || url.starts_with("https://github.com/Cosmoto-jian/") || url.starts_with("https://tailscale.com/")) {
         return Err("不允许打开该链接".into());
     }
-    std::process::Command::new("/usr/bin/open").arg(&url).spawn().map_err(err)?;
-    Ok(())
+    open_in_browser(&url)
 }
 
 #[derive(Serialize)]
@@ -931,7 +993,7 @@ async fn diagnose(core: St<'_>) -> CmdResult<Vec<Check>> {
         out.push(Check { name: name.into(), ok, detail });
     };
     add("网络代理", Ok(disco_discord::proxy_url().map_or("未检测到，直连".into(), |p| format!("使用系统代理 {p}"))));
-    add("macOS 钥匙串", with_vault(|m| persist_vault(m)).map(|_| "可读写（所有密钥存在一条钥匙串项里）".into()));
+    add(if cfg!(windows) { "Windows 凭据管理器" } else { "macOS 钥匙串" }, with_vault(|m| persist_vault(m)).map(|_| "可读写（所有密钥存在一条钥匙串项里）".into()));
     let token = secret_get(DISCORD_KEY);
     add("Discord Bot token", token.as_ref().map(|_| "已保存".into()).ok_or("还没保存，或钥匙串拒绝访问".into()));
     if let Some(token) = token {
