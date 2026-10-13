@@ -30,11 +30,69 @@ function colorOf(name) {
   const a = S.ov?.agents.find((a) => a.name === name);
   return BRAND[a?.template] ?? COLORS[hash(name) % COLORS.length];
 }
-function avatar(name, { group = false, small = false, live = false } = {}) {
-  const el = h("div", { class: `av${small ? " sm" : ""}${group ? " group" : ""}` }, group ? "#" : [...name][0].toUpperCase());
-  if (!group) el.style.background = colorOf(name);
+// ---------- avatars: small geometric creatures, white shapes on a two-tone gradient.
+// Stored per agent as "<form>.<palette>"; empty = form from the name, palette from the brand.
+const PALETTES = { brand: null, ember: ["#ff8a4c", "#e5484d"], sea: ["#22d3ee", "#3b82f6"], moss: ["#34d399", "#0f9f6e"], dusk: ["#a78bfa", "#6d28d9"],
+  candy: ["#f472b6", "#a855f7"], sun: ["#fbbf24", "#f97316"], ink: ["#475569", "#0f172a"], mint: ["#5eead4", "#0d9488"], rose: ["#fda4af", "#e11d48"] };
+const PAD = '<circle cx="20" cy="20" r="15" fill="none"/>';
+const FORMS = {
+  orbit: { label: "轨道", svg: `<circle cx="20" cy="20" r="7"/><g class="spin">${PAD}<circle cx="20" cy="7.5" r="3" opacity=".9"/></g><circle cx="20" cy="20" r="12.5" fill="none" stroke="#fff" stroke-opacity=".28" stroke-width="1.2"/>` },
+  bloom: { label: "花瓣", svg: `<g class="spin slow">${PAD}` + [0, 60, 120].map((d) => `<ellipse cx="20" cy="20" rx="4.6" ry="13" opacity=".5" transform="rotate(${d} 20 20)"/>`).join("") + '</g><circle cx="20" cy="20" r="3.4"/>' },
+  ripple: { label: "涟漪", svg: [0, 1, 2].map((i) => `<circle class="ring" style="animation-delay:${-i}s" cx="20" cy="20" r="12" fill="none" stroke="#fff" stroke-width="2"/>`).join("") + '<circle cx="20" cy="20" r="4"/>' },
+  prism: { label: "棱镜", svg: `<g class="spin slow">${PAD}<path d="M20 7 31.3 26.5H8.7Z" opacity=".55"/></g><g class="spin rev">${PAD}<path d="M20 33 8.7 13.5H31.3Z" opacity=".55"/></g>` },
+  dots: { label: "星点", svg: [8, 20, 32].flatMap((y, r) => [8, 20, 32].map((x, c) => `<circle class="tw" style="animation-delay:${-((r * 3 + c) * 0.37) % 2.2}s" cx="${x}" cy="${y}" r="3.2"/>`)).join("") },
+  wave: { label: "声波", svg: [9, 16, 23, 30].map((x, i) => `<rect class="bar" style="animation-delay:${-i * 0.28}s" x="${x - 2}" y="9" width="4" height="22" rx="2"/>`).join("") },
+  duo: { label: "双子", svg: '<circle class="drift" cx="15" cy="20" r="8" opacity=".7"/><circle class="drift rev" cx="25" cy="20" r="8" opacity=".7"/>' },
+  tile: { label: "方块", svg: `<g class="spin slow">${PAD}<rect x="10" y="10" width="20" height="20" rx="4" opacity=".45"/></g><g class="spin rev">${PAD}<rect x="13.5" y="13.5" width="13" height="13" rx="3" transform="rotate(45 20 20)"/></g>` },
+  letter: { label: "字母", svg: null },
+};
+const FORM_KEYS = Object.keys(FORMS);
+function avatarSpec(name) {
+  const a = S.ov?.agents.find((a) => a.name === name);
+  const [f, p] = (a?.avatar || "").split(".");
+  return { form: FORMS[f] ? f : FORM_KEYS[hash(name) % (FORM_KEYS.length - 1)], palette: p in PALETTES ? p : "brand" };
+}
+function paint(el, name, form, palette, base = colorOf(name)) {
+  const [c1, c2] = PALETTES[palette] ?? [`color-mix(in srgb, ${base} 70%, #fff)`, base];
+  el.style.background = `linear-gradient(140deg, ${c1}, ${c2})`;
+  const f = FORMS[form];
+  if (f?.svg) el.insertAdjacentHTML("afterbegin", `<svg viewBox="0 0 40 40" fill="#fff" aria-hidden="true">${f.svg}</svg>`);
+  else el.prepend([...name][0].toUpperCase());
+  el.dataset.form = form;
+  return el;
+}
+function avatar(name, { group = false, small = false, live = false, spec } = {}) {
+  const el = h("div", { class: `av${small ? " sm" : ""}${group ? " group" : ""}${live ? " live" : ""}` }, group ? "#" : null);
+  if (!group) { const sp = spec ?? avatarSpec(name); paint(el, name, sp.form, sp.palette, sp.base); }
   if (live) el.append(h("i", { class: "dot" }));
   return el;
+}
+// Form × palette picker; calls onPick("form.palette") on every change.
+function avatarPicker(name, value, onPick) {
+  const st = { ...value }, base = value.base ?? colorOf(name);
+  const forms = h("div", { class: "avp-forms" }), cols = h("div", { class: "avp-cols" });
+  const draw = () => {
+    forms.replaceChildren(...FORM_KEYS.map((f) => h("button", { type: "button", class: "avp" + (st.form === f ? " on" : ""), title: FORMS[f].label,
+      onclick: () => { st.form = f; draw(); onPick(`${st.form}.${st.palette}`); } }, avatar(name, { spec: { form: f, palette: st.palette, base } }), h("small", {}, FORMS[f].label))));
+    cols.replaceChildren(...Object.keys(PALETTES).map((p) => {
+      const sw = h("button", { type: "button", class: "sw" + (st.palette === p ? " on" : ""), title: p === "brand" ? "默认配色" : p,
+        onclick: () => { st.palette = p; draw(); onPick(`${st.form}.${st.palette}`); } });
+      const [c1, c2] = PALETTES[p] ?? [`color-mix(in srgb, ${base} 70%, #fff)`, base];
+      sw.style.background = `linear-gradient(140deg, ${c1}, ${c2})`;
+      return sw;
+    }));
+  };
+  draw();
+  return h("div", { class: "avpick" }, forms, cols);
+}
+function avatarDialog(name) {
+  let pick = null;
+  const cur = avatarSpec(name);
+  const preview = h("div", { class: "avp-hero" }, avatar(name, { spec: cur }));
+  const picker = avatarPicker(name, cur, (v) => { pick = v; const [form, palette] = v.split("."); preview.replaceChildren(avatar(name, { spec: { form, palette } })); });
+  dialog([h("h3", {}, `${name} 的形象`), preview, picker], "保存", async () => {
+    if (pick) { await invoke("set_avatar", { name, avatar: pick }); await load(); if (S.thread === `dm:${name}`) { S.thread = null; openThread(`dm:${name}`); } }
+  });
 }
 function when(ts) {
   if (!ts) return "";
@@ -162,7 +220,7 @@ async function openThread(t) {
   const sub = isGroup ? `${g.members.length} 个 agent · 组长 ${g.lead ?? "—"}${g.id.startsWith("local-") ? "" : " · Discord 同步"}` : peer ? `${peer.guest} 通过共享在用你的 ${peer.agent}` : a ? `${a.kind === "acp" ? "本机" : "A2A"} · ${a.detail}` : "";
   const pane = $("#pane");
   pane.replaceChildren(
-    h("div", { class: "head", "data-tauri-drag-region": true }, avatar(name, { group: isGroup }),
+    h("div", { class: "head", "data-tauri-drag-region": true }, a ? Object.assign(avatar(name, { live: a.live }), { title: "更换形象", onclick: () => avatarDialog(name), className: `av pickable${a.live ? " live" : ""}` }) : avatar(name, { group: isGroup }),
       h("div", {}, h("h2", { title: a ? "双击重命名" : "", ondblclick: a ? (e) => inlineRename(e.currentTarget, a.name) : null }, name), h("small", {}, sub)), h("span", { class: "sp" }),
       a && a.kind === "acp" ? h("div", { id: "cfgs" }) : null,
       !peer ? h("button", { class: "btn space-btn", title: "待办和群文档（agent 也能读写）", onclick: () => toggleSpace(t) }, "待办 · 文档", h("span", { class: "count", id: "todo-count" })) : null,
@@ -337,6 +395,7 @@ function popover(anchor, items) {
 function agentMenu(anchor, name) {
   const local = S.ov.agents.find((a) => a.name === name)?.kind === "acp";
   popover(anchor, [
+    { label: "更换形象…", run: () => avatarDialog(name) },
     ...(local ? [{ label: "共享给朋友…", run: () => shareDialog(name) }] : []),
     { label: "重命名", run: async () => {
       if (S.thread !== `dm:${name}`) { setTab("chats"); await openThread(`dm:${name}`); }
@@ -617,7 +676,9 @@ function agentForm(t) {
   const st = { cwd: "", conda: "", count: 1 };
   const err = h("div", { class: "err" });
   const name = h("input", { class: "fld", value: t.kind === "acp" ? t.id : "", placeholder: "名称，如 coder", spellcheck: false });
-  const parts = [h("div", { class: "frow" }, h("span", {}, "名称"), name)];
+  let look = null;
+  const parts = [h("div", { class: "frow" }, h("span", {}, "名称"), name),
+    h("div", { class: "frow top" }, h("span", {}, "形象"), avatarPicker(t.letter ?? t.name, { form: FORM_KEYS[hash(t.id) % (FORM_KEYS.length - 1)], palette: "brand", base: t.color }, (v) => { look = v; }))];
   let cmd, url, hn, hv;
   if (t.kind === "command") {
     cmd = h("input", { class: "fld", placeholder: "/path/to/agent --acp", spellcheck: false });
@@ -652,8 +713,9 @@ function agentForm(t) {
   go.onclick = async () => {
     go.disabled = true; err.textContent = "";
     try {
-      await invoke("add_agent", { spec: { template: t.id, name: name.value, url: url?.value ?? null, headerName: hn?.value || null, headerValue: hv?.value || null,
+      const added = await invoke("add_agent", { spec: { template: t.id, name: name.value, url: url?.value ?? null, headerName: hn?.value || null, headerValue: hv?.value || null,
         command: cmd?.value ?? null, cwd: st.cwd || null, count: st.count, worktree: st.count > 1, conda: st.conda || null } });
+      if (look) for (const n of added) await invoke("set_avatar", { name: n, avatar: look }).catch(() => {});
       await load(); setTab("chats"); openThread(`dm:${name.value.trim()}`);
     } catch (e) { err.textContent = String(e); go.disabled = false; }
   };

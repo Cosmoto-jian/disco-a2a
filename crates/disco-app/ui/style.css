@@ -51,6 +51,41 @@ body.paused #kill { color:#fff; background:var(--red); }
 .av { width:38px; height:38px; flex:none; border-radius:10px; display:grid; place-items:center; color:#fff; font-weight:700; font-size:15px; position:relative; }
 .av.sm { width:30px; height:30px; font-size:12px; border-radius:8px; }
 .av.group { background:var(--hover) !important; color:var(--fg); }
+/* geometric avatars: slow idle motion, quicker while the agent is working */
+.av { --sp:1; overflow:visible; box-shadow:inset 0 0 0 1px rgba(255,255,255,.12); }
+.av svg { width:78%; height:78%; overflow:visible; fill:#fff; stroke:none; }
+.av.live { --sp:.45; }
+.av .spin, .av .ring, .av .tw, .av .bar, .av .drift { transform-box:fill-box; transform-origin:center; }
+.av .spin { animation:av-spin calc(7s * var(--sp)) linear infinite; }
+.av .spin.slow { animation-duration:calc(16s * var(--sp)); }
+.av .spin.rev { animation-direction:reverse; animation-duration:calc(11s * var(--sp)); }
+.av .ring { animation:av-ring calc(3s * var(--sp)) ease-out infinite; }
+.av .tw { animation:av-tw calc(2.2s * var(--sp)) ease-in-out infinite; }
+.av .bar { animation:av-bar calc(1.4s * var(--sp)) ease-in-out infinite; }
+.av .drift { animation:av-drift calc(4s * var(--sp)) ease-in-out infinite; }
+.av .drift.rev { animation-direction:reverse; }
+@keyframes av-spin { to { transform:rotate(360deg); } }
+@keyframes av-ring { from { transform:scale(.35); opacity:.9; } to { transform:scale(1.15); opacity:0; } }
+@keyframes av-tw { 0%, 100% { transform:scale(.55); opacity:.45; } 50% { transform:scale(1); opacity:1; } }
+@keyframes av-bar { 0%, 100% { transform:scaleY(.35); } 50% { transform:scaleY(1); } }
+@keyframes av-drift { 0%, 100% { transform:translate(0, 0); } 50% { transform:translate(5px, 0); } }
+@media (prefers-reduced-motion: reduce) { .av svg * { animation:none !important; } }
+.av.pickable { cursor:pointer; transition:transform .2s var(--spring); }
+.av.pickable:hover { transform:scale(1.06); }
+.frow.top { align-items:flex-start; }
+.avpick { display:flex; flex-direction:column; gap:10px; min-width:0; }
+.avp-forms { display:grid; grid-template-columns:repeat(auto-fill, minmax(52px, 1fr)); gap:6px; }
+.avp { border:0; background:none; padding:6px 2px 4px; border-radius:10px; display:flex; flex-direction:column; align-items:center; gap:4px; color:var(--mute); cursor:pointer; transition:background .15s, color .15s; }
+.avp:hover { background:var(--hover); }
+.avp.on { background:var(--hover); color:var(--fg); box-shadow:inset 0 0 0 1.5px var(--acc); }
+.avp small { font-size:11px; }
+.avp .av { width:34px; height:34px; border-radius:10px; font-size:14px; }
+.avp-cols { display:flex; flex-wrap:wrap; gap:8px; }
+.sw { width:22px; height:22px; border-radius:50%; border:0; padding:0; cursor:pointer; box-shadow:0 0 0 2px var(--main), 0 0 0 3px transparent; transition:transform .15s var(--spring), box-shadow .15s; }
+.sw:hover { transform:scale(1.12); }
+.sw.on { box-shadow:0 0 0 2px var(--main), 0 0 0 4px var(--acc); }
+.avp-hero { display:grid; place-items:center; padding:6px 0 4px; }
+.avp-hero .av { width:72px; height:72px; border-radius:20px; font-size:28px; }
 .av .dot { position:absolute; right:-2px; bottom:-2px; width:10px; height:10px; border-radius:50%; background:var(--green); border:2px solid var(--list); }
 
 /* main */
@@ -382,4 +417,4 @@ dialog[open]::backdrop { animation:fade .2s var(--ease); }
 .fld.rules { flex:1; height:auto; min-height:52px; border:1px solid var(--line); border-radius:8px; padding:6px 10px; background:var(--list); color:var(--fg); font:12px/1.5 ui-monospace, Menlo, monospace; resize:vertical; }
 .fld.t { flex:none; min-width:0; width:auto; height:30px; border:1px solid var(--line); border-radius:8px; padding:0 8px; background:var(--list); color:var(--fg); font:inherit; }
 input[type=number].fld.t { width:64px; }
-@media (prefers-reduced-motion: reduce) { 
+@media (prefers-reduced-motion: reduce) { .avp:focus, .sw:focus { outline:none; }

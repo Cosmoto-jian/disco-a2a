@@ -36,6 +36,8 @@ const SET_ALLOW: &str = "discord_allow";
 const SET_HOME_GUILD: &str = "home_guild";
 /// `agent_channel/<agent>` -> Discord channel id of that agent's 1:1 channel.
 const SET_AGENT_CH: &str = "agent_channel/";
+/// Chosen avatar (`<form>.<palette>`, see ui/app.js); empty = generated from the name.
+const SET_AVATAR: &str = "avatar/";
 const AGENT_CATEGORY: &str = "Disco Agents";
 const GROUP_CATEGORY: &str = "Disco 群聊";
 /// Memory notes live in settings as `mem/<scope>/<millis>`; scope is `all` or an agent name.
@@ -499,7 +501,7 @@ struct TypingEvt { thread: String, agent: String, on: bool }
 // ------------------------------------------------------------------ commands
 
 #[derive(Serialize)]
-struct AgentView { name: String, kind: String, template: String, detail: String, live: bool }
+struct AgentView { name: String, kind: String, template: String, detail: String, live: bool, avatar: String }
 #[derive(Serialize)]
 struct GroupView { id: String, name: String, guild_id: String, lead: Option<String>, members: Vec<String> }
 #[derive(Serialize)]
@@ -533,7 +535,8 @@ async fn overview(core: St<'_>) -> CmdResult<Overview> {
                 .unwrap_or_else(|| a.endpoint.clone())
         } else if spec.description.is_empty() { a.endpoint.clone() } else { spec.description };
         let template = if a.transport == "a2a" { "a2a".into() } else { spec.template };
-        agents.push(AgentView { live: core.hub.is_live(&a.name).await, name: a.name, kind: a.transport, template, detail });
+        let avatar = core.db().setting(&format!("{SET_AVATAR}{}", a.name)).unwrap_or_default();
+        agents.push(AgentView { live: core.hub.is_live(&a.name).await, name: a.name, kind: a.transport, template, detail, avatar });
     }
     let peers = core.shares().into_iter().map(|(id, s)| PeerView { thread: format!("peer:{id}"), guest: s.guest, agent: s.agent }).collect();
     Ok(Overview {
@@ -735,6 +738,7 @@ async fn remove_agent(core: St<'_>, name: String, purge: Option<bool>) -> CmdRes
     if let Some(c) = row.credential_ref { secret_del(&c); }
     core.db().delete_agent(&name, purge.unwrap_or(false)).map_err(err)?;
     core.shares_follow(&name, None);
+    let _ = core.db().set_setting(&format!("{SET_AVATAR}{name}"), "");
     let _ = core.db().audit("user", Some(&name), "remove_agent", "ok");
     if let Some(ch) = core.agent_channel(&name) {
         let _ = core.db().set_setting(&format!("{SET_AGENT_CH}{name}"), "");
@@ -742,6 +746,16 @@ async fn remove_agent(core: St<'_>, name: String, purge: Option<bool>) -> CmdRes
         if let Some(d) = core.discord_rest() { let _ = d.delete_channel(&ch).await; }
     }
     Ok(())
+}
+
+/// Pick an agent's avatar (`<form>.<palette>`, both short ASCII words; "" = automatic).
+#[tauri::command]
+fn set_avatar(core: St<'_>, name: String, avatar: String) -> CmdResult<()> {
+    core.agent(&name)?;
+    if avatar.len() > 32 || !avatar.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-') {
+        return Err("无效的形象".into());
+    }
+    core.db().set_setting(&format!("{SET_AVATAR}{name}"), &avatar).map_err(err)
 }
 
 /// Rename an agent: history, groups, memories and its Discord channel follow it.
@@ -763,6 +777,10 @@ async fn rename_agent(core: St<'_>, name: String, new_name: String) -> CmdResult
     }
     core.db().rename_agent(&name, &new).map_err(err)?;
     core.memory_rename(&name, &new);
+    if let Some(av) = core.db().setting(&format!("{SET_AVATAR}{name}")).filter(|v| !v.is_empty()) {
+        core.db().set_setting(&format!("{SET_AVATAR}{name}"), "").map_err(err)?;
+        core.db().set_setting(&format!("{SET_AVATAR}{new}"), &av).map_err(err)?;
+    }
     if let Some(ch) = core.agent_channel(&name) {
         core.db().set_setting(&format!("{SET_AGENT_CH}{name}"), "").map_err(err)?;
         core.db().set_setting(&format!("{SET_AGENT_CH}{new}"), &ch).map_err(err)?;
@@ -1206,7 +1224,7 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
-            overview, detect_agents, conda_envs, choose_path, memories, forget, add_agent, remove_agent, rename_agent, stop_reply, messages, send, inbox, inbox_answer, net_policy, net_policy_set, send_file, team_state, team_files, agent_configs, set_agent_config,
+            overview, detect_agents, conda_envs, choose_path, memories, forget, add_agent, remove_agent, rename_agent, set_avatar, stop_reply, messages, send, inbox, inbox_answer, net_policy, net_policy_set, send_file, team_state, team_files, agent_configs, set_agent_config,
             stop_all, resume, save_discord_token, discord_connect, discord_settings, discord_sync, diagnose, open_url, reveal_path, discord_channels, save_group, delete_group,
             check_update, install_update, space, todo_new, todo_set, todo_remove, doc_save, reveal_doc, share::share_status, share::create_share, share::share_invite, share::revoke_share, share::accept_invite
         ])
