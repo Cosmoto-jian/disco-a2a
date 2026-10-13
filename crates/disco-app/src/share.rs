@@ -239,8 +239,9 @@ async fn card(State(core): State<Arc<Core>>, axum::extract::Path(id): axum::extr
     axum::Json(card).into_response()
 }
 
-fn owner_name() -> String {
-    std::env::var("USER").ok().filter(|s| !s.is_empty()).unwrap_or_else(|| "friend".into())
+/// The person using this computer, as others see them.
+pub(crate) fn owner_name() -> String {
+    std::env::var(if cfg!(windows) { "USERNAME" } else { "USER" }).ok().filter(|s| !s.is_empty()).unwrap_or_else(|| "friend".into())
 }
 
 struct PeerExec(Arc<Core>);

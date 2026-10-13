@@ -123,6 +123,11 @@ fn vault_write(json: &str) -> CmdResult<()> {
     Ok(())
 }
 
+/// A webhook this Disco created (its agents speaking), by webhook id.
+fn own_webhook(id: &str) -> bool {
+    with_vault(|m| m.iter().any(|(k, v)| k.starts_with("webhook/") && v.split('\n').next() == Some(id)))
+}
+
 fn secret_get(account: &str) -> Option<String> {
     with_vault(|m| m.get(account).cloned())
 }
@@ -165,6 +170,12 @@ pub struct Core {
     seen: Mutex<HashMap<String, i64>>,
     /// Everything waiting on the user (see inbox.rs).
     inbox: Arc<inbox::Inbox>,
+    /// Recent hand-offs from other Discos' agents, per channel (see `foreign_turn_ok`).
+    foreign: Mutex<HashMap<String, Vec<i64>>>,
+    /// Discord display name -> user id of people seen in group channels (for real @pings).
+    people: Mutex<HashMap<String, String>>,
+    /// Warnings already shown once (`group|name`).
+    warned: Mutex<std::collections::HashSet<String>>,
     /// Team runs per group (see team.rs).
     teams: team::Teams,
     /// The Tailscale share server (see share.rs).
@@ -214,7 +225,7 @@ impl Core {
         }
         let row = self.agent(agent)?;
         // Memory goes only to agents running on this Mac, never to a remote one.
-        let first = row.transport == "acp" && self.primed.lock().unwrap_or_else(|p| p.into_inner()).insert(format!("{agent}|{context}"));
+        let first = row.transport == "acp" && self.memory_on(context) && self.primed.lock().unwrap_or_else(|p| p.into_inner()).insert(format!("{agent}|{context}"));
         let with_mem;
         let prompt = if first { with_mem = format!("{}{prompt}", self.memory_preamble(agent, context)); with_mem.as_str() } else { prompt };
         // Team members work behind the scenes: no bubbles, only the activity strip
@@ -246,8 +257,9 @@ impl Core {
         res
     }
 
-    /// Save every `【记住】` line of an agent's answer to its memory.
-    fn remember_from(&self, agent: &str, answer: &str) {
+    /// Save every `【记住】` line of an agent's answer to its memory (unless the chat has memory off).
+    fn remember_from(&self, agent: &str, thread: &str, answer: &str) {
+        if !self.memory_on(thread) { return; }
         for l in answer.lines().filter_map(|l| l.trim().strip_prefix(MEM_TAG)) {
             self.remember(agent, l);
         }
@@ -259,6 +271,10 @@ impl Core {
         let Some(rest) = ["记住：", "记住:", "记住", "/remember ", "/记住 "].iter().find_map(|p| t.strip_prefix(p)) else { return false };
         let rest = rest.trim();
         if rest.is_empty() { return false; }
+        if !self.memory_on(thread) {
+            self.post_message(thread, "system", "这个对话的记忆已关闭，没有保存。打开顶部的「记忆」开关后再说一次。");
+            return true;
+        }
         self.remember(scope, rest);
         self.post_message(thread, "system", &format!("已记住{}：{rest}", if scope == "all" { "（所有 agent）" } else if scope.starts_with("group-") { "（本群）" } else { "" }));
         true
@@ -279,7 +295,7 @@ impl Core {
         match self.turn(&thread, &agent, &thread, &text).await {
             Ok(answer) => {
                 let answer = answer.trim();
-                self.remember_from(&agent, answer);
+                self.remember_from(&agent, &thread, answer);
                 self.post_message(&thread, &agent, answer);
                 if let Some((d, ch)) = &mirror && let Some(hook) = secret_get(&format!("webhook/{ch}"))
                     && let Err(e) = d.post_as(&hook, &agent, None, answer).await
@@ -297,11 +313,21 @@ impl Core {
         tauri::async_runtime::spawn(async move {
             let Ok(rows) = core.db().list_agents() else { return };
             let groups = core.db().list_groups().unwrap_or_default();
+            // Agents just added are also self-checked: a start-up failure shows in their chat now,
+            // with a hint, instead of on the first message.
+            let check = only.is_some();
             let runs = rows.into_iter().filter(|r| only.as_ref().is_none_or(|o| o.contains(&r.name))).map(|r| {
                 let core = core.clone();
                 let ctxs: Vec<String> = std::iter::once(format!("dm:{}", r.name))
                     .chain(groups.iter().filter(|g| g.members.contains(&r.name)).map(|g| format!("group:{}", g.id))).collect();
-                async move { for c in ctxs { core.hub.warm(&r, &secret_get, &c).await; } }
+                async move {
+                    for c in ctxs {
+                        if let Err(e) = core.hub.warm(&r, &secret_get, &c).await {
+                            if check { core.post_message(&format!("dm:{}", r.name), "system", &fail_line(&r.name, &e)); }
+                            break;
+                        }
+                    }
+                }
             });
             futures::future::join_all(runs).await;
         });
@@ -309,6 +335,39 @@ impl Core {
 
     fn agent_channel(&self, agent: &str) -> Option<String> {
         self.db().setting(&format!("{SET_AGENT_CH}{agent}"))
+    }
+
+    /// Who wrote a Discord message, as Disco records it, and its text; None to ignore it.
+    /// - A group channel is the group: anyone who can post there takes part (Discord's
+    ///   channel permissions decide who), and approvals still only reach this Disco's owner.
+    /// - An agent's own channel stays limited to the owner and the allow list.
+    /// - Webhooks are other Discos' agents (ours are skipped); a bot account is another
+    ///   Disco relaying its owner's words as `**Name**：text`.
+    fn speaker(&self, m: &Incoming, group: Option<&GroupRow>, agent_channel: bool) -> Option<(String, String)> {
+        if let Some(hook) = &m.webhook_id {
+            let g = group?;
+            if own_webhook(hook) { return None; }
+            if g.members.contains(&m.author) && self.warned.lock().unwrap_or_else(|p| p.into_inner()).insert(format!("{}|{}", g.id, m.author)) {
+                self.post_message(&format!("group:{}", g.id), "system", &format!("频道里另一个 Disco 也有叫 {} 的 agent，@{} 会同时叫到两边。建议其中一方改名。", m.author, m.author));
+            }
+            return Some((m.author.clone(), m.content.clone()));
+        }
+        if m.bot {
+            group?;
+            let relayed = m.content.strip_prefix("**").and_then(|r| r.split_once("**："));
+            return Some(match relayed {
+                Some((name, text)) if !name.is_empty() => (format!("{name}{HUMAN_TAG}"), text.to_owned()),
+                _ => (format!("{}{HUMAN_TAG}", m.author), m.content.clone()),
+            });
+        }
+        let is_owner = self.owners.lock().unwrap_or_else(|p| p.into_inner()).contains(&m.author_id);
+        if !is_owner && !(group.is_some() && !agent_channel) && !self.allowed(&m.author_id) {
+            let _ = self.db().audit(&format!("discord:{}", m.author_id), None, "discord.ignored", "sender not allowed");
+            return None;
+        }
+        self.people.lock().unwrap_or_else(|p| p.into_inner()).insert(m.author.clone(), m.author_id.clone());
+        // The tag keeps a Discord display name from passing for the owner ("me") or an agent.
+        Some((if is_owner { "me".into() } else { format!("{}{HUMAN_TAG}", m.author) }, m.content.clone()))
     }
 
     fn allowed(&self, discord_user: &str) -> bool {
@@ -344,6 +403,8 @@ impl Core {
     async fn on_discord_connected(&self) {
         let Some(rest) = self.discord_rest() else { return };
         if let Ok(ids) = rest.owner_ids().await {
+            // Agents address the owner by their computer name: make that a real ping too.
+            if let Some(id) = ids.first() { self.people.lock().unwrap_or_else(|p| p.into_inner()).insert(share::owner_name(), id.clone()); }
             *self.owners.lock().unwrap_or_else(|p| p.into_inner()) = ids;
         }
         let has_home = self.db().setting(SET_HOME_GUILD).is_some();
@@ -355,58 +416,86 @@ impl Core {
         }
     }
 
-    /// Group routing: @mentioned members answer, otherwise the lead does.
-    /// An answer that @mentions another member hands off to it, in waves (see MAX_WAVES / MAX_TURNS).
+    /// Group routing. The rules (one line each, see `group_help`):
+    /// - an @mentioned agent of this Disco answers at once (several: concurrently);
+    /// - a message that @s only people wakes no agent;
+    /// - no @ at all: the lead answers while the owner is the only person in the group,
+    ///   nobody once other people (or other people's agents) take part;
+    /// - every agent answer starts with @ whoever it answers; an @agent in it hands off
+    ///   (bounded by MAX_WAVES / MAX_TURNS), an @person ends the chain.
+    ///
+    /// Agents of other Discos in the same Discord channel answer through their own Disco.
     async fn group(&self, channel: String, author: String, text: String, from_discord: bool) {
         let Some(g) = self.db().list_groups().ok().and_then(|gs| gs.into_iter().find(|g| g.id == channel)) else { return };
         let thread = format!("group:{channel}");
+        let owner = author == "me";
         // A member agent posting through its Disco tools: only the members it @s answer.
         let by_agent = g.members.contains(&author);
+        let human = is_human(&author);
         self.post_message(&thread, &author, &text);
-        if !by_agent && self.user_remember(&thread, &format!("group-{channel}"), &text) { return; }
+        if owner && self.user_remember(&thread, &format!("group-{channel}"), &text) { return; }
         if !from_discord && !channel.starts_with("local-") && let Some(d) = self.discord_rest() {
             let hook = if by_agent { g.webhook_ref.as_deref().and_then(secret_get) } else { None };
-            let (ch, author, text) = (channel.clone(), author.clone(), text.clone());
+            let shown = if owner { share::owner_name() } else { author.clone() };
+            let (ch, body) = (channel.clone(), self.with_pings(&text));
             tauri::async_runtime::spawn(async move {
                 let _ = match hook {
-                    Some(h) => d.post_as(&h, &author, None, &text).await,
-                    None => d.post(&ch, &format!("**{author}**：{text}")).await,
+                    Some(h) => d.post_as(&h, &shown, None, &body).await,
+                    None => d.post(&ch, &format!("**{shown}**：{body}")).await,
                 };
             });
         }
-        if !by_agent && let Some(task) = team::command(&text) {
+        if owner && let Some(task) = team::command(&text) {
             self.team(&g, task).await;
             return;
         }
-        let mut wave = mentions(&text, &g.members, by_agent.then_some(author.as_str()));
-        if wave.is_empty() && !by_agent && let Some(lead) = g.lead_agent.clone().or_else(|| g.members.first().cloned()) {
-            wave.push(lead);
+        if human && self.group_command(&g, &thread, &text).await { return; }
+        let roster = self.roster(&g, &thread);
+        let multi = roster.multi();
+        let mut wave: Vec<(String, String)> = mentions(&text, &g.members, by_agent.then_some(author.as_str()))
+            .into_iter().map(|a| (a, author.clone())).collect();
+        if wave.is_empty() && human && !multi && let Some(lead) = g.lead_agent.clone().or_else(|| g.members.first().cloned()) {
+            wave.push((lead, author.clone()));
         }
-        // Agents addressed together run concurrently; their @handoffs form the next
-        // wave. Bounded by MAX_WAVES and MAX_TURNS so agents can't ping-pong forever.
+        // Another Disco's agent handing off to ours: rate-limited per channel, so two
+        // Discos can never ping-pong forever.
+        if !human && !by_agent && !wave.is_empty() && !self.foreign_turn_ok(&channel) {
+            self.post_message(&thread, "system", "其他 Disco 的 agent 在这个群里触发得太频繁，暂停自动接力 10 分钟；有人 @ 时照常回答。");
+            return;
+        }
+        let text = &text;
         let (mut waves, mut turns) = (0, 0);
         while !wave.is_empty() && waves < MAX_WAVES && !self.paused.load(Ordering::Relaxed) {
             waves += 1;
             wave.truncate(MAX_TURNS.saturating_sub(turns));
             turns += wave.len();
-            let runs = wave.iter().map(|agent| {
-                let prompt = self.group_prompt(&g, &thread, agent);
+            let runs = wave.iter().map(|(agent, by)| {
                 let thread = &thread;
                 let g = &g;
+                let roster = &roster;
+                let first = waves == 1;
                 async move {
+                    // `@agent /command` from a person runs that agent's own command.
+                    let slash = if first && human { slash_for(text, agent) } else { None };
+                    if let Some(cmd) = &slash && !owner && restricted(cmd) {
+                        self.post_message(thread, "system", &format!("{cmd} 会改变 {agent} 的状态，只有它的主人能用。"));
+                        return Vec::new();
+                    }
+                    let prompt = slash.unwrap_or_else(|| self.group_prompt(g, thread, agent, by, roster));
                     match self.turn(thread, agent, thread, &prompt).await {
                         Ok(answer) => {
-                            let answer = answer.trim().to_owned();
+                            let answer = answer.trim();
                             if answer.is_empty() { return Vec::new(); }
-                            self.remember_from(agent, &answer);
+                            let answer = if multi { lead_mention(answer, &display(by)) } else { answer.to_owned() };
+                            self.remember_from(agent, thread, &answer);
                             // Post as soon as this agent finishes, not when the wave does.
                             self.post_message(thread, agent, &answer);
                             if let (Some(d), Some(hook)) = (self.discord_rest(), g.webhook_ref.as_deref().and_then(secret_get))
-                                && let Err(e) = d.post_as(&hook, agent, None, &answer).await
+                                && let Err(e) = d.post_as(&hook, agent, None, &self.with_pings(&answer)).await
                             {
                                 self.post_message(thread, "system", &format!("Discord 发送失败：{e}"));
                             }
-                            mentions(&answer, &g.members, Some(agent))
+                            mentions(&answer, &g.members, Some(agent)).into_iter().map(|m| (m, agent.clone())).collect()
                         }
                         Err(e) => {
                             self.post_message(thread, "system", &fail_line(agent, &e));
@@ -415,35 +504,99 @@ impl Core {
                     }
                 }
             });
-            let mut next: Vec<String> = Vec::new();
+            let mut next: Vec<(String, String)> = Vec::new();
             for m in futures::future::join_all(runs).await.into_iter().flatten() {
-                if !next.contains(&m) { next.push(m); }
+                if !next.iter().any(|(a, _)| *a == m.0) { next.push(m); }
             }
             wave = next;
         }
     }
 
-    fn group_prompt(&self, g: &GroupRow, thread: &str, me: &str) -> String {
+    /// `/stop` and `/help`, typed by a person in a group. True if handled.
+    async fn group_command(&self, g: &GroupRow, thread: &str, text: &str) -> bool {
+        match text.trim() {
+            "/stop" | "/停止" => {
+                let mut n = 0;
+                for m in &g.members { if self.hub.cancel(m, thread).await { n += 1; } }
+                self.post_message(thread, "system", &if n > 0 { format!("已停止 {n} 个 agent 的回复") } else { "现在没有 agent 在回复".into() });
+                true
+            }
+            "/help" | "/帮助" => {
+                let help = group_help();
+                self.post_message(thread, "system", help);
+                if !g.id.starts_with("local-") && let Some(d) = self.discord_rest() {
+                    let ch = g.id.clone();
+                    tauri::async_runtime::spawn(async move { let _ = d.post(&ch, help).await; });
+                }
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Who besides the owner and this Disco's agents has spoken in the group lately.
+    fn roster(&self, g: &GroupRow, thread: &str) -> Roster {
+        let mut r = Roster::default();
+        for m in self.db().messages(thread, 100).unwrap_or_default() {
+            let a = m.author;
+            if a == "me" || a == "system" || g.members.contains(&a) { continue; }
+            let list = if a.ends_with(HUMAN_TAG) { &mut r.people } else { &mut r.agents };
+            let name = display(&a);
+            if !list.contains(&name) { list.push(name); }
+        }
+        r
+    }
+
+    /// At most FOREIGN_TURNS agent hand-offs from other Discos per channel per 10 minutes.
+    fn foreign_turn_ok(&self, channel: &str) -> bool {
+        let now = now();
+        let mut f = self.foreign.lock().unwrap_or_else(|p| p.into_inner());
+        let v = f.entry(channel.to_owned()).or_default();
+        v.retain(|t| now - t < 600);
+        if v.len() >= FOREIGN_TURNS { return false; }
+        v.push(now);
+        true
+    }
+
+    /// `@Name` of people we know on Discord written as `<@id>`, so Discord notifies them.
+    fn with_pings(&self, text: &str) -> String {
+        let ids = self.people.lock().unwrap_or_else(|p| p.into_inner()).clone();
+        let mut out = text.to_owned();
+        for (name, id) in ids {
+            out = replace_mention(&out, &name, &format!("<@{id}>"));
+        }
+        out
+    }
+
+    fn group_prompt(&self, g: &GroupRow, thread: &str, me: &str, by: &str, roster: &Roster) -> String {
         let history = self.db().messages(thread, TRANSCRIPT).unwrap_or_default();
         let key = format!("{me}|{thread}");
         let last = self.seen.lock().unwrap_or_else(|p| p.into_inner()).get(&key).copied();
         if let Some(newest) = history.last() {
             self.seen.lock().unwrap_or_else(|p| p.into_inner()).insert(key, newest.id);
         }
+        let owner = share::owner_name();
         let mut p = match last {
-            None => format!(
-                "你是 {me}，正在群聊「{}」里和其他 agent 及人类协作。成员：{}。\n\
-                 需要别人接手时，在回复里写 @名字。只输出你要发到群里的那段话，不要复述聊天记录。\n\n最近的聊天记录：\n",
-                g.name,
-                g.members.join("、")
-            ),
+            None => {
+                let mut people = vec![format!("{owner}（群主）")];
+                people.extend(roster.people.iter().cloned());
+                let mut agents: Vec<String> = g.members.iter().filter(|m| *m != me).cloned().collect();
+                agents.extend(roster.agents.iter().map(|a| format!("{a}（其他人的）")));
+                format!(
+                    "你是 {me}，正在群聊「{}」里和人类及其他 agent 协作。\n人类：{}。\nagent：{}。\n\
+                     群规：只在被 @ 时发言；回复第一个字必须是 @对方（回答谁就 @谁）；需要别的 agent 接手就 @它的名字，它会被触发；\
+                     @人类只是通知，不会触发任何 agent。只输出你要发到群里的那段话，不要复述聊天记录。\n\n最近的聊天记录：\n",
+                    g.name, people.join("、"), if agents.is_empty() { "（只有你）".into() } else { agents.join("、") }
+                )
+            }
             // The session already holds everything up to `last`, including our own replies.
             Some(_) => String::from("群里的新消息：\n"),
         };
         for m in history.iter().filter(|m| last.is_none_or(|l| m.id > l) && m.author != me) {
-            let who = if m.author == "me" { "我（人类）" } else { m.author.as_str() };
+            let who = if m.author == "me" { format!("{owner}（人类）") } else if is_human(&m.author) { format!("{}（人类）", display(&m.author)) } else { m.author.clone() };
             p.push_str(&format!("[{who}] {}\n", m.body));
         }
+        p.push_str(&format!("\n（这次是 {} 叫你，回复以 @{} 开头。）\n", display(by), display(by)));
         p
     }
 
@@ -483,12 +636,100 @@ fn mentions(text: &str, members: &[String], me: Option<&str>) -> Vec<String> {
     hits.into_iter().map(|(_, m)| m.clone()).collect()
 }
 
+/// People who write from Discord are stored as `Name (Discord)`, so a display name
+/// can never pass for the owner (`me`) or an agent.
+pub(crate) const HUMAN_TAG: &str = " (Discord)";
+/// Hand-offs from other Discos' agents allowed per channel per 10 minutes.
+const FOREIGN_TURNS: usize = 6;
+/// Agent commands that change its state: only the agent's owner may run them from a group.
+const RESTRICTED: &[&str] = &["clear", "compact", "model", "config", "login", "logout", "permissions", "init", "mcp", "resume", "reset", "new", "exit"];
+
+fn is_human(author: &str) -> bool { author == "me" || author.ends_with(HUMAN_TAG) }
+
+/// The name people see: `me` is the owner, `Name (Discord)` is `Name`.
+fn display(author: &str) -> String {
+    if author == "me" { share::owner_name() } else { author.strip_suffix(HUMAN_TAG).unwrap_or(author).to_owned() }
+}
+
+/// Other people and other Discos' agents seen in a group.
+#[derive(Default)]
+struct Roster { people: Vec<String>, agents: Vec<String> }
+
+impl Roster {
+    fn multi(&self) -> bool { !self.people.is_empty() || !self.agents.is_empty() }
+}
+
+fn group_help() -> &'static str {
+    "群规：@agent 它立刻回答（可以同时 @ 几个）；只 @ 人时 agent 不插话；谁都没 @ 时，只有群主一个人的群由组长回答，多人群里 agent 不插话。\n\
+     agent 的每条回复都以 @对方 开头；它 @ 另一个 agent 就是交接。\n\
+     命令：@agent /命令 运行它自己的命令（清空、换模型等只有主人能用）；/stop 停止所有回复；/team 任务 分工协作（群主）；/help 看这段说明。"
+}
+
+/// The command line after `@agent` when the text is `@agent /command …`.
+fn slash_for(text: &str, agent: &str) -> Option<String> {
+    let lower = text.to_lowercase();
+    let needle = format!("@{}", agent.to_lowercase());
+    let i = lower.find(&needle)? + needle.len();
+    // Lower-casing can change byte lengths outside ASCII: then no match rather than a bad slice.
+    let rest = if lower.len() == text.len() { text.get(i..)? } else { return None }.trim_start();
+    rest.starts_with('/').then(|| rest.lines().next().unwrap_or(rest).trim().to_owned())
+}
+
+fn restricted(cmd: &str) -> bool {
+    let name = cmd.trim_start_matches('/').split_whitespace().next().unwrap_or_default().to_lowercase();
+    RESTRICTED.contains(&name.as_str())
+}
+
+/// Make sure an agent's group answer starts by addressing someone.
+fn lead_mention(answer: &str, to: &str) -> String {
+    if answer.starts_with('@') { answer.to_owned() } else { format!("@{to} {answer}") }
+}
+
+/// Replace whole-word `@name` (case-insensitive) with `with`.
+fn replace_mention(text: &str, name: &str, with: &str) -> String {
+    let needle = format!("@{}", name.to_lowercase());
+    let lower = text.to_lowercase();
+    if lower.len() != text.len() || name.is_empty() { return text.to_owned(); }
+    let is_name_char = |c: char| c.is_alphanumeric() || c == '-' || c == '_';
+    let (mut out, mut last) = (String::new(), 0);
+    for (i, _) in lower.match_indices(&needle) {
+        let end = i + needle.len();
+        if i < last || text[end..].chars().next().is_some_and(is_name_char) { continue; }
+        out.push_str(&text[last..i]);
+        out.push_str(with);
+        last = end;
+    }
+    out.push_str(&text[last..]);
+    out
+}
+
 /// Errors starting with this are notices, not failures ("sent, no reply yet").
 pub(crate) const QUIET: &str = "⏳";
 
-/// The system line for a failed turn.
+/// The system line for a failed turn, with a one-line fix for errors we recognise.
 pub(crate) fn fail_line(agent: &str, e: &str) -> String {
-    match e.strip_prefix(QUIET) { Some(n) => format!("{agent} {n}"), None => format!("{agent} 出错：{e}") }
+    match e.strip_prefix(QUIET) {
+        Some(n) => format!("{agent} {n}"),
+        None => match hint(e) { Some(h) => format!("{agent} 出错：{e}\n💡 {h}"), None => format!("{agent} 出错：{e}") },
+    }
+}
+
+/// Common start-up and auth failures, in plain words. First match wins.
+fn hint(e: &str) -> Option<&'static str> {
+    const HINTS: &[(&[&str], &str)] = &[
+        (&["native binary not found", "claude_code_executable"], if cfg!(windows) {
+            "需要原生版 Claude Code：在 PowerShell 运行 `irm https://claude.ai/install.ps1 | iex`，然后完全退出并重新打开 Disco"
+        } else {
+            "需要原生版 Claude Code：在终端运行 `curl -fsSL https://claude.ai/install.sh | bash`，然后完全退出并重新打开 Disco"
+        }),
+        (&["os error 193", "not a valid win32"], "Windows 无法直接运行这个命令：升级到最新版 Disco，或在添加 agent 时填 .cmd / .exe 的完整路径"),
+        (&["no llm provider", "api key", "api_key", "unauthorized", "401", "not logged in", "authentication"],
+            "这个 agent 还没登录或缺少 API Key：先在终端里运行一次它完成登录（如 `claude` 后输入 /login），再完全退出并重新打开 Disco"),
+        (&["timed out", "timeout", "超时"], "agent 太久没有回应：点停止后再发一遍，或到设置里一键诊断"),
+        (&["进程已退出"], "agent 进程退出了，下一条消息会自动重新启动它"),
+    ];
+    let low = e.to_lowercase();
+    HINTS.iter().find(|(keys, _)| keys.iter().any(|k| low.contains(k))).map(|(_, h)| *h)
 }
 
 fn now() -> i64 {
@@ -507,7 +748,7 @@ struct TypingEvt { thread: String, agent: String, on: bool }
 #[derive(Serialize)]
 struct AgentView { name: String, kind: String, template: String, detail: String, live: bool, avatar: String }
 #[derive(Serialize)]
-struct GroupView { id: String, name: String, guild_id: String, lead: Option<String>, members: Vec<String> }
+struct GroupView { id: String, name: String, guild_id: String, lead: Option<String>, members: Vec<String>, people: Vec<String>, guests: Vec<String> }
 #[derive(Serialize)]
 struct Head { thread: String, author: String, body: String, ts: i64 }
 #[derive(Serialize)]
@@ -521,6 +762,8 @@ struct Overview {
     discord_token: bool,
     discord_status: String,
     paused: bool,
+    /// Chats with memory switched off.
+    memory_off: Vec<String>,
 }
 
 #[tauri::command]
@@ -546,11 +789,16 @@ async fn overview(core: St<'_>) -> CmdResult<Overview> {
     Ok(Overview {
         peers,
         agents,
-        groups: groups.into_iter().map(|g| GroupView { id: g.id, name: g.name, guild_id: g.guild_id, lead: g.lead_agent, members: g.members }).collect(),
+        groups: groups.into_iter().map(|g| {
+            let r = core.roster(&g, &format!("group:{}", g.id));
+            GroupView { id: g.id, name: g.name, guild_id: g.guild_id, lead: g.lead_agent, members: g.members, people: r.people, guests: r.agents }
+        }).collect(),
         heads: heads.into_iter().map(|(t, m)| Head { thread: t, author: m.author, body: m.body, ts: m.ts }).collect(),
         discord_token: core.db().setting(SET_TOKEN_SAVED).is_some(),
         discord_status: core.discord_status.lock().unwrap_or_else(|p| p.into_inner()).clone(),
         paused: core.paused.load(Ordering::Relaxed),
+        memory_off: core.db().settings_with_prefix(memory::MEM_OFF).unwrap_or_default().into_iter()
+            .filter(|(_, v)| v == "1").map(|(k, _)| k).collect(),
     })
 }
 
@@ -1107,11 +1355,43 @@ async fn save_group(core: St<'_>, channel_id: Option<String>, guild_id: Option<S
     Ok(channel_id)
 }
 
+/// Delete a group. Its history and webhook stay, so `restore_group` can undo it.
 #[tauri::command]
 fn delete_group(core: St<'_>, id: String) -> CmdResult<()> {
-    secret_del(&format!("webhook/{id}"));
-    core.db().delete_group(&id).map_err(err)?;
+    core.db().delete_group(&id).map_err(err).map(|_| ())
+}
+
+/// Undo `delete_group` (the UI offers it for a few seconds).
+#[tauri::command]
+fn restore_group(core: St<'_>, id: String, guild_id: String, name: String, members: Vec<String>, lead: Option<String>) -> CmdResult<()> {
+    let hook = format!("webhook/{id}");
+    let webhook_ref = secret_get(&hook).is_some().then_some(hook);
+    core.db().upsert_group(&GroupRow { id, guild_id, name, lead_agent: lead, webhook_ref, members }).map_err(err)
+}
+
+/// Undo `forget` (the key carries scope, topic and text).
+#[tauri::command]
+fn memory_restore(core: St<'_>, key: String) -> CmdResult<()> {
+    let mut parts = key.splitn(3, '/');
+    let (Some(scope), Some(topic), Some(text)) = (parts.next(), parts.next(), parts.next()) else { return Err("bad key".into()) };
+    core.remember_topic(scope, Some(topic), text);
     Ok(())
+}
+
+/// The chat's memory switch: off = its sessions neither read nor write memory.
+#[tauri::command]
+fn set_memory(core: St<'_>, thread: String, on: bool) -> CmdResult<()> {
+    if memory::thread_of(&thread).as_deref() != Some(thread.as_str()) { return Err("未知会话".into()); }
+    core.db().set_setting(&format!("{}{thread}", memory::MEM_OFF), if on { "" } else { "1" }).map_err(err)?;
+    // Sessions primed before the switch keep what they were told; new ones follow the switch.
+    let _ = core.db().audit("me", None, "memory", &format!("{thread} {}", if on { "on" } else { "off" }));
+    Ok(())
+}
+
+/// Slash commands an agent offers (known once it has started a session).
+#[tauri::command]
+async fn agent_commands(core: St<'_>, agent: String) -> CmdResult<Vec<(String, String)>> {
+    Ok(core.hub.commands(&agent).await)
 }
 
 fn connect_discord(core: Arc<Core>) {
@@ -1143,22 +1423,15 @@ fn connect_discord(core: Arc<Core>) {
                 tauri::async_runtime::spawn(async move { c.inbox_press(&m.author_id, &m.author, press).await });
                 continue;
             }
-            // Only the bot's owner(s) and explicitly allowed users may drive agents:
-            // anyone else in the guild could otherwise run tools on this Mac.
-            if !core.allowed(&m.author_id) {
-                let _ = core.db().audit(&format!("discord:{}", m.author_id), None, "discord.ignored", "sender not allowed");
-                continue;
-            }
             let c = core.clone();
-            // The " (Discord)" suffix keeps a Discord display name from
-            // impersonating the local user ("me") or an agent.
-            let author = format!("{} (Discord)", m.author);
             let agent = c.db().settings_with_prefix(SET_AGENT_CH).unwrap_or_default().into_iter().find(|(_, ch)| *ch == m.channel_id).map(|(a, _)| a);
+            let group = c.db().list_groups().unwrap_or_default().into_iter().find(|g| g.id == m.channel_id);
+            let Some((author, content)) = c.speaker(&m, group.as_ref(), agent.is_some()) else { continue };
             // Each message runs on its own task so one slow agent never blocks others.
             tauri::async_runtime::spawn(async move {
                 match agent {
-                    Some(a) => c.dm(a, author, m.content, true).await,
-                    None => c.group(m.channel_id, author, m.content, true).await,
+                    Some(a) => c.dm(a, author, content, true).await,
+                    None => c.group(m.channel_id, author, content, true).await,
                 }
             });
         }
@@ -1211,6 +1484,9 @@ pub fn run() {
                 discord: Mutex::new(None),
                 discord_status: Mutex::new("未连接".into()),
                 owners: Mutex::default(),
+                foreign: Mutex::default(),
+                people: Mutex::default(),
+                warned: Mutex::default(),
                 paused: AtomicBool::new(false),
                 primed: Mutex::default(),
                 seen: Mutex::default(),
@@ -1241,7 +1517,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             overview, detect_agents, conda_envs, choose_path, memories, forget, add_agent, remove_agent, rename_agent, set_avatar, stop_reply, messages, send, inbox, inbox_answer, net_policy, net_policy_set, send_file, team_state, team_files, agent_configs, set_agent_config,
-            stop_all, resume, save_discord_token, discord_connect, discord_settings, discord_sync, diagnose, open_url, reveal_path, discord_channels, save_group, delete_group,
+            stop_all, resume, save_discord_token, discord_connect, discord_settings, discord_sync, diagnose, open_url, reveal_path, discord_channels, save_group, delete_group, restore_group, memory_restore, set_memory, agent_commands,
             check_update, install_update, space, todo_new, todo_set, todo_remove, doc_save, reveal_doc, share::share_status, share::create_share, share::share_invite, share::revoke_share, share::accept_invite
         ])
         .run(tauri::generate_context!())
@@ -1255,6 +1531,24 @@ mod tests {
     #[test]
     fn split_args_quotes() {
         assert_eq!(super::split_args(r#""/Applications/My Agent/bin/agent" --acp  'a b'"#), vec!["/Applications/My Agent/bin/agent", "--acp", "a b"]);
+    }
+
+    #[test]
+    fn group_rules_helpers() {
+        assert_eq!(super::slash_for("@coder /review src", "coder").as_deref(), Some("/review src"));
+        assert_eq!(super::slash_for("@coder 看下 /x", "coder"), None);
+        assert!(super::restricted("/model opus") && !super::restricted("/review"));
+        assert_eq!(super::lead_mention("好的", "amy"), "@amy 好的");
+        assert_eq!(super::lead_mention("@bob 你来", "amy"), "@bob 你来");
+        assert_eq!(super::replace_mention("@Amy hi @amyx @amy", "amy", "<@1>"), "<@1> hi @amyx <@1>");
+        assert!(super::is_human("me") && super::is_human("amy (Discord)") && !super::is_human("coder"));
+    }
+
+    #[test]
+    fn hints_for_known_errors() {
+        assert!(super::fail_line("c", "Claude native binary not found for win32-x64").contains("💡"));
+        assert!(super::fail_line("h", "No LLM provider configured").contains("登录"));
+        assert!(!super::fail_line("x", "something odd").contains("💡"));
     }
 
     #[test]

@@ -64,6 +64,9 @@ pub struct PermissionChoice {
     pub id: String,
     pub label: String,
     pub allow: bool,
+    /// "Always allow": the agent stops asking for this kind of action.
+    #[serde(default)]
+    pub always: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

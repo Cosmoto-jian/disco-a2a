@@ -93,9 +93,20 @@ impl Hub {
 
     /// Start an agent (and its session for `context`) in the background, so the
     /// first message doesn't wait for npx, process start-up and session creation.
-    pub async fn warm(&self, row: &AgentRow, secret: &CredLookup, context: &str) {
-        if let Ok(Runtime::Acp(a)) = self.runtime(row, secret).await {
+    /// Err when the agent cannot even start (the add-time self check uses this).
+    pub async fn warm(&self, row: &AgentRow, secret: &CredLookup, context: &str) -> Result<(), String> {
+        if let Runtime::Acp(a) = self.runtime(row, secret).await? {
             let _ = a.warm(context).await;
+        }
+        Ok(())
+    }
+
+    /// Slash commands a running agent advertises (empty when it isn't running).
+    pub async fn commands(&self, agent: &str) -> Vec<(String, String)> {
+        let cell = self.live.lock().await.get(agent).cloned();
+        match cell.as_ref().and_then(|c| c.get()) {
+            Some(Runtime::Acp(a)) => a.commands(),
+            _ => Vec::new(),
         }
     }
 

@@ -14,7 +14,7 @@ use tokio::sync::oneshot;
 use crate::Core;
 
 #[derive(Serialize, Clone)]
-pub struct Opt { pub id: String, pub label: String, pub allow: bool }
+pub struct Opt { pub id: String, pub label: String, pub allow: bool, #[serde(default)] pub always: bool }
 
 #[derive(Serialize, Clone)]
 pub struct Item {
@@ -93,7 +93,7 @@ impl Core {
         let item = Item {
             id: uuid::Uuid::new_v4().simple().to_string(), kind: "permission", thread: thread.into(), agent: agent.into(),
             title: if title.is_empty() { "工具调用".into() } else { title.into() },
-            options: options.iter().map(|o| Opt { id: o.id.clone(), label: o.label.clone(), allow: o.allow }).collect(),
+            options: options.iter().map(|o| Opt { id: o.id.clone(), label: o.label.clone(), allow: o.allow, always: o.always }).collect(),
             text: false, ts: crate::now(),
         };
         self.inbox_add(item, Reply::Permission { request_id: request_id.into() });
@@ -105,7 +105,7 @@ impl Core {
         let (tx, rx) = oneshot::channel();
         let item = Item {
             id: uuid::Uuid::new_v4().simple().to_string(), kind: "question", thread: thread.into(), agent: agent.into(), title: question.into(),
-            options: options.into_iter().enumerate().map(|(i, l)| Opt { id: i.to_string(), label: l, allow: false }).collect(),
+            options: options.into_iter().enumerate().map(|(i, l)| Opt { id: i.to_string(), label: l, allow: false, always: false }).collect(),
             text, ts: crate::now(),
         };
         self.inbox_add(item, Reply::Question(tx));

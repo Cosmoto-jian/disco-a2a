@@ -6,7 +6,8 @@ const $ = (s, r = document) => r.querySelector(s);
 // ---------- state
 // typing: thread -> Set(agent); live: "thread|agent" -> streaming bubble
 // msgs: thread -> cached messages, so switching chats renders instantly.
-const S = { tab: "chats", thread: null, ov: null, tpl: [], typing: {}, live: {}, inbox: [], team: {}, q: "", msgs: {}, found: null };
+// status: "thread|agent" -> { st: "think" | "tool", tool }; "wait" comes from the inbox.
+const S = { tab: "chats", thread: null, ov: null, tpl: [], typing: {}, live: {}, inbox: [], team: {}, q: "", msgs: {}, found: null, status: {}, cmds: {} };
 const REDUCED = matchMedia("(prefers-reduced-motion: reduce)").matches;
 const COLORS = ["#5865f2", "#d97757", "#10a37f", "#7c5cff", "#e5484d", "#3b82f6", "#f59e0b", "#14b8a6"];
 
@@ -58,11 +59,25 @@ function paint(el, name, form, palette, base = colorOf(name)) {
   el.dataset.form = form;
   return el;
 }
-function avatar(name, { group = false, small = false, live = false, spec } = {}) {
+function avatar(name, { group = false, small = false, live = false, spec, status } = {}) {
   const el = h("div", { class: `av${small ? " sm" : ""}${group ? " group" : ""}${live ? " live" : ""}` }, group ? "#" : null);
   if (!group) { const sp = spec ?? avatarSpec(name); paint(el, name, sp.form, sp.palette, sp.base); }
   if (live) el.append(h("i", { class: "dot" }));
+  if (status) { el.dataset.st = status.st; el.title = status.label; el.append(h("i", { class: "st" })); }
   return el;
+}
+// What an agent is doing in a thread right now: thinking, running a tool, or waiting on you.
+const ST_LABEL = { think: "思考中", tool: "调工具", wait: "等你确认" };
+function statusOf(thread, agent) {
+  if (S.inbox.some((it) => it.thread === thread && it.agent === agent)) return { st: "wait", label: `${agent} · 等你确认` };
+  const s = S.status[`${thread}|${agent}`];
+  return s ? { st: s.st, label: `${agent} · ${ST_LABEL[s.st]}${s.tool ? "：" + s.tool : ""}` } : null;
+}
+function setStatus(thread, agent, st, tool) {
+  const k = `${thread}|${agent}`;
+  if (st) S.status[k] = { st, tool }; else delete S.status[k];
+  if (S.thread === thread) { drawMembers(); syncComposer(); }
+  renderList();
 }
 // Form × palette picker; calls onPick("form.palette") on every change.
 function avatarPicker(name, value, onPick) {
@@ -188,11 +203,11 @@ function threadRow(t, head, fallback) {
   const live = !isGroup && S.ov.agents.find((a) => `dm:${a.name}` === t)?.live;
   const waiting = S.inbox.filter((it) => it.thread === t).length;
   return h("li", { class: S.thread === t ? "on" : "", onclick: () => openThread(t), onmouseenter: () => prefetch(t) },
-    avatar(name, { group: isGroup, live }),
+    avatar(name, { group: isGroup, live, status: isGroup ? null : statusOf(t, name) }),
     waiting ? h("i", { class: "badge row-badge", title: `${waiting} 项等你处理` }, String(waiting)) : null,
     h("div", { class: "meta" },
       h("div", { class: "row" }, h("span", { class: "name" }, name), h("span", { class: "time" }, when(head?.ts))),
-      h("div", { class: `sub${typing ? " typing" : ""}` }, typing ? `${typing} 正在输入…` : head ? `${isGroup && head.author !== "me" ? head.author + "：" : ""}${head.body}` : (fallback ?? "")),
+      h("div", { class: `sub${typing ? " typing" : ""}` }, typing ? `${typing} ${isGroup ? "正在回复" : ST_LABEL[S.status[`${t}|${name}`]?.st] ?? "正在输入"}…` : head ? `${isGroup && head.author !== "me" ? head.author + "：" : ""}${head.body}` : (fallback ?? "")),
     ));
 }
 
@@ -214,12 +229,15 @@ async function openThread(t) {
   const peer = peerOf(t);
   const g = isGroup && S.ov.groups.find((g) => `group:${g.id}` === t);
   const a = !isGroup && S.ov.agents.find((a) => a.name === name);
-  const sub = isGroup ? `${g.members.length} 个 agent · 组长 ${g.lead ?? "—"}${g.id.startsWith("local-") ? "" : " · Discord 同步"}` : peer ? `${peer.guest} 通过共享在用你的 ${peer.agent}` : a ? `${a.kind === "acp" ? "本机" : "A2A"} · ${a.detail}` : "";
+  const multi = isGroup && (g.people.length || g.guests.length);
+  const sub = isGroup ? `${g.members.length} 个 agent${multi ? ` · ${g.people.length + 1} 人 · 多人群：@ 才回答` : ` · 组长 ${g.lead ?? "—"}`}${g.id.startsWith("local-") ? "" : " · Discord 同步"}` : peer ? `${peer.guest} 通过共享在用你的 ${peer.agent}` : a ? `${a.kind === "acp" ? "本机" : "A2A"} · ${a.detail}` : "";
   const pane = $("#pane");
   pane.replaceChildren(
     h("div", { class: "head", "data-tauri-drag-region": true }, a ? Object.assign(avatar(name, { live: a.live }), { title: "更换形象", onclick: () => avatarDialog(name), className: `av pickable${a.live ? " live" : ""}` }) : avatar(name, { group: isGroup }),
       h("div", {}, h("h2", { title: a ? "双击重命名" : "", ondblclick: a ? (e) => inlineRename(e.currentTarget, a.name) : null }, name), h("small", {}, sub)), h("span", { class: "sp" }),
+      isGroup ? h("div", { id: "members" }) : null,
       a && a.kind === "acp" ? h("div", { id: "cfgs" }) : null,
+      !peer ? memorySwitch(t) : null,
       !peer ? h("button", { class: "btn space-btn", title: "待办和群文档（agent 也能读写）", onclick: () => toggleSpace(t) }, "待办 · 文档", h("span", { class: "count", id: "todo-count" })) : null,
       isGroup ? h("button", { class: "btn", title: "让成员分工并行处理一个任务，最后由组长汇总", onclick: () => { const i = $("#input"); if (!i.value.startsWith("/team ")) i.value = `/team ${i.value}`; i.focus(); i.dispatchEvent(new Event("input")); } }, "团队") : null,
       isGroup ? h("button", { class: "btn", onclick: () => groupDialog(g) }, "成员") : null,
@@ -228,26 +246,29 @@ async function openThread(t) {
     peer ? h("div", { class: "peer-note" }, "这是对方的会话，你只能旁观。需要你批准的操作会在这里弹出。") : h("div", { id: "composer" },
       h("button", { class: "attach", type: "button", title: "放一个文件到共享空间，agent 都能读到", onclick: () => attachFile(t) },
         Object.assign(h("span"), { innerHTML: '<svg viewBox="0 0 24 24"><path d="M20.5 11.5 12.4 19.6a5 5 0 0 1-7.1-7.1l8.5-8.5a3.3 3.3 0 0 1 4.7 4.7l-8.5 8.5a1.7 1.7 0 0 1-2.4-2.4l7.8-7.8"/></svg>' })),
-      h("textarea", { id: "input", rows: 1, placeholder: isGroup ? "发到群里：@名字 指定 agent，@all 一起回答，/team 任务 分工协作" : `给 ${name} 发消息` }),
+      h("textarea", { id: "input", rows: 1, placeholder: isGroup ? "@名字 叫 agent 回答，@all 一起回答，/help 看群规" : `给 ${name} 发消息，/ 看它的命令` }),
       sendButton()));
   $("#pane").classList.remove("enter"); void $("#pane").offsetWidth; $("#pane").classList.add("enter");
   const ta = $("#input") ?? h("textarea");
   ta.addEventListener("input", () => {
     ta.style.height = "auto"; ta.style.height = ta.scrollHeight + "px";
-    const btn = $("#send"); if (btn) btn.disabled = !ta.value.trim();
+    const btn = $("#send"); if (btn && !btn.classList.contains("stop")) btn.disabled = !ta.value.trim();
   });
-  const mention = isGroup ? mentionPicker(ta, () => g.members) : null;
+  const mention = isGroup ? mentionPicker(ta, () => [...g.members, ...g.guests, ...g.people]) : null;
+  const slash = slashPicker(ta, t);
   ta.addEventListener("keydown", (e) => {
-    if (mention?.key(e)) return;
+    if (mention?.key(e) || slash.key(e)) return;
     if (e.key === "Enter" && !e.shiftKey && !e.isComposing) { e.preventDefault(); sendMsg(); }
   });
   ta.focus();
+  drawMembers(); syncComposer();
   if (a && a.kind === "acp") loadConfigs(name, t);
   if (!peer) loadSpace(t);
   if (isGroup) invoke("team_state", { thread: t }).then((st) => { if (st) { S.team[t] = st; renderTeam(t); } }).catch(() => {});
   const draw = (msgs) => {
     const log = $("#log"); if (!log || S.thread !== t) return;
     log.replaceChildren(...msgs.map((m) => bubble(m.author, m.body)));
+    markResend(log);
     for (const it of S.inbox) if (it.thread === t) log.append(inboxCard(it));
     for (const [k, v] of Object.entries(S.live)) if (k.startsWith(t + "|")) log.append(v.el);
     log.scrollTop = log.scrollHeight;
@@ -259,6 +280,104 @@ async function openThread(t) {
   S.msgs[t] = fresh;
   if (!Array.isArray(had) || had.length !== fresh.length) draw(fresh);
 }
+// The chat's memory switch: one row, the whole row toggles; Tab focuses, Space/Enter toggles.
+function memorySwitch(t) {
+  const on = () => !S.ov.memory_off.includes(t);
+  const row = h("div", { class: "memrow", role: "switch", tabindex: 0, "aria-checked": String(on()), "aria-label": "记忆",
+    title: "开启时 agent 会读取并保存这个对话的长期记忆；关闭时既不读也不写" }, h("span", {}, "记忆"), h("span", { class: "track" }, h("i")));
+  const flip = async () => {
+    const next = !on();
+    row.setAttribute("aria-checked", String(next));
+    try {
+      await invoke("set_memory", { thread: t, on: next });
+      S.ov.memory_off = next ? S.ov.memory_off.filter((x) => x !== t) : [...S.ov.memory_off, t];
+      toast(next ? "记忆已开启" : "记忆已关闭：这个对话不再读取或保存记忆", 2200);
+    } catch (e) { row.setAttribute("aria-checked", String(!next)); toast(e); }
+  };
+  row.onclick = flip;
+  row.onkeydown = (e) => { if (e.key === " " || e.key === "Enter") { e.preventDefault(); flip(); } };
+  return row;
+}
+// Group header: every member with what it is doing right now.
+function drawMembers() {
+  const box = $("#members"); if (!box) return;
+  const g = S.ov.groups.find((g) => `group:${g.id}` === S.thread); if (!g) return;
+  box.replaceChildren(...g.members.map((m) => avatar(m, { small: true, status: statusOf(S.thread, m) ?? { st: "idle", label: m } })));
+}
+// While any agent is replying here, the send button becomes a stop button.
+function syncComposer() {
+  const btn = $("#send"); if (!btn) return;
+  const busy = Object.keys(S.live).filter((k) => k.startsWith(S.thread + "|") && S.live[k].on);
+  btn.classList.toggle("stop", busy.length > 0);
+  btn.title = busy.length ? "停止回复" : "发送（↩）";
+  if (busy.length) btn.disabled = false;
+  else btn.disabled = !$("#input")?.value.trim();
+}
+// "Again" on the last thing I sent: send the same words once more.
+function markResend(log) {
+  log.querySelectorAll(".again").forEach((b) => b.remove());
+  const mine = [...log.querySelectorAll(".m.me:not(.pending)")].pop();
+  if (!mine) return;
+  const body = mine.dataset.body; if (!body) return;
+  mine.append(h("button", { class: "again", type: "button", title: "再发一遍", onclick: () => resend(body) }, "↻"));
+}
+async function resend(text) {
+  const t = S.thread; if (!t) return;
+  const el = bubble("me", text); el.classList.add("new", "pending"); el.dataset.body = text;
+  $("#log").append(el); scrollLog(true);
+  try { await invoke("send", { thread: t, text }); } catch (e) { failed(el, e); }
+}
+function failed(el, e) {
+  el.classList.add("failed"); el.title = String(e);
+  el.append(h("button", { class: "retry", type: "button", onclick: () => { el.remove(); resend(el.dataset.body); } }, "发送失败 · 重发"));
+}
+// "/" at the start (or after "@agent ") offers that agent's own commands; groups add their own.
+function slashPicker(ta, t) {
+  let box = null, items = [], idx = 0, start = -1;
+  const close = () => { box?.remove(); box = null; };
+  const group = t.startsWith("group:");
+  const GROUP_CMDS = [["help", "看群规"], ["stop", "停止所有回复"], ["team", "分工协作（群主）"]];
+  const pick = (name) => {
+    const v = ta.value, end = ta.selectionStart;
+    ta.value = `${v.slice(0, start)}/${name} ${v.slice(end)}`;
+    const caret = start + name.length + 2; ta.setSelectionRange(caret, caret); close(); ta.focus(); ta.dispatchEvent(new Event("input"));
+  };
+  const draw = () => box.replaceChildren(...items.map(([n, d], i) => h("button", {
+    class: `pop-item${i === idx ? " hl" : ""}`, onmousedown: (e) => { e.preventDefault(); pick(n); },
+  }, h("span", { class: "mi" }, h("b", {}, `/${n}`), h("small", { class: "mute" }, d)))));
+  ta.addEventListener("input", async () => {
+    const before = ta.value.slice(0, ta.selectionStart);
+    const m = before.match(/^(?:@([\w-]+)\s+)?\/([\w-]*)$/);
+    if (!m) return close();
+    const agent = m[1] ?? (group ? null : t.slice(3));
+    start = ta.selectionStart - m[2].length - 1;
+    let list = group && !agent ? GROUP_CMDS : [];
+    if (agent && S.ov.agents.some((a) => a.name === agent && a.kind === "acp")) {
+      S.cmds[agent] ??= await invoke("agent_commands", { agent }).catch(() => []);
+      if (!S.cmds[agent].length) delete S.cmds[agent]; // not known yet: ask again next time
+      list = S.cmds[agent] ?? [];
+    }
+    const q = m[2].toLowerCase();
+    items = list.filter(([n]) => n.toLowerCase().startsWith(q)).slice(0, 12);
+    if (!items.length) return close();
+    idx = 0;
+    if (!box) {
+      box = h("div", { class: "pop mention" }); document.body.append(box);
+      const r = ta.getBoundingClientRect(); box.style.left = `${r.left}px`; box.style.bottom = `${innerHeight - r.top + 6}px`;
+    }
+    draw();
+  });
+  ta.addEventListener("blur", () => setTimeout(close, 100));
+  return { key(e) {
+    if (!box) return false;
+    if (e.key === "ArrowDown" || e.key === "ArrowUp") { idx = (idx + (e.key === "ArrowDown" ? 1 : items.length - 1)) % items.length; draw(); }
+    else if ((e.key === "Enter" || e.key === "Tab") && !e.isComposing) pick(items[idx][0]);
+    else if (e.key === "Escape") close();
+    else return false;
+    e.preventDefault(); return true;
+  } };
+}
+
 // ---------- space: the thread's shared to-dos and doc (agents edit them through Disco tools)
 // ---------- team mode: activity strip over the composer + blackboard drawer
 const TEAM_STAGE = { plan: "正在拆分任务", work: "成员并行处理中", summary: "组长正在汇总", done: "已完成", failed: "未完成" };
@@ -324,7 +443,9 @@ async function loadSpace(t) {
   const todos = h("ul", { class: "todos" }, ...sp.todos.map((x) => h("li", { class: x.done ? "done" : "" },
     h("input", { type: "checkbox", checked: x.done, onchange: (e) => invoke("todo_set", { thread: t, id: x.id, done: e.target.checked }).catch(toast) }),
     h("span", { class: "tx" }, x.text, x.assignee ? h("em", {}, ` → ${who(x.assignee)}`) : null, x.by && x.by !== "me" ? h("small", {}, ` · ${x.by} 添加`) : null),
-    h("button", { class: "icon-btn", title: "删除", onclick: () => invoke("todo_remove", { thread: t, id: x.id }).catch(toast) }, "×"))));
+    h("button", { class: "icon-btn", title: "删除", onclick: async () => {
+      try { await invoke("todo_remove", { thread: t, id: x.id }); toast("已删除待办", 5000, ["撤销", () => invoke("todo_new", { thread: t, text: x.text }).catch(toast)]); } catch (e) { toast(e); }
+    } }, "×"))));
   const doc = h("div", { class: "doc md" });
   doc.innerHTML = sp.doc.trim() ? md(sp.doc) : '<p class="mute">还没有内容。agent 可以用 doc_write 写入目标、结论和分工，你也可以直接编辑。</p>';
   const edit = h("button", { class: "btn sm" }, "编辑");
@@ -338,7 +459,7 @@ async function loadSpace(t) {
     h("div", { class: "sp-head" }, h("b", {}, "待办"), h("span", { class: "mute" }, left ? `${left} 项未完成` : "")),
     todos, add,
     h("div", { class: "sp-head" }, h("b", {}, "群文档"), h("span", { class: "sp" }), edit,
-      h("button", { class: "btn sm", title: sp.doc_path, onclick: () => invoke("reveal_doc", { thread: t }).catch(toast) }, "在访达中显示")),
+      h("button", { class: "btn sm", title: sp.doc_path, onclick: () => invoke("reveal_doc", { thread: t }).catch(toast) }, IS_WIN ? "在资源管理器中显示" : "在访达中显示")),
     doc);
 }
 listen("space", ({ payload: t }) => { if (S.thread === t && !$("#space .doc-edit")) loadSpace(t); });
@@ -421,7 +542,12 @@ function inlineRename(el, name) {
   el.addEventListener("keydown", key); el.addEventListener("blur", blur);
 }
 function bubble(author, body) {
-  if (author === "system") return h("div", { class: "m sys" }, body);
+  if (author === "system") {
+    // Hints carry commands in `code`: click one to copy it.
+    const el = h("div", { class: "m sys" }), tx = h("span"); el.append(tx); tx.innerHTML = esc(body).replace(/`([^`]+)`/g, '<code class="cp" title="点击复制">$1</code>').replace(/\n/g, "<br>");
+    el.querySelectorAll("code.cp").forEach((c) => { c.onclick = () => copyText(c.textContent, null).then(() => toast("已复制", 1200)); });
+    return el;
+  }
   const me = author === "me";
   const b = h("div", { class: "b" }); b.innerHTML = md(body);
   // File hand-offs end with the file's path: make it open in Finder.
@@ -429,8 +555,11 @@ function bubble(author, body) {
     b.innerHTML = b.innerHTML.replace(/(^|<br>|<p>)(\/[^<]+)/g, '$1<a class="path" href="#">$2</a>');
     b.querySelectorAll("a.path").forEach((a) => { a.onclick = (e) => { e.preventDefault(); invoke("reveal_path", { path: a.textContent }).catch(toast); }; });
   }
-  const col = h("div", {}, !me && S.thread?.startsWith("group:") ? h("div", { class: "who" }, author) : null, b);
-  return h("div", { class: `m${me ? " me" : ""}` }, me ? null : avatar(author, { small: true }), col);
+  const human = author.endsWith(" (Discord)");
+  const col = h("div", {}, !me && S.thread?.startsWith("group:") ? h("div", { class: "who" }, human ? author.slice(0, -10) : author) : null, b);
+  const el = h("div", { class: `m${me ? " me" : ""}${human ? " person" : ""}` }, me ? null : human ? h("div", { class: "av sm person" }, author[0].toUpperCase()) : avatar(author, { small: true }), col);
+  if (me) el.dataset.body = body;
+  return el;
 }
 // Typing "@" in a group offers its members; ↑↓ to move, ↩/⇥ to pick, Esc to close.
 function mentionPicker(ta, members) {
@@ -443,7 +572,7 @@ function mentionPicker(ta, members) {
   };
   const draw = () => box.replaceChildren(...items.map((n, i) => h("button", {
     class: `pop-item${i === idx ? " hl" : ""}`, onmousedown: (e) => { e.preventDefault(); pick(n); },
-  }, h("span", { class: "mi" }, n === "all" ? h("span", { class: "mi-all" }, "@") : avatar(n, { small: true }), n === "all" ? "所有人" : n))));
+  }, h("span", { class: "mi" }, n === "all" ? h("span", { class: "mi-all" }, "@") : S.ov.agents.some((a) => a.name === n) ? avatar(n, { small: true }) : h("span", { class: "mi-all person" }, n[0].toUpperCase()), n === "all" ? "所有人" : n))));
   ta.addEventListener("input", () => {
     const m = ta.value.slice(0, ta.selectionStart).match(/(^|\s)@([\w-]*)$/);
     if (!m) return close();
@@ -491,6 +620,7 @@ async function attachFile(t) {
   try { toast(await invoke("send_file", { thread: t, path, note: null }), 3000); } catch (e) { toast(e, 8000); }
 }
 async function sendMsg() {
+  if ($("#send")?.classList.contains("stop")) return stopHere();
   const ta = $("#input"); const text = ta.value.trim();
   if (!text || !S.thread) return;
   ta.value = ""; ta.style.height = "auto"; if ($("#send")) $("#send").disabled = true;
@@ -499,7 +629,15 @@ async function sendMsg() {
   const el = bubble("me", text); el.classList.add("new", "pending"); el.dataset.body = text;
   $("#log").append(el); scrollLog(true);
   try { await invoke("send", { thread: t, text }); }
-  catch (e) { el.classList.add("failed"); el.title = String(e); toast(e); }
+  catch (e) { failed(el, e); toast(e); }
+}
+// Stop every reply running in the open chat.
+async function stopHere() {
+  const t = S.thread, btn = $("#send");
+  const agents = Object.keys(S.live).filter((k) => k.startsWith(t + "|") && S.live[k].on).map((k) => k.slice(t.length + 1));
+  btn.disabled = true;
+  const ok = await Promise.all(agents.map((agent) => invoke("stop_reply", { thread: t, agent }).catch(() => false)));
+  if (!ok.some(Boolean)) { toast("这个 agent 不支持中途停止"); btn.disabled = false; }
 }
 
 // ---------- inbox: permission requests and agent questions, answered here or from Discord
@@ -513,7 +651,9 @@ function inboxCard(it) {
     try { await invoke("inbox_answer", { id: it.id, optionId, text }); }
     catch (e) { card.querySelectorAll("button, textarea").forEach((b) => { b.disabled = false; }); toast(e); }
   };
-  const opts = h("div", { class: "opts" }, ...it.options.map((o) => h("button", { class: o.allow ? "allow" : "", onclick: () => answer(o.id, null) }, o.label)),
+  // "Always allow" first and marked: one tap and the agent stops asking for this kind of action.
+  const order = [...it.options].sort((a, b) => b.always - a.always);
+  const opts = h("div", { class: "opts" }, ...order.map((o) => h("button", { class: `${o.allow ? "allow" : ""}${o.always ? " always" : ""}`, title: o.always ? "以后同类操作不再询问" : "", onclick: () => answer(o.id, null) }, o.label)),
     perm ? h("button", { onclick: () => answer(null, null) }, "拒绝") : null);
   if (it.options.length || perm) card.append(opts);
   if (it.text) {
@@ -541,6 +681,7 @@ function setInbox(items, quiet = false) {
   if (!quiet) for (const it of items) if (!before.has(it.id) && it.thread !== S.thread) {
     toast(`${it.agent} ${it.kind === "permission" ? "需要你批准" : "有问题问你"}`, 6000, ["查看", () => openThread(it.thread)]);
   }
+  if (S.thread) drawMembers();
   renderList();
 }
 listen("inbox", ({ payload }) => setInbox(payload));
@@ -559,6 +700,11 @@ listen("message", ({ payload: m }) => {
     const pending = m.author === "me" && [...document.querySelectorAll("#log .m.pending")].find((e) => e.dataset.body === m.body.trim());
     if (pending) pending.classList.remove("pending");
     else { const el = bubble(m.author, m.body); el.classList.add("new"); $("#log").append(el); scrollLog(m.author === "me"); }
+    if (m.author === "me") markResend($("#log"));
+  }
+  if (m.thread.startsWith("group:") && m.author.endsWith(" (Discord)")) {
+    const g = S.ov.groups.find((g) => `group:${g.id}` === m.thread), who = m.author.slice(0, -10);
+    if (g && !g.people.includes(who)) g.people.push(who);
   }
   renderList();
 });
@@ -568,17 +714,13 @@ listen("typing", ({ payload: { thread, agent, on } }) => {
   const k = liveKey(thread, agent);
   if (on && !S.live[k]) {
     const b = h("div", { class: "b" }, h("span", { class: "typing-dots" }, h("i"), h("i"), h("i")));
-    const stop = h("button", { class: "stop-btn", title: "停止这次回复", onclick: async () => {
-      stop.disabled = true; stop.textContent = "正在停止…";
-      try { if (!(await invoke("stop_reply", { thread, agent }))) { stop.textContent = "无法停止"; } } catch (e) { toast(e); }
-    } }, "停止");
     b.classList.add("streaming");
-    S.live[k] = { text: "", b, stop, el: h("div", { class: "m new" }, avatar(agent, { small: true }), h("div", {}, h("div", { class: "who" }, agent, stop), b)) };
+    S.live[k] = { text: "", b, on: true, el: h("div", { class: "m new" }, avatar(agent, { small: true }), h("div", {}, h("div", { class: "who" }, agent), b)) };
     if (S.thread === thread) { $("#log").append(S.live[k].el); scrollLog(); }
   }
   if (!on && S.live[k] && !S.live[k].text) { S.live[k].el.remove(); delete S.live[k]; }
-  if (!on && S.live[k]) { S.live[k].stop?.remove(); S.live[k].b.classList.remove("streaming"); }
-  renderList();
+  if (!on && S.live[k]) { S.live[k].on = false; S.live[k].b.classList.remove("streaming"); }
+  setStatus(thread, agent, on ? "think" : null);
 });
 listen("stream", ({ payload: { thread, agent, event } }) => {
   const live = S.live[liveKey(thread, agent)];
@@ -589,9 +731,13 @@ listen("stream", ({ payload: { thread, agent, event } }) => {
       live.raf = 0; live.b.innerHTML = md(live.text);
       if (S.thread === thread) scrollLog();
     });
-  } else if (event.type === "tool" && S.thread === thread && event.title) {
-    const chip = h("div", { class: "chip new" }, `🔧 ${agent} · ${event.title}`);
-    live ? live.el.before(chip) : $("#log").append(chip);
+  } else if (event.type === "tool") {
+    const done = /completed|failed/.test(event.status);
+    if (S.typing[thread]?.has(agent)) setStatus(thread, agent, done ? "think" : "tool", done ? null : event.title);
+    if (S.thread === thread && event.title && !done) {
+      const chip = h("div", { class: "chip new" }, `🔧 ${agent} · ${event.title}`);
+      live ? live.el.before(chip) : $("#log").append(chip);
+    }
   }
 });
 async function installUpdate() {
@@ -609,7 +755,7 @@ const shortPath = (p) => (p || "").replace(/^\/Users\/[^/]+/, "~");
 const baseName = (p) => (p ? p.replace(/\/$/, "").split("/").pop() : "");
 async function renderGallery() {
   S.thread = null; renderList();
-  const page = h("div", { class: "page add" }, h("h1", {}, "添加 Agent"), h("p", {}, "正在扫描这台 Mac…"));
+  const page = h("div", { class: "page add" }, h("h1", {}, "添加 Agent"), h("p", {}, `正在扫描这台${IS_WIN ? "电脑" : " Mac "}…`));
   $("#pane").replaceChildren(page);
   $("#pane").classList.remove("enter"); void $("#pane").offsetWidth; $("#pane").classList.add("enter");
   // Show the last scan at once; rescan in the background and redraw if it changed.
@@ -625,7 +771,7 @@ async function renderGallery() {
     agentRow({ id: "invite", name: "朋友的邀请码", kind: "invite", color: "#10a37f", letter: "@" }, "接入别人通过 Disco 共享的 agent"),
     agentRow({ id: "a2a", name: "远程 A2A agent", kind: "a2a", color: "#5865f2", letter: "A" }, "通过 URL 接入"));
   page.replaceChildren(h("h1", {}, "添加 Agent"),
-    h("p", {}, have.length ? `在这台 Mac 上找到 ${have.length} 个。点「导入」一步完成，点整行可调目录和环境。` : "没在这台 Mac 上找到已安装的 agent，可以手动添加。"),
+    h("p", {}, have.length ? `在这台${IS_WIN ? "电脑" : " Mac "}上找到 ${have.length} 个。点「导入」一步完成，点整行可调目录和环境。` : `没在这台${IS_WIN ? "电脑" : " Mac "}上找到已安装的 agent，可以手动添加。`),
     list,
     miss.length ? h("p", { class: "muted" }, `装好后会自动出现：${miss.map((t) => t.name).join(" · ")}`) : "");
 }
@@ -823,6 +969,7 @@ async function groupDialog(g) {
     draw([]);
     where.append(h("small", {}, "Discord"), slot);
     invoke("discord_channels").then(draw).catch(() => {});
+    where.after(h("p", { class: "hint2" }, "想把 agent 带进朋友的群？先在 设置 → Discord 复制邀请链接发给朋友，他把你的 Bot 加进他的服务器后，这里就能选他的频道。频道里的每个人都能 @ 你的 agent，需要批准的操作只会问你。"));
   } else where.append(h("small", {}, "Discord 未连接，群聊先只在 Disco 内进行"));
   const err = h("div", { class: "err" });
   const go = h("button", { class: "btn pri" }, g ? "保存" : "创建群聊");
@@ -835,7 +982,10 @@ async function groupDialog(g) {
     } catch (e) { err.textContent = String(e); go.disabled = false; }
   };
   const del = g ? h("button", { class: "btn danger", onclick: async () => {
-    if (await ask("删除这个群聊？聊天记录保留，Discord 频道不受影响。", "删除")) { await invoke("delete_group", { id: g.id }); blank(); await load(); }
+    if (await ask("删除这个群聊？聊天记录保留，Discord 频道不受影响。", "删除")) {
+      await invoke("delete_group", { id: g.id }); blank(); await load();
+      toast(`已删除群聊 ${g.name}`, 6000, ["撤销", async () => { await invoke("restore_group", { id: g.id, guildId: g.guild_id, name: g.name, members: g.members, lead: g.lead }); await load(); setTab("groups"); openThread(`group:${g.id}`); }]);
+    }
   } }, "删除群聊") : null;
   $("#pane").replaceChildren(h("div", { class: "page gpage" },
     h("h1", {}, g ? "群设置" : "新建群聊"), name,
@@ -848,7 +998,10 @@ async function groupDialog(g) {
 async function loadMemories(box) {
   const ms = await invoke("memories").catch(() => []);
   box.replaceChildren(...(ms.length ? ms.map((m) => h("li", {}, h("b", {}, m.scope === "all" ? "所有 agent" : m.scope.startsWith("group-") ? (S.ov.groups.find((g) => `group-${g.id}` === m.scope)?.name ?? "群") : m.scope), h("small", { class: "mute" }, m.topic), h("span", { style: "flex:1" }, m.text),
-    h("button", { class: "btn", onclick: async () => { await invoke("forget", { key: m.key }); loadMemories(box); } }, "删除"))) : [h("li", {}, h("span", {}, "还没有记忆"))]));
+    h("button", { class: "btn", onclick: async () => {
+      await invoke("forget", { key: m.key }); loadMemories(box);
+      toast("已删除这条记忆", 5000, ["撤销", async () => { await invoke("memory_restore", { key: m.key }).catch(toast); loadMemories(box); }]);
+    } }, "删除"))) : [h("li", {}, h("span", {}, "还没有记忆"))]));
 }
 const inputStyle = "flex:1;height:32px;border:1px solid var(--line);border-radius:8px;padding:0 10px;background:var(--list);color:var(--fg)";
 function renderSettings() {
@@ -871,7 +1024,7 @@ function renderSettings() {
       discordBox),
     h("div", { class: "section" }, h("h3", {}, "Tailscale 访问规则"), (() => { const box = h("div", {}, h("p", { class: "mute2" }, "正在读取…")); loadNet(box); return box; })()),
     h("div", { class: "section" }, h("h3", {}, "记忆"),
-      h("p", { style: "margin:0 0 8px;color:var(--mute)" }, "在私聊里说「记住 …」存给这个 agent，在群聊里说存给本群；agent 也能用 remember 工具按主题记下东西。记忆是普通的 Markdown 文件，每次新会话自动带上，只发给这台 Mac 上的 agent。"),
+      h("p", { style: "margin:0 0 8px;color:var(--mute)" }, `在私聊里说「记住 …」存给这个 agent，在群聊里说存给本群；agent 也能用 remember 工具按主题记下东西。记忆是普通的 Markdown 文件，每次新会话自动带上，只发给这台${IS_WIN ? "电脑" : " Mac "}上的 agent。每个对话顶部的「记忆」开关可以单独关掉。`),
       (() => { const box = h("ul", { class: "checks-list" }); loadMemories(box); return box; })()),
     h("div", { class: "section" }, h("h3", {}, "诊断"),
       (() => {
@@ -946,8 +1099,10 @@ async function loadDiscordSettings(box) {
         try { const n = await invoke("discord_sync"); toast(`已同步 ${n} 个 agent 频道`); } catch (er) { toast(er, 8000); }
         e.target.disabled = false;
       } }, "同步频道")),
-    d.invite_url ? h("button", { class: "btn", style: "margin-top:8px", onclick: () => invoke("open_url", { url: d.invite_url }).catch(toast) }, "重新授权 Bot（补齐管理频道等权限）") : null,
-    h("p", { style: "margin:14px 0 6px;color:var(--mute)" }, "只有 Bot 所有者能在 Discord 里指挥 agent。要允许其他人，填他们的用户 ID："),
+    d.invite_url ? h("div", { style: "display:flex;gap:8px;margin-top:8px" },
+      h("button", { class: "btn", onclick: () => invoke("open_url", { url: d.invite_url }).catch(toast) }, "重新授权 Bot"),
+      h("button", { class: "btn", title: "发给朋友，他把你的 Bot 加进他的服务器后，你就能把 agent 拉进他的群频道", onclick: (e) => copyText(d.invite_url, e.currentTarget) }, "复制邀请链接（给朋友）")) : null,
+    h("p", { style: "margin:14px 0 6px;color:var(--mute)" }, "群频道里每个能发言的人都能 @ agent；agent 自己的频道只有你能用。要让别人也能在 agent 频道里用，填他们的用户 ID："),
     h("div", { style: "display:flex;gap:8px" }, allow,
       h("button", { class: "btn", onclick: async () => {
         try { const r = await invoke("discord_settings", { allow: allow.value }); allow.value = r.allow; toast("已保存"); } catch (e) { toast(e); }
@@ -970,14 +1125,27 @@ function dialog(fields, okText, onOk, extra) {
   };
   d.showModal();
 }
+const MOD = IS_WIN ? "Ctrl+" : "⌘";
 function blank() {
   S.thread = null;
   const none = !S.ov?.agents.length;
-  $("#pane").replaceChildren(h("div", { class: "blank" }, h("div", { class: "logo" }, "D"), h("b", {}, "Disco"),
-    none ? h("p", {}, "还没有 agent。") : h("p", {}, "选一个会话开始"),
-    none ? h("button", { class: "btn pri", onclick: () => setTab("agents") }, "添加第一个 agent") : h("div", { class: "keys" },
-      h("span", {}, h("kbd", {}, "⌘K"), " 搜索"), h("span", {}, h("kbd", {}, "⌘1–5"), " 切换"), h("span", {}, h("kbd", {}, "⌘N"), " 新建"))));
+  const box = h("div", { class: "blank" }, h("div", { class: "logo" }, "D"), h("b", {}, "Disco"),
+    none ? h("p", {}, "正在找这台电脑上的 agent…") : h("p", {}, "选一个会话开始"),
+    none ? null : h("div", { class: "keys" },
+      h("span", {}, h("kbd", {}, `${MOD}K`), " 搜索"), h("span", {}, h("kbd", {}, `${MOD}1–5`), " 切换"), h("span", {}, h("kbd", {}, `${MOD}N`), " 新建")));
+  $("#pane").replaceChildren(box);
   renderList();
+  if (none) firstRun(box);
+}
+// First launch: no setup screen. Found agents import with one click; Discord is optional.
+async function firstRun(box) {
+  const found = (await invoke("detect_agents").catch(() => [])).filter((t) => t.found);
+  if (!box.isConnected) return;
+  const rows = found.map((t) => h("div", { class: "frun" }, h("b", {}, t.name), h("small", { class: "mute" }, shortPath(t.found)),
+    h("button", { class: "btn pri sm", onclick: (e) => quickImport(t, e.currentTarget) }, "开始聊天")));
+  box.querySelector("p").textContent = found.length ? "找到这些 agent，点一下就能开始：" : "没在这台电脑上找到 agent。";
+  box.append(...rows, ...(found.length ? [] : [h("button", { class: "btn pri", onclick: () => setTab("agents") }, "手动添加 agent")]),
+    h("p", { class: "mute" }, "想在手机上也能用？以后到 设置 → Discord 连接，随时可以。"));
 }
 function setTab(tab) {
   S.tab = tab;
@@ -1007,6 +1175,9 @@ addEventListener("keydown", (e) => {
   if (mod && e.key.toLowerCase() === "n") { e.preventDefault(); if (S.tab === "agents") renderGallery(); else groupDialog(null); return; }
   if (!mod && !e.altKey && !typingInField && e.key.length === 1 && $("#input") && !$("#dlg").open) $("#input").focus();
 });
+// Text keeps one size: no page zoom from Ctrl/⌘ + wheel or + / − / 0.
+addEventListener("wheel", (e) => { if (e.ctrlKey || e.metaKey) e.preventDefault(); }, { passive: false });
+addEventListener("keydown", (e) => { if ((e.ctrlKey || e.metaKey) && ["+", "=", "-", "_", "0"].includes(e.key)) e.preventDefault(); }, true);
 $("#search").addEventListener("keydown", (e) => {
   if (e.key === "Escape") { e.target.value = ""; S.q = ""; renderList(); e.target.blur(); }
   if (e.key === "Enter" && !e.isComposing) { e.preventDefault(); $("#items li:not(.empty)")?.click(); e.target.blur(); }

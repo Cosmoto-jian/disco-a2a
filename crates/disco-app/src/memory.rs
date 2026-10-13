@@ -17,6 +17,8 @@ const INDEX: &str = "MEMORY.md";
 /// Characters of notes a new session is shown before falling back to indexes.
 const BUDGET: usize = 4000;
 pub const DEFAULT_TOPIC: &str = "general";
+/// `memory_off/<thread>` = "1": that chat neither reads nor writes memory.
+pub const MEM_OFF: &str = "memory_off/";
 
 #[derive(Serialize)]
 pub struct Note { pub key: String, pub scope: String, pub topic: String, pub text: String }
@@ -80,6 +82,11 @@ impl Core {
         let dir = self.memory_dir(scope);
         let file = topic.map_or(INDEX.to_owned(), |t| format!("{}.md", slug(t)));
         std::fs::read_to_string(dir.join(file)).unwrap_or_default()
+    }
+
+    /// Whether the chat `context` belongs to has memory switched on (the default).
+    pub(crate) fn memory_on(&self, context: &str) -> bool {
+        thread_of(context).is_none_or(|t| self.db().setting(&format!("{MEM_OFF}{t}")).as_deref() != Some("1"))
     }
 
     /// What a new session is told first. `context` locates it (a group's sessions
@@ -156,6 +163,14 @@ impl Core {
     }
 }
 
+/// The chat a session context belongs to (`group:<id>` or `dm:<agent>`), if any.
+pub fn thread_of(context: &str) -> Option<String> {
+    match group_of(context) {
+        Some(g) => Some(format!("group:{}", &g["group-".len()..])),
+        None => context.starts_with("dm:").then(|| context.to_owned()),
+    }
+}
+
 /// `group-<id>` for contexts inside a group (`group:<id>`, `team:group:<id>:…`).
 pub fn group_of(context: &str) -> Option<String> {
     let rest = context.strip_prefix("team:").unwrap_or(context).strip_prefix("group:")?;
@@ -172,5 +187,8 @@ mod tests {
         assert_eq!(group_of("group:123").as_deref(), Some("group-123"));
         assert_eq!(group_of("team:group:local-x:claude").as_deref(), Some("group-local-x"));
         assert_eq!(group_of("dm:claude"), None);
+        assert_eq!(thread_of("team:group:local-x:claude").as_deref(), Some("group:local-x"));
+        assert_eq!(thread_of("dm:claude").as_deref(), Some("dm:claude"));
+        assert_eq!(thread_of("ask:coder"), None);
     }
 }

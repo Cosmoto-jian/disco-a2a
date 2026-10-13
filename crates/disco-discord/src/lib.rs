@@ -311,7 +311,7 @@ impl Rest {
     pub async fn post_as(&self, webhook: &str, username: &str, avatar: Option<&str>, text: &str) -> Result<(), String> {
         let (wid, token) = webhook.split_once('\n').ok_or("bad webhook ref")?;
         for part in chunk(text) {
-            let mut body = json!({"content": part, "username": persona_name(username), "allowed_mentions": {"parse": []}});
+            let mut body = json!({"content": part, "username": persona_name(username), "allowed_mentions": pings(&part)});
             if let Some(a) = avatar { body["avatar_url"] = json!(a); }
             self.post_json(&format!("/webhooks/{wid}/{token}"), body).await?;
         }
@@ -344,13 +344,34 @@ impl Rest {
         self.post_json(&format!("/interactions/{id}/{token}/callback"), body).await.map(|_| ())
     }
 
-    /// Post as the bot itself (used for messages typed in the app). Never pings anyone.
+    /// Post as the bot itself (used for messages typed in the app). Pings only users
+    /// written as `<@id>`, never roles or @everyone.
     pub async fn post(&self, channel: &str, text: &str) -> Result<(), String> {
         for part in chunk(text) {
-            self.post_json(&format!("/channels/{channel}/messages"), json!({"content": part, "allowed_mentions": {"parse": []}})).await?;
+            self.post_json(&format!("/channels/{channel}/messages"), json!({"content": part, "allowed_mentions": pings(&part)})).await?;
         }
         Ok(())
     }
+}
+
+/// `allowed_mentions` that pings exactly the users written as `<@id>` in `text`.
+fn pings(text: &str) -> Value {
+    let mut users: Vec<&str> = Vec::new();
+    for part in text.split("<@").skip(1) {
+        let id = part.trim_start_matches('!').split('>').next().unwrap_or_default();
+        if !id.is_empty() && id.bytes().all(|b| b.is_ascii_digit()) && !users.contains(&id) && users.len() < 100 { users.push(id); }
+    }
+    json!({"parse": [], "users": users})
+}
+
+/// `<@id>` / `<@!id>` user mentions written as `@Name`, using the message's `mentions` list.
+fn readable_mentions(content: &str, mentions: &Value) -> String {
+    let mut out = content.to_owned();
+    for u in mentions.as_array().into_iter().flatten() {
+        let (Some(id), Some(name)) = (u["id"].as_str(), u["global_name"].as_str().or(u["username"].as_str())) else { continue };
+        for tag in [format!("<@{id}>"), format!("<@!{id}>")] { out = out.replace(&tag, &format!("@{name}")); }
+    }
+    out
 }
 
 /// Discord channel names: lowercase, no spaces, at most 100 chars.
@@ -387,14 +408,20 @@ pub fn chunk(text: &str) -> Vec<String> {
 
 // ---------------------------------------------------------------- Gateway
 
-/// A human message seen in a guild text channel.
+/// A message seen in a guild text channel (from a person, another bot or a webhook;
+/// never our own bot).
 #[derive(Debug, Clone)]
 pub struct Incoming {
     pub guild_id: String,
     pub channel_id: String,
     pub author_id: String,
     pub author: String,
+    /// User mentions already written as `@Name`.
     pub content: String,
+    /// Posted through a webhook (how another Disco speaks as its agents).
+    pub webhook_id: Option<String>,
+    /// Posted by a bot account (another Disco relaying its owner's words).
+    pub bot: bool,
     /// A button press on one of our messages: (interaction id, token, custom_id).
     pub press: Option<(String, String, String)>,
 }
@@ -520,8 +547,11 @@ pub async fn run_gateway(token: String, tx: mpsc::Sender<Incoming>, mut stop: wa
         let via = proxy_url().map(|p| format!("（经代理 {p}）")).unwrap_or_default();
         on_status(format!("连接中{via}…"));
         let mut was_ready = false;
+        // Our own bot id (from READY): its messages are never echoed back.
+        let me = std::sync::Mutex::new(String::new());
         let end = session(&token, &mut stop, |d| {
             was_ready = true;
+            *me.lock().unwrap_or_else(|p| p.into_inner()) = d["user"]["id"].as_str().unwrap_or_default().to_owned();
             let guilds = d["guilds"].as_array().map_or(0, Vec::len);
             on_status(format!("在线 · {} · {guilds} 个服务器", d["user"]["username"].as_str().unwrap_or("bot")));
         }, |m| {
@@ -534,21 +564,25 @@ pub async fn run_gateway(token: String, tx: mpsc::Sender<Incoming>, mut stop: wa
                     author_id: u["id"].as_str().unwrap_or_default().into(),
                     author: u["global_name"].as_str().or(u["username"].as_str()).unwrap_or("someone").into(),
                     content: String::new(),
+                    webhook_id: None,
+                    bot: false,
                     press: Some((m["id"].as_str().unwrap_or_default().into(), m["token"].as_str().unwrap_or_default().into(),
                         m["data"]["custom_id"].as_str().unwrap_or_default().into())),
                 };
                 return tx.try_send(msg).is_ok() || !tx.is_closed();
             }
-            if m["author"]["bot"].as_bool() == Some(true) || !m["webhook_id"].is_null() { return true; }
+            let a = &m["author"];
+            if a["id"].as_str() == Some(me.lock().unwrap_or_else(|p| p.into_inner()).as_str()) { return true; }
             let (Some(guild), Some(content)) = (m["guild_id"].as_str(), m["content"].as_str()) else { return true };
             if content.is_empty() { return true; }
-            let a = &m["author"];
             let msg = Incoming {
                 guild_id: guild.into(),
                 channel_id: m["channel_id"].as_str().unwrap_or_default().into(),
                 author_id: a["id"].as_str().unwrap_or_default().into(),
                 author: a["global_name"].as_str().or(a["username"].as_str()).unwrap_or("someone").into(),
-                content: content.into(),
+                content: readable_mentions(content, &m["mentions"]),
+                webhook_id: m["webhook_id"].as_str().map(str::to_owned),
+                bot: a["bot"].as_bool() == Some(true),
                 press: None,
             };
             tx.try_send(msg).is_ok() || !tx.is_closed()
@@ -611,6 +645,8 @@ mod tests {
     fn slugs() {
         assert_eq!(channel_slug("Claude Code"), "claude-code");
         assert_eq!(persona_name("discord-bot"), "disc0rd-bot");
+        assert_eq!(pings("@x <@12> hi <@!34> <@12> <@abc>")["users"], json!(["12", "34"]));
+        assert_eq!(readable_mentions("hi <@12> and <@!12>", &json!([{"id": "12", "username": "amy"}])), "hi @amy and @amy");
     }
 }
 

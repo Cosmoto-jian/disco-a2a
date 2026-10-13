@@ -191,7 +191,7 @@ impl Core {
         match self.turn(&thread, &lead, &ctx_of(&lead), &prompt).await {
             Ok(summary) => {
                 let summary = summary.trim().to_owned();
-                self.remember_from(&lead, &summary);
+                self.remember_from(&lead, &thread, &summary);
                 let _ = mcp::write_doc(&dir.join("summary.md"), &format!("# 团队结论\n\n{task}\n\n---\n\n{summary}\n"));
                 let roles: Vec<String> = results.iter().map(|(a, r, _)| format!("{a}·{r}")).collect();
                 self.team_post(g, &thread, &lead, &format!("🧩 团队结论（{}）\n\n{summary}", roles.join("、"))).await;

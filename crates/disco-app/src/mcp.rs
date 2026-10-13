@@ -218,6 +218,7 @@ impl Call<'_> {
             "todo_done" => self.todo_done(args),
             "doc_read" => self.doc_read(args),
             "doc_write" => self.doc_write(args),
+            "remember" | "memory_read" if !self.core.memory_on(self.context) => Err("用户关闭了这个对话的记忆，现在不能读写记忆".into()),
             "remember" => {
                 let text = s(args, "text").ok_or("text 不能为空")?;
                 let (scope, label) = self.mem_scope(args)?;

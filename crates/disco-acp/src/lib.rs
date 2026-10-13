@@ -76,6 +76,8 @@ pub struct ConfigChoice {
 }
 
 type Configs = Arc<Mutex<Vec<ConfigChoice>>>;
+/// Slash commands the agent advertises: (name without `/`, description).
+type Commands = Arc<Mutex<Vec<(String, String)>>>;
 
 fn choices(opts: &[SessionConfigOption]) -> Vec<ConfigChoice> {
     opts.iter()
@@ -124,6 +126,7 @@ pub struct AcpAgent {
     cmd: mpsc::Sender<Cmd>,
     pending: Pending,
     configs: Configs,
+    commands: Commands,
     child: Mutex<tokio::process::Child>,
 }
 
@@ -159,9 +162,10 @@ impl AcpAgent {
         let (cmd_tx, cmd_rx) = mpsc::channel::<Cmd>(32);
         let pending: Pending = Arc::default();
         let configs: Configs = Arc::default();
+        let commands: Commands = Arc::default();
         let transport = ByteStreams::new(stdin.compat_write(), stdout.compat());
-        tokio::spawn(run_connection(transport, launch, cmd_rx, pending.clone(), configs.clone()));
-        Ok(Self { cmd: cmd_tx, pending, configs, child: Mutex::new(child) })
+        tokio::spawn(run_connection(transport, launch, cmd_rx, pending.clone(), configs.clone(), commands.clone()));
+        Ok(Self { cmd: cmd_tx, pending, configs, commands, child: Mutex::new(child) })
     }
 
     /// Send one prompt in the session named `key` (created on first use);
@@ -183,6 +187,11 @@ impl AcpAgent {
         self.cmd.send(Cmd::Warm { key: key.into(), ready: Some(tx) }).await.map_err(|_| AcpError::Gone)?;
         let _ = rx.await;
         Ok(lock(&self.configs).clone())
+    }
+
+    /// The slash commands the agent offers (known once a session has started).
+    pub fn commands(&self) -> Vec<(String, String)> {
+        lock(&self.commands).clone()
     }
 
     /// Change a setting (e.g. the model) for every session, now and later.
@@ -279,6 +288,7 @@ async fn run_connection<W, R>(
     mut cmd_rx: mpsc::Receiver<Cmd>,
     pending: Pending,
     configs: Configs,
+    commands: Commands,
 ) where
     W: futures::AsyncWrite + Send + 'static,
     R: futures::AsyncRead + Send + 'static,
@@ -295,6 +305,9 @@ async fn run_connection<W, R>(
             async move |n: SessionNotification, _cx| {
                 if let SessionUpdate::ConfigOptionUpdate(u) = &n.update {
                     *lock(&configs_n) = choices(&u.config_options);
+                }
+                if let SessionUpdate::AvailableCommandsUpdate(u) = &n.update {
+                    *lock(&commands) = u.available_commands.iter().map(|c| (c.name.trim_start_matches('/').to_owned(), c.description.clone())).collect();
                 }
                 if let Some(ev) = map_update(n.update) {
                     emit(&sinks_n, &n.session_id.to_string(), ev);
@@ -317,6 +330,7 @@ async fn run_connection<W, R>(
                         id: o.option_id.to_string(),
                         label: o.name.clone(),
                         allow: matches!(o.kind, PermissionOptionKind::AllowOnce | PermissionOptionKind::AllowAlways),
+                        always: matches!(o.kind, PermissionOptionKind::AllowAlways),
                     }).collect(),
                 });
                 // Never block the dispatch loop while a human decides.
