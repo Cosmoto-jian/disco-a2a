@@ -1,19 +1,19 @@
 {
-  "version": "1.3.0",
-  "notes": "Agent 形象：8 种会动的几何形态，10 组渐变色，可随时更换。",
-  "pub_date": "2026-10-13T08:28:38Z",
+  "version": "1.3.1",
+  "notes": "新的应用图标。",
+  "pub_date": "2026-10-13T09:09:50Z",
   "platforms": {
     "darwin-aarch64": {
-      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVUcDdocWFJV0FyVjZKQnFWTUtEeUFmdmdPNkNmNVZNcURSL1ozamxhcVdCMEgzUDk5V2Z5U1RjNG4wQis4S3BacURCWmdqOG9RZitxN1VBZ2VOWVpmZGg3RVJHT0VlK2dNPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkxODgwMTE3CWZpbGU6RGlzY29fMS4zLjBfdW5pdmVyc2FsLmFwcC50YXIuZ3oKclBpZ2JibmFoSXhvVXRtb1ZyWStIUU1CQS9weHNiano4YmVkKzUvcDAza2QybVR6OW9GWkhaNTlYWU1jU1E4cmFrVk9rMmhjZ3FPdkZGR0dKSXduQVE9PQo=",
-      "url": "https://github.com/Cosmoto-jian/disco-a2a/releases/download/v1.3.0/Disco_1.3.0_universal.app.tar.gz"
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVUcDdocWFJV0FyVno2QVU1bUpWOUdoaW1yY053V0lPUEtpUmRobU50SWhjWHhaUUoraDN5cC84THQrLzByREVwM1ZMSFVGQ1lFU2xtaFQwQUU0a2V1YkRDUWFBN3RhRndFPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkxODgyNTg5CWZpbGU6RGlzY29fMS4zLjFfdW5pdmVyc2FsLmFwcC50YXIuZ3oKVEUxZlIvT0dCdVZDME9sdkRGK0JlZlhzZ0Y1R3VaSENXQVkyWFArOXhwa24xZkNzWXJlNkI0dEMvdHlEelNlaUZDa0xGMUwwRHFWMy8yWG52dTNKQmc9PQo=",
+      "url": "https://github.com/Cosmoto-jian/disco-a2a/releases/download/v1.3.1/Disco_1.3.1_universal.app.tar.gz"
     },
     "darwin-x86_64": {
-      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVUcDdocWFJV0FyVjZKQnFWTUtEeUFmdmdPNkNmNVZNcURSL1ozamxhcVdCMEgzUDk5V2Z5U1RjNG4wQis4S3BacURCWmdqOG9RZitxN1VBZ2VOWVpmZGg3RVJHT0VlK2dNPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkxODgwMTE3CWZpbGU6RGlzY29fMS4zLjBfdW5pdmVyc2FsLmFwcC50YXIuZ3oKclBpZ2JibmFoSXhvVXRtb1ZyWStIUU1CQS9weHNiano4YmVkKzUvcDAza2QybVR6OW9GWkhaNTlYWU1jU1E4cmFrVk9rMmhjZ3FPdkZGR0dKSXduQVE9PQo=",
-      "url": "https://github.com/Cosmoto-jian/disco-a2a/releases/download/v1.3.0/Disco_1.3.0_universal.app.tar.gz"
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVUcDdocWFJV0FyVno2QVU1bUpWOUdoaW1yY053V0lPUEtpUmRobU50SWhjWHhaUUoraDN5cC84THQrLzByREVwM1ZMSFVGQ1lFU2xtaFQwQUU0a2V1YkRDUWFBN3RhRndFPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkxODgyNTg5CWZpbGU6RGlzY29fMS4zLjFfdW5pdmVyc2FsLmFwcC50YXIuZ3oKVEUxZlIvT0dCdVZDME9sdkRGK0JlZlhzZ0Y1R3VaSENXQVkyWFArOXhwa24xZkNzWXJlNkI0dEMvdHlEelNlaUZDa0xGMUwwRHFWMy8yWG52dTNKQmc9PQo=",
+      "url": "https://github.com/Cosmoto-jian/disco-a2a/releases/download/v1.3.1/Disco_1.3.1_universal.app.tar.gz"
     },
     "windows-x86_64": {
-      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVUcDdocWFJV0FyVitjQ21pLzZFQ1g0Zm4rTlZqamhRYTkxUTErSTVwWTJ5UjkrUnJFdjJxYUUzeUszOTM3ZWxOR3JvdDZic2o2QkVDRVJjZkpLVTdPT1ZGcHQzNS8xbGdnPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkxODgwMTE4CWZpbGU6RGlzY29fMS4zLjBfeDY0LXNldHVwLmV4ZQpTclEwSU9kM1l6cktScXl4ZnpObnA4aE5kZG5aUFkrSGw3aTM4Q1lnU0NCdCtjMUFsVndQVjZ5cC83Z28wTDhCMWhUL20xaktVdWtES1p5b0Q2ZlRCdz09Cg==",
-      "url": "https://github.com/Cosmoto-jian/disco-a2a/releases/download/v1.3.0/Disco_1.3.0_x64-setup.exe"
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVUcDdocWFJV0FyVitaRFZ4dlh1ZnBTcUFMcWJNZGh3bHNxbEkvdk0vcnFramdDR0ZEd3IreEZ1bWt3d2pDSjZBcU5ncEQ5dHdvc0I4UGpzUkdSUzZkOExTQVVVdkkyaEFZPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkxODgyNTkwCWZpbGU6RGlzY29fMS4zLjFfeDY0LXNldHVwLmV4ZQp2M1JhdFFmT0xvV1p2NDNRRitQUFJ0Uzl0d3RHd09McGNUR29sMGdXcjZmaGNQQ1o4THpNNjBsbjFSME9PWm9sRDFiaHhzZ2hubC9QdWRpU05Db2xDdz09Cg==",
+      "url": "https://github.com/Cosmoto-jian/disco-a2a/releases/download/v1.3.1/Disco_1.3.1_x64-setup.exe"
     }
   }
 }
