@@ -44,20 +44,17 @@ const FORMS = {
   wave: { label: "声波", svg: [9, 16, 23, 30].map((x, i) => `<rect class="bar" style="animation-delay:${-i * 0.28}s" x="${x - 2}" y="9" width="4" height="22" rx="2"/>`).join("") },
   duo: { label: "双子", svg: '<circle class="drift" cx="15" cy="20" r="8" opacity=".7"/><circle class="drift rev" cx="25" cy="20" r="8" opacity=".7"/>' },
   tile: { label: "方块", svg: `<g class="spin slow">${PAD}<rect x="10" y="10" width="20" height="20" rx="4" opacity=".45"/></g><g class="spin rev">${PAD}<rect x="13.5" y="13.5" width="13" height="13" rx="3" transform="rotate(45 20 20)"/></g>` },
-  letter: { label: "字母", svg: null },
 };
 const FORM_KEYS = Object.keys(FORMS);
 function avatarSpec(name) {
   const a = S.ov?.agents.find((a) => a.name === name);
   const [f, p] = (a?.avatar || "").split(".");
-  return { form: FORMS[f] ? f : FORM_KEYS[hash(name) % (FORM_KEYS.length - 1)], palette: p in PALETTES ? p : "brand" };
+  return { form: FORMS[f] ? f : FORM_KEYS[hash(name) % FORM_KEYS.length], palette: p in PALETTES ? p : "brand" };
 }
 function paint(el, name, form, palette, base = colorOf(name)) {
   const [c1, c2] = PALETTES[palette] ?? [`color-mix(in srgb, ${base} 70%, #fff)`, base];
   el.style.background = `linear-gradient(140deg, ${c1}, ${c2})`;
-  const f = FORMS[form];
-  if (f?.svg) el.insertAdjacentHTML("afterbegin", `<svg viewBox="0 0 40 40" fill="#fff" aria-hidden="true">${f.svg}</svg>`);
-  else el.prepend([...name][0].toUpperCase());
+  el.insertAdjacentHTML("afterbegin", `<svg viewBox="0 0 40 40" fill="#fff" aria-hidden="true">${(FORMS[form] ?? FORMS.orbit).svg}</svg>`);
   el.dataset.form = form;
   return el;
 }
@@ -678,7 +675,7 @@ function agentForm(t) {
   const name = h("input", { class: "fld", value: t.kind === "acp" ? t.id : "", placeholder: "名称，如 coder", spellcheck: false });
   let look = null;
   const parts = [h("div", { class: "frow" }, h("span", {}, "名称"), name),
-    h("div", { class: "frow top" }, h("span", {}, "形象"), avatarPicker(t.letter ?? t.name, { form: FORM_KEYS[hash(t.id) % (FORM_KEYS.length - 1)], palette: "brand", base: t.color }, (v) => { look = v; }))];
+    h("div", { class: "frow top" }, h("span", {}, "形象"), avatarPicker(t.letter ?? t.name, { form: FORM_KEYS[hash(t.id) % FORM_KEYS.length], palette: "brand", base: t.color }, (v) => { look = v; }))];
   let cmd, url, hn, hv;
   if (t.kind === "command") {
     cmd = h("input", { class: "fld", placeholder: "/path/to/agent --acp", spellcheck: false });
