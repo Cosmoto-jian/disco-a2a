@@ -121,7 +121,8 @@ impl Core {
         let mut context = format!("# 任务\n\n{task}\n\n# 成员\n\n");
         for m in &g.members { context.push_str(&format!("- {m}{}\n", if *m == lead { "（负责人）" } else { "" })); }
         context.push_str("\n# 最近的群聊\n\n");
-        for m in self.db().messages(&thread, 20).unwrap_or_default() {
+        let history = self.db().messages(&thread, 20).unwrap_or_default();
+        for m in history {
             let who = if m.author == "me" { "用户" } else { m.author.as_str() };
             let body: String = m.body.chars().take(500).collect();
             context.push_str(&format!("[{who}] {body}\n"));

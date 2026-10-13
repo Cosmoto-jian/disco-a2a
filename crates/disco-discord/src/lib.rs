@@ -228,12 +228,21 @@ impl Rest {
 
     /// Discord user ids that own the bot application (the owner, or every team member).
     pub async fn owner_ids(&self) -> Result<Vec<String>, String> {
+        Ok(self.owners().await?.into_iter().map(|(id, _)| id).collect())
+    }
+
+    /// The application's owner(s): (user id, the names they show up as).
+    pub async fn owners(&self) -> Result<Vec<(String, Vec<String>)>, String> {
         let v = self.get("/oauth2/applications/@me").await?;
-        let mut ids: Vec<String> = v["owner"]["id"].as_str().map(str::to_owned).into_iter().collect();
-        if let Some(members) = v["team"]["members"].as_array() {
-            ids.extend(members.iter().filter_map(|m| m["user"]["id"].as_str().map(str::to_owned)));
+        let user = |u: &Value| -> Option<(String, Vec<String>)> {
+            let names = [&u["global_name"], &u["username"]].iter().filter_map(|n| n.as_str()).map(str::to_owned).collect();
+            Some((u["id"].as_str()?.to_owned(), names))
+        };
+        let mut out: Vec<(String, Vec<String>)> = user(&v["owner"]).into_iter().collect();
+        for m in v["team"]["members"].as_array().into_iter().flatten() {
+            out.extend(user(&m["user"]));
         }
-        Ok(ids)
+        Ok(out)
     }
 
     pub async fn guilds(&self) -> Result<Vec<Guild>, String> {

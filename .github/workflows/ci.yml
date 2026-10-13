@@ -18,9 +18,31 @@ jobs:
         with: { components: clippy }
       - uses: Swatinem/rust-cache@v2
       - if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev xvfb
       - if: runner.os == 'macOS'
         run: brew install protobuf
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: DISCO_ENV_PROBE=1 cargo test --workspace --release
       - run: cargo test -p disco-store --release -- --ignored --nocapture
+      # End-to-end: launch the real app with a mock ACP agent and drive every main flow
+      # (import, 1:1, groups, multi-person rules, memory switch, undo, rename, stop).
+      - run: cargo build -p disco-app -p disco-acp --bins
+      - if: runner.os == 'Linux'
+        timeout-minutes: 6
+        run: HOME=$(mktemp -d) DISCO_SELFTEST=$PWD/target/debug/mock-acp-agent xvfb-run -a target/debug/disco-app
+      - if: runner.os == 'macOS'
+        timeout-minutes: 6
+        run: HOME=$(mktemp -d) DISCO_SELFTEST=$PWD/target/debug/mock-acp-agent target/debug/disco-app
+  selftest-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with: { key: windows-selftest }
+      - uses: arduino/setup-protoc@v3
+        with: { repo-token: "${{ secrets.GITHUB_TOKEN }}" }
+      - run: cargo build -p disco-app -p disco-acp --bins
+      - timeout-minutes: 6
+        shell: bash
+        run: DISCO_SELFTEST="$(cygpath -w "$PWD/target/debug/mock-acp-agent.exe")" target/debug/disco-app.exe

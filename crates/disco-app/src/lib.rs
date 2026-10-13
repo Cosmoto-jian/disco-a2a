@@ -12,6 +12,8 @@ mod share;
 mod files;
 mod tailnet;
 mod templates;
+#[cfg(debug_assertions)]
+mod selftest;
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -38,6 +40,8 @@ const SET_HOME_GUILD: &str = "home_guild";
 const SET_AGENT_CH: &str = "agent_channel/";
 /// Chosen avatar (`<form>.<palette>`, see ui/app.js); empty = generated from the name.
 const SET_AVATAR: &str = "avatar/";
+/// Names the bot owner(s) go by on Discord, one per line.
+const SET_OWNER_NAMES: &str = "discord_owner_names";
 const AGENT_CATEGORY: &str = "Disco Agents";
 const GROUP_CATEGORY: &str = "Disco 群聊";
 /// Memory notes live in settings as `mem/<scope>/<millis>`; scope is `all` or an agent name.
@@ -353,12 +357,11 @@ impl Core {
             return Some((m.author.clone(), m.content.clone()));
         }
         if m.bot {
+            // Only another Disco's relay format counts; other bots in the channel are ignored.
             group?;
-            let relayed = m.content.strip_prefix("**").and_then(|r| r.split_once("**："));
-            return Some(match relayed {
-                Some((name, text)) if !name.is_empty() => (format!("{name}{HUMAN_TAG}"), text.to_owned()),
-                _ => (format!("{}{HUMAN_TAG}", m.author), m.content.clone()),
-            });
+            let (name, text) = m.content.strip_prefix("**").and_then(|r| r.split_once("**："))?;
+            if name.is_empty() || name.contains('\n') { return None; }
+            return Some((format!("{name}{HUMAN_TAG}"), text.to_owned()));
         }
         let is_owner = self.owners.lock().unwrap_or_else(|p| p.into_inner()).contains(&m.author_id);
         if !is_owner && !(group.is_some() && !agent_channel) && !self.allowed(&m.author_id) {
@@ -402,10 +405,17 @@ impl Core {
     /// only one, and make sure every agent has its channel.
     async fn on_discord_connected(&self) {
         let Some(rest) = self.discord_rest() else { return };
-        if let Ok(ids) = rest.owner_ids().await {
-            // Agents address the owner by their computer name: make that a real ping too.
-            if let Some(id) = ids.first() { self.people.lock().unwrap_or_else(|p| p.into_inner()).insert(share::owner_name(), id.clone()); }
-            *self.owners.lock().unwrap_or_else(|p| p.into_inner()) = ids;
+        if let Ok(owners) = rest.owners().await {
+            {
+                // Agents address the owner by their computer name: make that a real ping too.
+                let mut people = self.people.lock().unwrap_or_else(|p| p.into_inner());
+                if let Some((id, _)) = owners.first() { people.insert(share::owner_name(), id.clone()); }
+            }
+            // Remembered so the owner's own older Discord messages ("Name (Discord)")
+            // never make a group look like it has other people in it.
+            let names: Vec<String> = owners.iter().flat_map(|(_, n)| n.iter().cloned()).collect();
+            let _ = self.db().set_setting(SET_OWNER_NAMES, &names.join("\n"));
+            *self.owners.lock().unwrap_or_else(|p| p.into_inner()) = owners.into_iter().map(|(id, _)| id).collect();
         }
         let has_home = self.db().setting(SET_HOME_GUILD).is_some();
         if !has_home && let Ok(gs) = rest.guilds().await && gs.len() == 1 {
@@ -537,9 +547,11 @@ impl Core {
     /// Who besides the owner and this Disco's agents has spoken in the group lately.
     fn roster(&self, g: &GroupRow, thread: &str) -> Roster {
         let mut r = Roster::default();
-        for m in self.db().messages(thread, 100).unwrap_or_default() {
+        let owner: Vec<String> = self.db().setting(SET_OWNER_NAMES).unwrap_or_default().lines().map(|n| format!("{n}{HUMAN_TAG}")).collect();
+        let history = self.db().messages(thread, 100).unwrap_or_default();
+        for m in history {
             let a = m.author;
-            if a == "me" || a == "system" || g.members.contains(&a) { continue; }
+            if a == "me" || a == "system" || g.members.contains(&a) || owner.contains(&a) { continue; }
             let list = if a.ends_with(HUMAN_TAG) { &mut r.people } else { &mut r.agents };
             let name = display(&a);
             if !list.contains(&name) { list.push(name); }
@@ -786,19 +798,25 @@ async fn overview(core: St<'_>) -> CmdResult<Overview> {
         agents.push(AgentView { live: core.hub.is_live(&a.name).await, name: a.name, kind: a.transport, template, detail, avatar });
     }
     let peers = core.shares().into_iter().map(|(id, s)| PeerView { thread: format!("peer:{id}"), guest: s.guest, agent: s.agent }).collect();
+    // Read every setting first, one lock at a time: a `core.db()` temporary inside the
+    // struct literal below would stay locked to the end of the statement, and any later
+    // `db()` in it (roster, the switches) would then deadlock the whole app.
+    let groups: Vec<GroupView> = groups.into_iter().map(|g| {
+        let r = core.roster(&g, &format!("group:{}", g.id));
+        GroupView { id: g.id, name: g.name, guild_id: g.guild_id, lead: g.lead_agent, members: g.members, people: r.people, guests: r.agents }
+    }).collect();
+    let discord_token = core.db().setting(SET_TOKEN_SAVED).is_some();
+    let memory_off: Vec<String> = core.db().settings_with_prefix(memory::MEM_OFF).unwrap_or_default().into_iter()
+        .filter(|(_, v)| v == "1").map(|(k, _)| k).collect();
     Ok(Overview {
         peers,
         agents,
-        groups: groups.into_iter().map(|g| {
-            let r = core.roster(&g, &format!("group:{}", g.id));
-            GroupView { id: g.id, name: g.name, guild_id: g.guild_id, lead: g.lead_agent, members: g.members, people: r.people, guests: r.agents }
-        }).collect(),
+        groups,
         heads: heads.into_iter().map(|(t, m)| Head { thread: t, author: m.author, body: m.body, ts: m.ts }).collect(),
-        discord_token: core.db().setting(SET_TOKEN_SAVED).is_some(),
-        discord_status: core.discord_status.lock().unwrap_or_else(|p| p.into_inner()).clone(),
+        discord_token,
+        discord_status: core.discord_status(),
         paused: core.paused.load(Ordering::Relaxed),
-        memory_off: core.db().settings_with_prefix(memory::MEM_OFF).unwrap_or_default().into_iter()
-            .filter(|(_, v)| v == "1").map(|(k, _)| k).collect(),
+        memory_off,
     })
 }
 
@@ -1031,7 +1049,8 @@ async fn rename_agent(core: St<'_>, name: String, new_name: String) -> CmdResult
     }
     core.db().rename_agent(&name, &new).map_err(err)?;
     core.memory_rename(&name, &new);
-    if let Some(av) = core.db().setting(&format!("{SET_AVATAR}{name}")).filter(|v| !v.is_empty()) {
+    let avatar = core.db().setting(&format!("{SET_AVATAR}{name}")).filter(|v| !v.is_empty());
+    if let Some(av) = avatar {
         core.db().set_setting(&format!("{SET_AVATAR}{name}"), "").map_err(err)?;
         core.db().set_setting(&format!("{SET_AVATAR}{new}"), &av).map_err(err)?;
     }
@@ -1300,7 +1319,8 @@ async fn diagnose(core: St<'_>) -> CmdResult<Vec<Check>> {
     add("Tailscale", me.map(|n| format!("这台 Mac：{}", n.node)).ok_or("没检测到：共享 agent 需要先安装并登录 Tailscale".into()));
     let path = core.hub.user_path.clone();
     add("Node.js / npx", hub::which("npx", &path).map(|p| p.display().to_string()).ok_or("找不到 npx：Claude Code、Codex、pi 需要先安装 Node.js".into()));
-    for a in core.db().list_agents().map_err(err)?.into_iter().filter(|a| a.transport == "acp") {
+    let agents = core.db().list_agents().map_err(err)?;
+    for a in agents.into_iter().filter(|a| a.transport == "acp") {
         let cmd = a.endpoint.split_whitespace().next().unwrap_or_default().to_owned();
         add(&format!("agent {}", a.name), hub::which(&cmd, &path).map(|_| format!("命令 {cmd} 可用")).ok_or(format!("找不到命令 {cmd}")));
     }
@@ -1400,7 +1420,8 @@ fn connect_discord(core: Arc<Core>) {
         return;
     };
     let (stop_tx, stop_rx) = watch::channel(false);
-    if let Some(old) = core.discord.lock().unwrap_or_else(|p| p.into_inner()).replace(Discord { rest: Rest::new(token.clone()), stop: stop_tx }) {
+    let old = core.discord.lock().unwrap_or_else(|p| p.into_inner()).replace(Discord { rest: Rest::new(token.clone()), stop: stop_tx });
+    if let Some(old) = old {
         let _ = old.stop.send(true);
     }
     let (tx, mut rx) = mpsc::channel::<Incoming>(64);
@@ -1505,6 +1526,8 @@ pub fn run() {
             core.warm(None);
             if !core.shares().is_empty() { core.serve_shares(); }
             app.manage(core);
+            #[cfg(debug_assertions)]
+            if let Ok(mock) = std::env::var("DISCO_SELFTEST") { selftest::spawn(app.handle().clone(), mock); }
             let handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
                 // Quietly check a few seconds after launch; errors (offline) are ignored.

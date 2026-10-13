@@ -288,7 +288,8 @@ impl Hub {
     }
 
     pub async fn drop_agent(&self, agent: &str) {
-        if let Some(Runtime::Acp(a)) = self.live.lock().await.remove(agent).as_ref().and_then(|c| c.get()) {
+        let cell = self.live.lock().await.remove(agent);
+        if let Some(Runtime::Acp(a)) = cell.as_ref().and_then(|c| c.get()) {
             a.kill();
         }
     }
