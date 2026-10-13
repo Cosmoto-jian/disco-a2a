@@ -145,6 +145,12 @@ impl Hub {
                 if spec.command == "npx" && !args.iter().any(|a| a == "--prefer-offline") {
                     args.insert(0, "--prefer-offline".into());
                 }
+                // Windows: run npx as `node npx-cli.js` rather than through npx.cmd,
+                // so no cmd.exe sits between Disco and the agent (quoting, os error 193).
+                let (command, args) = match npx_cli(&command) {
+                    Some((node, cli)) => (node, std::iter::once(cli).chain(args).collect()),
+                    None => (command, args),
+                };
                 // A PowerShell script picked as the agent program runs through PowerShell.
                 let (command, args) = if command.extension().is_some_and(|e| e.eq_ignore_ascii_case("ps1")) {
                     let mut a = vec!["-NoProfile".into(), "-ExecutionPolicy".into(), "Bypass".into(), "-File".into(), command.to_string_lossy().into_owned()];
@@ -378,6 +384,15 @@ pub fn which(cmd: &str, path: &str) -> Option<PathBuf> {
     let with_ext = |p: PathBuf| exts.iter().map(|e| PathBuf::from(format!("{}{e}", p.display()))).find(|p| runnable(p));
     if cmd.contains('/') || cmd.contains('\\') { return with_ext(PathBuf::from(cmd)); }
     path.split(PATH_SEP).filter(|d| !d.is_empty()).find_map(|d| with_ext(PathBuf::from(d).join(cmd)))
+}
+
+/// `npx(.cmd)` in a Node.js folder → that folder's `node.exe` and `npx-cli.js`.
+fn npx_cli(command: &std::path::Path) -> Option<(PathBuf, String)> {
+    if !cfg!(windows) || !command.file_stem().is_some_and(|s| s.eq_ignore_ascii_case("npx")) { return None; }
+    let dir = command.parent()?;
+    let node = dir.join("node.exe");
+    let cli = dir.join("node_modules").join("npm").join("bin").join("npx-cli.js");
+    (node.is_file() && cli.is_file()).then(|| (node, cli.to_string_lossy().into_owned()))
 }
 
 /// A command that never flashes a console window on Windows.

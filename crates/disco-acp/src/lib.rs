@@ -106,6 +106,50 @@ const INHERITED: &[&str] = &["PATH", "HOME", "LANG", "TMPDIR", "USER", "SHELL",
     "SystemRoot", "SystemDrive", "windir", "ComSpec", "PATHEXT", "TEMP", "TMP", "USERPROFILE", "USERNAME", "APPDATA", "LOCALAPPDATA",
     "ProgramData", "ProgramFiles", "ProgramFiles(x86)", "CommonProgramFiles", "HOMEDRIVE", "HOMEPATH", "NUMBER_OF_PROCESSORS", "PROCESSOR_ARCHITECTURE", "OS"];
 
+/// Provider settings an agent CLI reads from the environment (API keys, base
+/// URLs, proxies, its own config vars). Without them a CLI that works in the
+/// terminal reports "No LLM provider configured" when Disco starts it.
+fn passes_through(k: &str) -> bool {
+    let k = k.to_ascii_uppercase();
+    const PREFIX: &[&str] = &["HERMES_", "OPENAI_", "ANTHROPIC_", "OPENROUTER_", "GEMINI_", "GOOGLE_", "DEEPSEEK_", "NOUS_", "AZURE_OPENAI_",
+        "MISTRAL_", "GROQ_", "XAI_", "MOONSHOT_", "DASHSCOPE_", "ZHIPU_", "OLLAMA_", "LITELLM_", "CLAUDE_", "CODEX_", "PI_", "XDG_"];
+    const SUFFIX: &[&str] = &["_API_KEY", "_API_BASE", "_BASE_URL", "_AUTH_TOKEN"];
+    const EXACT: &[&str] = &["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY", "SSL_CERT_FILE", "NODE_EXTRA_CA_CERTS", "PYTHONUTF8", "PYTHONIOENCODING"];
+    PREFIX.iter().any(|p| k.starts_with(p)) || SUFFIX.iter().any(|s| k.ends_with(s)) || EXACT.contains(&k.as_str())
+}
+
+/// The environment an agent starts with: the basics in INHERITED plus provider
+/// settings. On Windows the user's own variables (HKCU\Environment) are read
+/// too, so a key set after Disco was opened still reaches the agent.
+fn base_env() -> Vec<(String, String)> {
+    #[cfg_attr(not(windows), allow(unused_mut))]
+    let mut out: Vec<(String, String)> = std::env::vars()
+        .filter(|(k, _)| INHERITED.iter().any(|i| i.eq_ignore_ascii_case(k)) || passes_through(k))
+        .collect();
+    #[cfg(windows)]
+    for (k, v) in user_env_windows() {
+        if passes_through(&k) && !out.iter().any(|(o, _)| o.eq_ignore_ascii_case(&k)) { out.push((k, v)); }
+    }
+    out
+}
+
+#[cfg(windows)]
+fn user_env_windows() -> Vec<(String, String)> {
+    use std::os::windows::process::CommandExt;
+    let Ok(o) = std::process::Command::new("reg").args(["query", r"HKCU\Environment"]).creation_flags(0x0800_0000).output() else { return Vec::new() };
+    parse_reg_values(&String::from_utf8_lossy(&o.stdout))
+}
+
+/// `    NAME    REG_SZ    value` lines of `reg query` output.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn parse_reg_values(text: &str) -> Vec<(String, String)> {
+    text.lines().filter_map(|l| {
+        let mut it = l.trim_start().splitn(3, "    ");
+        let (k, t, v) = (it.next()?, it.next()?, it.next()?);
+        (t == "REG_SZ" && !k.is_empty() && !v.contains('%')).then(|| (k.to_owned(), v.trim_end().to_owned()))
+    }).collect()
+}
+
 type Pending = Arc<Mutex<HashMap<String, oneshot::Sender<PermissionDecision>>>>;
 /// ACP session id -> event channel of the prompt currently running in it.
 type Sinks = Arc<Mutex<HashMap<String, mpsc::Sender<AgentEvent>>>>;
@@ -143,7 +187,7 @@ impl AcpAgent {
         let mut c = tokio::process::Command::new(&launch.command);
         c.args(&launch.args)
             .env_clear()
-            .envs(INHERITED.iter().filter_map(|k| std::env::var(k).ok().map(|v| (*k, v))))
+            .envs(base_env())
             .envs(launch.env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
             .current_dir(&launch.cwd)
             .stdin(Stdio::piped())
@@ -430,5 +474,18 @@ async fn run_connection<W, R>(
         .await;
     if let Err(e) = result {
         tracing::warn!("acp connection ended: {e}");
+    }
+}
+
+#[cfg(test)]
+mod env_tests {
+    use super::*;
+
+    #[test]
+    fn provider_env() {
+        assert!(passes_through("OPENROUTER_API_KEY") && passes_through("hermes_home") && passes_through("MY_LLM_API_KEY"));
+        assert!(!passes_through("AWS_SECRET_ACCESS_KEY") && !passes_through("GITHUB_TOKEN"));
+        let r = "\r\nHKEY_CURRENT_USER\\Environment\r\n    OPENAI_API_KEY    REG_SZ    sk-a b\r\n    Path    REG_EXPAND_SZ    %USERPROFILE%\\x\r\n";
+        assert_eq!(parse_reg_values(r), vec![("OPENAI_API_KEY".to_owned(), "sk-a b".to_owned())]);
     }
 }
