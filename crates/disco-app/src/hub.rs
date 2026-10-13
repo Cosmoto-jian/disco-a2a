@@ -136,6 +136,13 @@ impl Hub {
                     env.extend([("CONDA_PREFIX".to_owned(), spec.conda.clone()), ("CONDA_DEFAULT_ENV".into(), name), ("CONDA_SHLVL".into(), "1".into())]);
                 }
                 env.push(("PATH".into(), path.clone()));
+                // Windows: the Claude ACP adapter looks for claude.exe inside an npm
+                // optional package that npx often skips; point it at the user's own.
+                if cfg!(windows) && std::iter::once(&spec.command).chain(&spec.args).any(|a| a.contains("claude"))
+                    && std::env::var_os("CLAUDE_CODE_EXECUTABLE").is_none()
+                    && let Some(exe) = which("claude.exe", &path) {
+                    env.push(("CLAUDE_CODE_EXECUTABLE".into(), exe.to_string_lossy().into_owned()));
+                }
                 let command = which(&spec.command, &path).ok_or_else(|| match spec.command.as_str() {
                     "npx" | "node" => "找不到 npx：请先安装 Node.js（https://nodejs.org），然后重启 Disco".to_owned(),
                     c => format!("找不到命令 {c}：请先安装它，或在终端确认 `which {c}` 有输出"),
