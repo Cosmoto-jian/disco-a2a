@@ -341,6 +341,25 @@ impl Core {
         self.db().setting(&format!("{SET_AGENT_CH}{agent}"))
     }
 
+    /// One message from the Discord gateway: find its agent channel or group, decide who
+    /// spoke, and handle it on its own task so one slow agent never blocks the others.
+    fn on_incoming(self: &Arc<Self>, m: Incoming) {
+        let c = self.clone();
+        if let Some(press) = m.press {
+            tauri::async_runtime::spawn(async move { c.inbox_press(&m.author_id, &m.author, press).await });
+            return;
+        }
+        let agent = c.db().settings_with_prefix(SET_AGENT_CH).unwrap_or_default().into_iter().find(|(_, ch)| *ch == m.channel_id).map(|(a, _)| a);
+        let group = c.db().list_groups().unwrap_or_default().into_iter().find(|g| g.id == m.channel_id);
+        let Some((author, content)) = c.speaker(&m, group.as_ref(), agent.is_some()) else { return };
+        tauri::async_runtime::spawn(async move {
+            match agent {
+                Some(a) => c.dm(a, author, content, true).await,
+                None => c.group(m.channel_id, author, content, true).await,
+            }
+        });
+    }
+
     /// Who wrote a Discord message, as Disco records it, and its text; None to ignore it.
     /// - A group channel is the group: anyone who can post there takes part (Discord's
     ///   channel permissions decide who), and approvals still only reach this Disco's owner.
@@ -1438,24 +1457,7 @@ fn connect_discord(core: Arc<Core>) {
         c.set_discord_status(s);
     }));
     tauri::async_runtime::spawn(async move {
-        while let Some(m) = rx.recv().await {
-            if let Some(press) = m.press {
-                let c = core.clone();
-                tauri::async_runtime::spawn(async move { c.inbox_press(&m.author_id, &m.author, press).await });
-                continue;
-            }
-            let c = core.clone();
-            let agent = c.db().settings_with_prefix(SET_AGENT_CH).unwrap_or_default().into_iter().find(|(_, ch)| *ch == m.channel_id).map(|(a, _)| a);
-            let group = c.db().list_groups().unwrap_or_default().into_iter().find(|g| g.id == m.channel_id);
-            let Some((author, content)) = c.speaker(&m, group.as_ref(), agent.is_some()) else { continue };
-            // Each message runs on its own task so one slow agent never blocks others.
-            tauri::async_runtime::spawn(async move {
-                match agent {
-                    Some(a) => c.dm(a, author, content, true).await,
-                    None => c.group(m.channel_id, author, content, true).await,
-                }
-            });
-        }
+        while let Some(m) = rx.recv().await { core.on_incoming(m); }
     });
 }
 

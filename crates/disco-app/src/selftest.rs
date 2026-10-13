@@ -33,6 +33,9 @@ fn count(core: &Core, thread: &str, author: &str) -> usize {
 pub fn spawn(app: AppHandle, mock: String) {
     tauri::async_runtime::spawn(async move {
         let core: Arc<Core> = app.state::<Arc<Core>>().inner().clone();
+        // Any panic is a failure, not a hang.
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| { prev(info); println!("SELFTEST PANIC"); std::process::exit(101); }));
         // Approve every permission the mock asks for, like a user would.
         let c2 = core.clone();
         tauri::async_runtime::spawn(async move {
@@ -101,10 +104,38 @@ pub fn spawn(app: AppHandle, mock: String) {
             crate::restore_group(st(), gid.clone(), String::new(), "dev".into(), vec!["m1".into(), "m2".into()], Some("m1".into()))?;
             within(5, crate::overview(st())).await?.and_then(|o| if o.groups.iter().any(|g| g.id == gid) { Ok(String::new()) } else { Err("没恢复".into()) }) });
 
+        // Discord: what the gateway delivers, fed through the same handler.
+        *core.owners.lock().unwrap() = vec!["owner1".into()];
+        let _ = core.db().upsert_group(&crate::GroupRow { id: "chan1".into(), guild_id: "g1".into(), name: "dc".into(), lead_agent: Some("m1".into()), webhook_ref: None, members: vec!["m1".into()] });
+        let _ = core.db().set_setting(&format!("{}m1", crate::SET_AGENT_CH), "chanA");
+        let msg = |ch: &str, id: &str, name: &str, text: &str| disco_discord::Incoming { guild_id: "g1".into(), channel_id: ch.into(), author_id: id.into(), author: name.into(), content: text.into(), webhook_id: None, bot: false, press: None };
+        let _ = check!("Discord 私聊频道 主人", { let n = count(&core, "dm:m1", "m1"); core.on_incoming(msg("chanA", "owner1", "Jian", "hi")); wait_msg(&core, "dm:m1", "m1", n, 30).await });
+        let _ = check!("Discord 私聊频道 陌生人被拦", { let n = count(&core, "dm:m1", "Bob (Discord)"); core.on_incoming(msg("chanA", "u9", "Bob", "hi")); tokio::time::sleep(Duration::from_secs(1)).await;
+            if count(&core, "dm:m1", "Bob (Discord)") == n { Ok(String::new()) } else { Err("陌生人进来了".into()) } });
+        let _ = check!("Discord 群 主人不@ → 组长", { let n = count(&core, "group:chan1", "m1"); core.on_incoming(msg("chan1", "owner1", "Jian", "大家好")); wait_msg(&core, "group:chan1", "m1", n, 30).await });
+        let _ = check!("Discord 群 朋友 @m1", { let n = count(&core, "group:chan1", "m1"); core.on_incoming(msg("chan1", "u9", "Bob", "@m1 你好")); wait_msg(&core, "group:chan1", "m1", n, 30).await
+            .and_then(|b| if b.starts_with("@Bob") { Ok(b) } else { Err(b) }) });
+        let _ = check!("Discord 别的 bot 被忽略", { let n = core.db().messages("group:chan1", 500).map(|v| v.len()).unwrap_or(0);
+            core.on_incoming(disco_discord::Incoming { bot: true, ..msg("chan1", "b1", "MEE6", "level up!") }); tokio::time::sleep(Duration::from_secs(1)).await;
+            if core.db().messages("group:chan1", 500).map(|v| v.len()).unwrap_or(0) == n { Ok(String::new()) } else { Err("记下来了".into()) } });
+        let _ = check!("Discord 另一个 Disco 转发的人", { core.on_incoming(disco_discord::Incoming { bot: true, ..msg("chan1", "b2", "TheirBot", "**Amy**：大家好") });
+            wait_msg(&core, "group:chan1", "Amy (Discord)", 0, 5).await });
+        let _ = check!("Discord 另一个 Disco 的 agent @m1", { let n = count(&core, "group:chan1", "m1");
+            core.on_incoming(disco_discord::Incoming { webhook_id: Some("hook9".into()), ..msg("chan1", "hook9", "coder", "@m1 帮我看看") }); wait_msg(&core, "group:chan1", "m1", n, 30).await });
+
         // the rest of the surface
         let _ = check!("messages", crate::messages(st(), gt.clone()).map(|v| format!("{} 条", v.len())));
-        let _ = check!("todo", { let id = crate::todo_new(st(), gt.clone(), "写测试".into())?; crate::todo_set(st(), gt.clone(), id.clone(), true)?; crate::todo_remove(st(), gt.clone(), id)?; Ok(String::new()) });
-        let _ = check!("space", crate::space(st(), gt.clone()).map(|s| format!("{} todos", s.todos.len())));
+        let _ = check!("待办 增/完成/删", {
+            let id = crate::todo_new(st(), gt.clone(), "写测试".into())?;
+            let has = |done: bool| crate::space(st(), gt.clone()).map(|s| s.todos.iter().any(|t| t.id == id && t.done == done));
+            if !has(false)? { return Err("新增后看不到".into()); }
+            crate::todo_set(st(), gt.clone(), id.clone(), true)?;
+            if !has(true)? { return Err("没标记完成".into()); }
+            crate::todo_remove(st(), gt.clone(), id.clone())?;
+            if crate::space(st(), gt.clone())?.todos.iter().any(|t| t.id == id) { return Err("删不掉".into()); }
+            Ok(String::new()) });
+        let _ = check!("群文档", { crate::doc_save(st(), gt.clone(), "# 目标\n".into())?;
+            let d = crate::space(st(), gt.clone())?.doc; if d.contains("目标") { Ok(String::new()) } else { Err(d) } });
         let _ = check!("agent_commands", within(5, crate::agent_commands(st(), "m1".into())).await.and_then(|r| r.map(|v| format!("{} 个", v.len()))));
         let _ = check!("rename", within(20, crate::rename_agent(st(), "m2".into(), "m3".into())).await.and_then(|r| r).map(|_| String::new()));
         let _ = check!("改名后群聊", { let n = count(&core, &gt, "m3"); crate::send(st(), gt.clone(), "@m3 改名了".into())?; wait_msg(&core, &gt, "m3", n, 30).await });

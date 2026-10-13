@@ -399,7 +399,7 @@ pub fn todos(core: &Core, thread: &str) -> Vec<Todo> {
     let prefix = todo_prefix(thread);
     core.db().settings_with_prefix(&prefix).unwrap_or_default().into_iter().filter_map(|(k, v)| {
         let mut t: Todo = serde_json::from_str(&v).ok()?;
-        t.id = short_id(&k[prefix.len()..]);
+        t.id = short_id(&k); // keys come back without the prefix
         Some(t)
     }).collect()
 }
@@ -421,8 +421,8 @@ pub fn add_todo(core: &Core, thread: &str, text: &str, assignee: Option<&str>, b
 fn find_todo(core: &Core, thread: &str, id: &str) -> Result<(String, Todo), String> {
     let prefix = todo_prefix(thread);
     core.db().settings_with_prefix(&prefix).unwrap_or_default().into_iter()
-        .find(|(k, _)| k.ends_with(id))
-        .and_then(|(k, v)| Some((k, serde_json::from_str(&v).ok()?)))
+        .find(|(k, v)| k.ends_with(id) && !v.is_empty())
+        .and_then(|(k, v)| Some((format!("{prefix}{k}"), serde_json::from_str(&v).ok()?)))
         .ok_or_else(|| format!("没有 id 为 {id} 的待办"))
 }
 
