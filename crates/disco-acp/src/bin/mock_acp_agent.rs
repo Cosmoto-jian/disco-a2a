@@ -1,5 +1,5 @@
 //! Deterministic ACP agent for tests and CI: streams two chunks, asks one
-//! permission, reports whether a forbidden env var leaked, then ends the turn.
+//! permission, reports whether the parent's environment reached it, then ends the turn.
 use agent_client_protocol::schema::v1::{
     AgentCapabilities, ContentChunk, InitializeRequest, InitializeResponse, NewSessionRequest,
     NewSessionResponse, PermissionOption, PermissionOptionKind, PromptRequest, PromptResponse,
@@ -42,8 +42,8 @@ async fn main() -> agent_client_protocol::Result<()> {
                     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
                     chunk(&cx2, &s, "hello ")?;
                     chunk(&cx2, &s, "from mock")?;
-                    let leaked = std::env::var("DISCO_LEAK_PROBE").is_ok();
-                    chunk(&cx2, &s, if leaked { " env=LEAKED" } else { " env=clean" })?;
+                    let seen = std::env::var("DISCO_ENV_PROBE").is_ok();
+                    chunk(&cx2, &s, if seen { " env=inherited" } else { " env=missing" })?;
                     let ask = RequestPermissionRequest::new(
                         s.clone(),
                         ToolCallUpdate::new("tc1", ToolCallUpdateFields::new().title("rm -rf build").kind(ToolKind::Execute).status(ToolCallStatus::Pending)),

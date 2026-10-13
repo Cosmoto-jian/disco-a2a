@@ -1,4 +1,4 @@
-//! M0-4 (mechanics): spawn the mock agent, stream, answer a permission ask, check env isolation.
+//! M0-4 (mechanics): spawn the mock agent, stream, answer a permission ask, check the agent inherits the environment.
 use std::time::Duration;
 
 use disco_acp::{AcpAgent, Launch};
@@ -39,8 +39,8 @@ async fn drive(agent: &AcpAgent, key: &str, decision: &str) -> String {
 #[tokio::test(flavor = "multi_thread")]
 async fn streams_and_handles_permission() {
     let agent = AcpAgent::spawn(launch()).await.unwrap();
-    assert_eq!(drive(&agent, "dm", "allow").await, "hello from mock env=clean ran");
-    assert_eq!(drive(&agent, "dm", "deny").await, "hello from mock env=clean skipped");
+    assert_eq!(drive(&agent, "dm", "allow").await, "hello from mock env=inherited ran");
+    assert_eq!(drive(&agent, "dm", "deny").await, "hello from mock env=inherited skipped");
 }
 
 #[tokio::test(flavor = "multi_thread")]
