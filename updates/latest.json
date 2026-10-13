@@ -1,15 +1,19 @@
 {
-  "version": "1.1.0",
-  "notes": "去掉 Yobiru 兼容，保留 Tailscale 访问规则、免打扰和共享空间文件",
-  "pub_date": "2026-10-13T03:37:18Z",
+  "version": "1.2.0",
+  "notes": "首个 Windows 版本：Windows x64 安装程序与 macOS 版同步发布、同步自动更新。",
+  "pub_date": "2026-10-13T05:07:35Z",
   "platforms": {
     "darwin-aarch64": {
-      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVUcDdocWFJV0FyVi8rSjBnakpYSWREZ2lESW5rZWZ4QnVqajd0MS9oVHhZSXVBUUhqQ1NTUlQybVhtS1lvdzlhSkEzQlU1bngyOXhranFEdXhSZEM3MjFCM2htMlRkWndvPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkxODYyNjM4CWZpbGU6RGlzY29fMS4xLjBfdW5pdmVyc2FsLmFwcC50YXIuZ3oKODhSdXg3OElBSStYUENkS214b1ZJdWpuU1VuekNOYXdvQWMyVFdOQzFJMTZKRkJhenZJWjBiZy92R3hIZ1JHUjZ1dS8xdmVtekdFOFhDcHJjaHFmQnc9PQo=",
-      "url": "https://github.com/Cosmoto-jian/disco-a2a/releases/download/v1.1.0/Disco_1.1.0_universal.app.tar.gz"
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVUcDdocWFJV0FyVjdJT1o4TzFZTkNhTlIxQ0pTOHJ3b09BTUh6aExOYXJ6M1Bab2YvbjluUXgvQjVoUzN5Qy9MN0RQQ2ZBb3BGeFpRTVVkN3dRWEFOQXBmcHFGWkdKdGdRPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkxODY4MDU0CWZpbGU6RGlzY29fMS4yLjBfdW5pdmVyc2FsLmFwcC50YXIuZ3oKdE9qRC9Falpvais5SXRDcnlvN1NMUWdwbER6S25wZlR0dzlJNmQrVVdZOVlrY1hLc3pqem1UUkxjcDlIN0ZkT0QyZUwzTldiQzAvV2lhczY2OFFnRHc9PQo=",
+      "url": "https://github.com/Cosmoto-jian/disco-a2a/releases/download/v1.2.0/Disco_1.2.0_universal.app.tar.gz"
     },
     "darwin-x86_64": {
-      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVUcDdocWFJV0FyVi8rSjBnakpYSWREZ2lESW5rZWZ4QnVqajd0MS9oVHhZSXVBUUhqQ1NTUlQybVhtS1lvdzlhSkEzQlU1bngyOXhranFEdXhSZEM3MjFCM2htMlRkWndvPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkxODYyNjM4CWZpbGU6RGlzY29fMS4xLjBfdW5pdmVyc2FsLmFwcC50YXIuZ3oKODhSdXg3OElBSStYUENkS214b1ZJdWpuU1VuekNOYXdvQWMyVFdOQzFJMTZKRkJhenZJWjBiZy92R3hIZ1JHUjZ1dS8xdmVtekdFOFhDcHJjaHFmQnc9PQo=",
-      "url": "https://github.com/Cosmoto-jian/disco-a2a/releases/download/v1.1.0/Disco_1.1.0_universal.app.tar.gz"
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVUcDdocWFJV0FyVjdJT1o4TzFZTkNhTlIxQ0pTOHJ3b09BTUh6aExOYXJ6M1Bab2YvbjluUXgvQjVoUzN5Qy9MN0RQQ2ZBb3BGeFpRTVVkN3dRWEFOQXBmcHFGWkdKdGdRPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkxODY4MDU0CWZpbGU6RGlzY29fMS4yLjBfdW5pdmVyc2FsLmFwcC50YXIuZ3oKdE9qRC9Falpvais5SXRDcnlvN1NMUWdwbER6S25wZlR0dzlJNmQrVVdZOVlrY1hLc3pqem1UUkxjcDlIN0ZkT0QyZUwzTldiQzAvV2lhczY2OFFnRHc9PQo=",
+      "url": "https://github.com/Cosmoto-jian/disco-a2a/releases/download/v1.2.0/Disco_1.2.0_universal.app.tar.gz"
+    },
+    "windows-x86_64": {
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVUcDdocWFJV0FyVjM5dDl3aXNkRGQwQW0wQVFRSHB3b05oTTRIcHZSdWpaRE5hczFpZUcvUFc2cU9BSUkzK2JlclFvSnBtY0t3VXh0QytoWUhPWk5xa0QxdWJyNXVmMXc4PQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkxODY4MDU1CWZpbGU6RGlzY29fMS4yLjBfeDY0LXNldHVwLmV4ZQp3ZVRRSHlHLzZIMjVLZjVLYU91L0tneFF3VzUxelJUeU5zUW5zcVJZNlRxMUk1RU9tNkhVa0JudGpFdlBQOTcyNS9LL0dxOXdmenprVG90Nk5WenNEQT09Cg==",
+      "url": "https://github.com/Cosmoto-jian/disco-a2a/releases/download/v1.2.0/Disco_1.2.0_x64-setup.exe"
     }
   }
 }
