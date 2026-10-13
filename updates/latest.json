@@ -1,19 +1,19 @@
 {
-  "version": "1.3.2",
-  "notes": "修复 Windows 上 Bot 邀请与服务器识别。",
-  "pub_date": "2026-10-13T10:04:30Z",
+  "version": "1.3.3",
+  "notes": "修复 Windows 上 agent 启动报 os error 193。",
+  "pub_date": "2026-10-13T11:25:34Z",
   "platforms": {
     "darwin-aarch64": {
-      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVUcDdocWFJV0FyVjkwSFcvV1lHSXdZazVTZkFIQlVoRGZZQ2tLMnAyWkZ1VmFDMnJpREJub00wVVJ6cnlVWmw5ZWs0RkcvWlFGKzVNTjdTZEV5amFma2xac2xlaWZEN2dJPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkxODg1ODY5CWZpbGU6RGlzY29fMS4zLjJfdW5pdmVyc2FsLmFwcC50YXIuZ3oKMWNxYXpFS3Y1SUtpUGJRSmV2RTZSZHk4dGxpd3ZLTHdwTXBGeEhvclZseWJXb1VKNFRCMTJyK3pGM1p3eDRYS0xQeHd6NnluekYxTzRGaHBubmtGQWc9PQo=",
-      "url": "https://github.com/Cosmoto-jian/disco-a2a/releases/download/v1.3.2/Disco_1.3.2_universal.app.tar.gz"
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVUcDdocWFJV0FyVjhiMy9qUVNlWXJSOWIrVHY5ekU1VzRsM2FsNVQzWEpMMFZpejNDOWVHZ2NYR24xQ3ZudUZUemhkWC9qNVFGdUdNdTNxSWhCSDR4QmcwNXVBbExwK3d3PQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkxODkwNzMzCWZpbGU6RGlzY29fMS4zLjNfdW5pdmVyc2FsLmFwcC50YXIuZ3oKZm9aU1drMThZNzhjK1hkQU04QTh4M2YyVXIxSUNUREkxUDg1djJ5TjZiSTUxYnRZbzBpQTVYU3dYYmJBUDViTGYyS1dTWUxyNlNPVFBKOXlVamJFQ1E9PQo=",
+      "url": "https://github.com/Cosmoto-jian/disco-a2a/releases/download/v1.3.3/Disco_1.3.3_universal.app.tar.gz"
     },
     "darwin-x86_64": {
-      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVUcDdocWFJV0FyVjkwSFcvV1lHSXdZazVTZkFIQlVoRGZZQ2tLMnAyWkZ1VmFDMnJpREJub00wVVJ6cnlVWmw5ZWs0RkcvWlFGKzVNTjdTZEV5amFma2xac2xlaWZEN2dJPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkxODg1ODY5CWZpbGU6RGlzY29fMS4zLjJfdW5pdmVyc2FsLmFwcC50YXIuZ3oKMWNxYXpFS3Y1SUtpUGJRSmV2RTZSZHk4dGxpd3ZLTHdwTXBGeEhvclZseWJXb1VKNFRCMTJyK3pGM1p3eDRYS0xQeHd6NnluekYxTzRGaHBubmtGQWc9PQo=",
-      "url": "https://github.com/Cosmoto-jian/disco-a2a/releases/download/v1.3.2/Disco_1.3.2_universal.app.tar.gz"
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVUcDdocWFJV0FyVjhiMy9qUVNlWXJSOWIrVHY5ekU1VzRsM2FsNVQzWEpMMFZpejNDOWVHZ2NYR24xQ3ZudUZUemhkWC9qNVFGdUdNdTNxSWhCSDR4QmcwNXVBbExwK3d3PQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkxODkwNzMzCWZpbGU6RGlzY29fMS4zLjNfdW5pdmVyc2FsLmFwcC50YXIuZ3oKZm9aU1drMThZNzhjK1hkQU04QTh4M2YyVXIxSUNUREkxUDg1djJ5TjZiSTUxYnRZbzBpQTVYU3dYYmJBUDViTGYyS1dTWUxyNlNPVFBKOXlVamJFQ1E9PQo=",
+      "url": "https://github.com/Cosmoto-jian/disco-a2a/releases/download/v1.3.3/Disco_1.3.3_universal.app.tar.gz"
     },
     "windows-x86_64": {
-      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVUcDdocWFJV0FyVi9BOWhoYlBITHZoM1Q3Mk9qRThIdVB1QjFKYXJLUlZrN1hYU1BacXVFQ2ljeXFFVngwZ1JtK1F0YkFmWEhidDhORkN0TW8wUy8vendEZE5LNXZTZ3d3PQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkxODg1ODcwCWZpbGU6RGlzY29fMS4zLjJfeDY0LXNldHVwLmV4ZQpaeGV5NWs4VjZJRkY0azJMa2o4TVFOcXdRKzdNZzBNQVdsdFZJMGNVR1pvTU9uSCsvSitmQXpiOTU2cHBOTHpraWJFdXc0NlBIZmRlTE93SmxYdXNDUT09Cg==",
-      "url": "https://github.com/Cosmoto-jian/disco-a2a/releases/download/v1.3.2/Disco_1.3.2_x64-setup.exe"
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVUcDdocWFJV0FyVjlVUDlJRFlqRTg4dmVManEvR0c2alBjLytmbXBNQStzZHZBZk42RHFRdzJweU9CR1pEWm5JQ25MMEg0OWt5Yi92ZnZ1QXYxVllYRCtZQU0vZ0E3bUFzPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkxODkwNzM0CWZpbGU6RGlzY29fMS4zLjNfeDY0LXNldHVwLmV4ZQpDa01sYWFZYWpwQ25wTzNtNEtjQmJuN05EWlRCU3RXZ0N4WXNzZ1IwYW1vTnhocElGQlI5WnJjbXFPRDZSUlFEc3FzZnZVVklWV2dzQURnVjlyaEpBQT09Cg==",
+      "url": "https://github.com/Cosmoto-jian/disco-a2a/releases/download/v1.3.3/Disco_1.3.3_x64-setup.exe"
     }
   }
 }
