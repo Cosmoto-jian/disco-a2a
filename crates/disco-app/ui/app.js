@@ -23,7 +23,7 @@ function h(tag, attrs = {}, ...kids) {
 }
 const esc = (s) => s.replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 function hash(s) { let x = 0; for (const c of s) x = (x * 31 + c.codePointAt(0)) | 0; return Math.abs(x); }
-const BRAND = { "claude-code": "#d97757", codex: "#10a37f", gemini: "#4285f4", qwen: "#615ced", goose: "#111111", opencode: "#3b82f6", hermes: "#7c5cff", dsh: "#4d6bfe", pi: "#e5484d", yobiru: "#f97316" };
+const BRAND = { "claude-code": "#d97757", codex: "#10a37f", gemini: "#4285f4", qwen: "#615ced", goose: "#111111", opencode: "#3b82f6", hermes: "#7c5cff", dsh: "#4d6bfe", pi: "#e5484d" };
 function colorOf(name) {
   const a = S.ov?.agents.find((a) => a.name === name);
   return BRAND[a?.template] ?? COLORS[hash(name) % COLORS.length];
@@ -157,7 +157,7 @@ async function openThread(t) {
   const peer = peerOf(t);
   const g = isGroup && S.ov.groups.find((g) => `group:${g.id}` === t);
   const a = !isGroup && S.ov.agents.find((a) => a.name === name);
-  const sub = isGroup ? `${g.members.length} 个 agent · 组长 ${g.lead ?? "—"}${g.id.startsWith("local-") ? "" : " · Discord 同步"}` : peer ? `${peer.guest} 通过共享在用你的 ${peer.agent}` : a ? (a.kind === "tailmsg" ? a.detail : `${a.kind === "acp" ? "本机" : "A2A"} · ${a.detail}`) : "";
+  const sub = isGroup ? `${g.members.length} 个 agent · 组长 ${g.lead ?? "—"}${g.id.startsWith("local-") ? "" : " · Discord 同步"}` : peer ? `${peer.guest} 通过共享在用你的 ${peer.agent}` : a ? `${a.kind === "acp" ? "本机" : "A2A"} · ${a.detail}` : "";
   const pane = $("#pane");
   pane.replaceChildren(
     h("div", { class: "head", "data-tauri-drag-region": true }, avatar(name, { group: isGroup }),
@@ -169,7 +169,7 @@ async function openThread(t) {
       a ? h("button", { class: "icon-btn", title: "更多", onclick: (e) => agentMenu(e.currentTarget, a.name) }, "⋯") : null),
     h("div", { id: "log" }),
     peer ? h("div", { class: "peer-note" }, "这是对方的会话，你只能旁观。需要你批准的操作会在这里弹出。") : h("div", { id: "composer" },
-      h("button", { class: "attach", type: "button", title: a?.kind === "tailmsg" ? `发文件给 ${name}（经 Tailscale，对方校验 SHA-256）` : "放一个文件到共享空间，agent 都能读到", onclick: () => attachFile(t) },
+      h("button", { class: "attach", type: "button", title: "放一个文件到共享空间，agent 都能读到", onclick: () => attachFile(t) },
         Object.assign(h("span"), { innerHTML: '<svg viewBox="0 0 24 24"><path d="M20.5 11.5 12.4 19.6a5 5 0 0 1-7.1-7.1l8.5-8.5a3.3 3.3 0 0 1 4.7 4.7l-8.5 8.5a1.7 1.7 0 0 1-2.4-2.4l7.8-7.8"/></svg>' })),
       h("textarea", { id: "input", rows: 1, placeholder: isGroup ? "发到群里：@名字 指定 agent，@all 一起回答，/team 任务 分工协作" : `给 ${name} 发消息` }),
       sendButton()));
@@ -565,7 +565,6 @@ async function renderGallery() {
     ...have.map((t) => agentRow({ ...t, kind: "acp" }, shortPath(t.found))),
     agentRow({ id: "command", name: "其他本地 agent", kind: "command", color: "#8a8a8e", letter: "›" }, "任意支持 ACP 的程序"),
     agentRow({ id: "invite", name: "朋友的邀请码", kind: "invite", color: "#10a37f", letter: "@" }, "接入别人通过 Disco 共享的 agent"),
-    agentRow({ id: "yobiru", name: "其他设备上的 agent", kind: "yobiru", color: "#f97316", letter: "Y" }, "服务器上的 Codex、云端 Bot…通过 Yobiru 互通"),
     agentRow({ id: "a2a", name: "远程 A2A agent", kind: "a2a", color: "#5865f2", letter: "A" }, "通过 URL 接入"));
   page.replaceChildren(h("h1", {}, "添加 Agent"),
     h("p", {}, have.length ? `在这台 Mac 上找到 ${have.length} 个。点「导入」一步完成，点整行可调目录和环境。` : "没在这台 Mac 上找到已安装的 agent，可以手动添加。"),
@@ -611,55 +610,8 @@ function inviteForm() {
   return h("div", { class: "aform" }, h("div", { class: "frow" }, h("span", {}, "邀请码"), code), h("div", { class: "frow" }, h("span", {}, "名称"), name),
     h("p", { class: "hint2" }, "双方都要登录同一个 Tailscale 网络（或对方把你加为共享设备）。"), h("div", { class: "factions" }, err, go));
 }
-// Yobiru agents on other machines: found on the tailnet, typed in, or asked to install themselves.
-function yobiruForm() {
-  const box = h("div", { class: "aform yobiru" }, h("p", { class: "hint2" }, "正在读取 Tailscale…"));
-  (async () => {
-    const st = await invoke("tm_status").catch((e) => ({ error: String(e), policy: {} }));
-    const err = h("div", { class: "err" });
-    const found = h("div", { class: "found" }, h("p", { class: "hint2" }, "正在扫描 Tailscale 网络里的 Yobiru…"));
-    const add = async (addr, name, btn) => {
-      if (btn) btn.disabled = true; err.textContent = "";
-      try { const n = await invoke("tm_add", { addr, name: name || null }); await load(); setTab("chats"); openThread(`dm:${n}`); }
-      catch (e) { err.textContent = String(e); if (btn) btn.disabled = false; }
-    };
-    const scan = async () => {
-      const list = await invoke("tm_discover").catch(() => []);
-      found.replaceChildren(...(list.length ? list.map((n) => h("div", { class: "frow node" },
-        h("span", { title: n.node }, n.node.split(".")[0]),
-        h("div", { class: "chips" }, ...(n.agents.length ? n.agents : [""]).map((ag) => {
-          const done = n.added.length && !ag;
-          const b = h("button", { type: "button", class: "chip2" + (done ? " on" : ""), title: `${n.product} ${n.version}`.trim() }, ag ? `＋ ${ag}` : done ? "已添加" : "＋ 默认 agent");
-          b.onclick = () => add(ag ? `${n.node}/${ag}` : n.node, null, b);
-          return b;
-        })))) : [h("p", { class: "hint2" }, "没找到在线的 Yobiru 接收端。可以手动填地址，或把下面的提示词发给那边的 agent。")]),
-        h("button", { type: "button", class: "linkish", onclick: () => { found.replaceChildren(h("p", { class: "hint2" }, "正在扫描…")); scan(); } }, "重新扫描"));
-    };
-    const addr = h("input", { class: "fld", placeholder: "设备名/agent，如 my-server/codex", spellcheck: false });
-    const name = h("input", { class: "fld", placeholder: "名称（可选）", spellcheck: false });
-    const go = h("button", { type: "button", class: "btn pri" }, "添加");
-    go.onclick = () => add(addr.value, name.value, go);
-    const prompt = `Set up Yobiru on this computer by following the official instructions at https://yobiru.com/install.md (project: https://github.com/chekusu/yobiru). Keep a receiver running. When it is ready, send a short hello to ${st.node ?? "<我的 Mac>"}/disco so this agent appears in my Disco.`;
-    const cp = h("button", { type: "button", class: "btn sm" }, "复制");
-    cp.onclick = () => copyText(prompt, cp);
-    box.replaceChildren(...[
-      !st.node ? h("div", { class: "warn" }, "没检测到 Tailscale：两台设备都要装好并登录同一个 Tailscale 网络。", h("button", { type: "button", class: "linkish", onclick: () => invoke("open_url", { url: "https://tailscale.com/download/mac" }) }, "下载 Tailscale")) : null,
-      st.node && !st.on ? h("div", { class: "warn" }, "Yobiru 接收还没打开，对方的回复回不来。", h("button", { type: "button", class: "linkish", onclick: async () => {
-        try { const s2 = await invoke("tm_set", { on: true, defaultAgent: st.default_agent ?? null }); toast(s2.error ?? `正在 ${s2.addr} 接收`); box.replaceWith(yobiruForm()); } catch (e) { toast(e); }
-      } }, "现在打开")) : null,
-      h("div", { class: "muted3" }, "网络里找到的"), found,
-      h("div", { class: "muted3" }, "手动添加"),
-      h("div", { class: "frow" }, h("span", {}, "地址"), addr), h("div", { class: "frow" }, h("span", {}, "名称"), name),
-      h("div", { class: "factions" }, err, go),
-      h("div", { class: "muted3" }, "对方还没装 Yobiru？把这段话发给那台设备上的 agent，它会自己装好并来打招呼"),
-      h("div", { class: "code-row" }, h("code", {}, prompt), cp)].filter(Boolean));
-    if (st.node) scan(); else found.replaceChildren();
-  })();
-  return box;
-}
 function agentForm(t) {
   if (t.kind === "invite") return inviteForm();
-  if (t.kind === "yobiru") return yobiruForm();
   const st = { cwd: "", conda: "", count: 1 };
   const err = h("div", { class: "err" });
   const name = h("input", { class: "fld", value: t.kind === "acp" ? t.id : "", placeholder: "名称，如 coder", spellcheck: false });
@@ -856,7 +808,7 @@ function renderSettings() {
         h("button", { class: "btn pri" }, "保存")),
       S.ov.discord_token ? h("button", { class: "btn", style: "margin-top:8px", onclick: async () => { try { await invoke("discord_connect"); } catch (e) { toast(e); } } }, "重新连接") : null,
       discordBox),
-    h("div", { class: "section" }, h("h3", {}, "Yobiru 互通 · Tailscale"), (() => { const box = h("div", {}, h("p", { class: "mute2" }, "正在读取…")); loadNet(box); return box; })()),
+    h("div", { class: "section" }, h("h3", {}, "Tailscale 访问规则"), (() => { const box = h("div", {}, h("p", { class: "mute2" }, "正在读取…")); loadNet(box); return box; })()),
     h("div", { class: "section" }, h("h3", {}, "记忆"),
       h("p", { style: "margin:0 0 8px;color:var(--mute)" }, "在私聊里说「记住 …」存给这个 agent，在群聊里说存给本群；agent 也能用 remember 工具按主题记下东西。记忆是普通的 Markdown 文件，每次新会话自动带上，只发给这台 Mac 上的 agent。"),
       (() => { const box = h("ul", { class: "checks-list" }); loadMemories(box); return box; })()),
@@ -887,42 +839,25 @@ function renderSettings() {
 }
 
 async function loadNet(box) {
-  let st;
-  try { st = await invoke("tm_status"); } catch (e) { box.replaceChildren(h("p", { class: "err" }, String(e))); return; }
-  const p = { ...st.policy };
-  const locals = S.ov.agents.filter((a) => a.kind === "acp").map((a) => a.name);
+  let p;
+  try { p = await invoke("net_policy"); } catch (e) { box.replaceChildren(h("p", { class: "err" }, String(e))); return; }
   const lines = (v) => v.split(/[\s,，]+/).filter(Boolean);
   const area = (key, ph) => { const t = h("textarea", { class: "fld rules", rows: 2, placeholder: ph, spellcheck: false }); t.value = p[key].join("\n"); t.oninput = () => { p[key] = lines(t.value); }; return t; };
-  const toggle = h("button", { type: "button", class: "switch" + (st.on ? " on" : ""), role: "switch", "aria-checked": String(st.on) }, h("i"));
-  const apply = async (on, dflt) => {
-    toggle.disabled = true;
-    try { await invoke("tm_set", { on, defaultAgent: dflt ?? null }); } catch (e) { toast(e); }
-    loadNet(box);
-  };
-  toggle.onclick = () => apply(!st.on, st.default_agent);
-  const status = st.on ? (st.addr ? h("div", { class: "status ok" }, h("i"), `在 ${st.addr} 接收，其他设备可以用 ${st.node}/agent名 找到你的 agent`) : h("div", { class: "status" }, h("i"), st.error ?? "正在启动…"))
-    : h("div", { class: "status" }, h("i"), st.node ? `这台 Mac：${st.node}` : "没检测到 Tailscale");
   const allowRow = h("label", { class: "nrow", hidden: p.mode !== "allowlist" }, h("span", {}, "允许名单"), area("allow", "每行一个：设备名、tag:名称 或 user:登录名"));
   const mode = h("div", { class: "seg" });
-  const drawMode = () => mode.replaceChildren(...[["tailnet", "整个 Tailscale 网络", "网络策略放行的设备都能发消息"], ["allowlist", "仅允许名单", "只有列出的设备能发消息"]]
+  const drawMode = () => mode.replaceChildren(...[["tailnet", "整个 Tailscale 网络", "有邀请码的设备都能用"], ["allowlist", "仅允许名单", "还要在名单里"]]
     .map(([v, t, sub]) => h("button", { type: "button", class: p.mode === v ? "on" : "", onclick: () => { p.mode = v; allowRow.hidden = v !== "allowlist"; drawMode(); } }, h("b", {}, t), h("small", {}, sub))));
   drawMode();
   const qs = h("input", { type: "time", class: "fld t", value: p.quiet_start }); qs.oninput = () => { p.quiet_start = qs.value; };
   const qe = h("input", { type: "time", class: "fld t", value: p.quiet_end }); qe.oninput = () => { p.quiet_end = qe.value; };
-  const rate = h("input", { type: "number", class: "fld t", min: 0, max: 1000, value: p.wake_rate }); rate.oninput = () => { p.wake_rate = Number(rate.value) || 0; };
   const save = h("button", { class: "btn pri" }, "保存规则");
   save.onclick = async () => { save.disabled = true; try { Object.assign(p, await invoke("net_policy_set", { policy: p })); toast("已保存", 1500); } catch (e) { toast(e, 8000); } save.disabled = false; };
-  box.replaceChildren(...[
-    h("p", { class: "mute2" }, "和其他设备上的 agent（服务器上的 Codex、云端 Bot…）互发消息和文件，兼容开源的 Yobiru。只走你自己的 Tailscale 网络，对方身份由 Tailscale 确认；这些规则也用于朋友共享。"),
-    h("div", { class: "nrow" }, h("span", {}, "接收消息"), toggle, status),
-    st.on ? h("div", { class: "nrow" }, h("span", {}, "默认交给"), h("div", { class: "chips" },
-      ...[["", "我（只显示）"], ...locals.map((n) => [n, n])].map(([v, l]) => h("button", { type: "button", class: "chip2" + ((st.default_agent ?? "") === v ? " on" : ""), onclick: () => apply(true, v || null) }, l)))) : null,
-    h("div", { class: "nrow" }, h("span", {}, "谁能发"), mode), allowRow,
+  box.replaceChildren(
+    h("p", { class: "mute2" }, "朋友通过邀请码使用你共享的 agent 时，Disco 会向 Tailscale 确认对方是哪台设备，再按这里的规则放行。"),
+    h("div", { class: "nrow" }, h("span", {}, "谁能用"), mode), allowRow,
     h("label", { class: "nrow" }, h("span", {}, "拒绝"), area("deny", "这些设备一律拒绝（优先于其他规则）")),
-    h("label", { class: "nrow" }, h("span", {}, "直接唤醒"), area("wake_now", "这些设备的消息会立刻交给 agent 处理；其余设备的消息先问你")),
-    h("div", { class: "nrow" }, h("span", {}, "免打扰"), qs, h("small", {}, "到"), qe, h("small", {}, "这段时间里先问你，不直接唤醒")),
-    h("div", { class: "nrow" }, h("span", {}, "唤醒上限"), rate, h("small", {}, "每台设备每小时最多直接唤醒几次，超出后先问你")),
-    h("div", { class: "factions" }, save)].filter(Boolean));
+    h("div", { class: "nrow" }, h("span", {}, "免打扰"), qs, h("small", {}, "到"), qe, h("small", {}, "这段时间不接共享消息")),
+    h("div", { class: "factions" }, save));
 }
 async function loadDiscordSettings(box) {
   let d;

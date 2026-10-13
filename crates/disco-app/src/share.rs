@@ -120,6 +120,10 @@ impl Core {
         srv.error = Some(format!("端口 7480–7489 都被占用：{last}"));
     }
 
+    pub(crate) fn net_policy(&self) -> tailnet::Policy {
+        self.db().setting(tailnet::POLICY).and_then(|j| serde_json::from_str(&j).ok()).unwrap_or_default()
+    }
+
     fn share_base(&self) -> Result<String, String> {
         let port = {
             let s = self.server.lock().unwrap_or_else(|p| p.into_inner());
@@ -133,6 +137,7 @@ impl Core {
     /// in the `peer:<id>` thread, where permission prompts also appear.
     async fn peer_turn(&self, id: &str, device: &str, guest_ctx: &str, text: &str, out: mpsc::UnboundedSender<AgentEvent>) -> Result<String, String> {
         let share = self.share(id).ok_or("这个共享已被撤销")?;
+        if self.net_policy().quiet_now() { return Err("对方设置了免打扰，现在不处理消息，请稍后再试".into()); }
         let used = self.used_today(id);
         if share.limit > 0 && used >= share.limit {
             return Err(format!("今天的 {} 次额度已用完", share.limit));

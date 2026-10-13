@@ -1,11 +1,9 @@
 //! Who is on the other end of a tailnet connection, and whether they may talk to us.
 //!
-//! Everything Disco serves on the tailnet (agent shares, the Yobiru-compatible
-//! receiver) asks Tailscale itself who connected (`tailscale whois`) and checks the
-//! answer against one local access policy, the same rules Yobiru uses: a rule is a
-//! hostname, a MagicDNS name, `tag:NAME` or `user:LOGIN`, and deny always wins.
-//! "Being allowed to send" never means "may wake an agent": that is a second,
-//! stricter decision (`wake`), with quiet hours and a per-sender rate limit.
+//! The share server asks Tailscale itself who connected (`tailscale whois`) and
+//! checks the answer against one local access policy: a rule is a hostname, a
+//! MagicDNS name, `tag:NAME` or `user:LOGIN`, and deny always wins. Quiet hours
+//! keep guests from waking your agents at night.
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::sync::{Mutex, OnceLock};
@@ -28,28 +26,14 @@ pub struct Policy {
     pub mode: String,
     pub allow: Vec<String>,
     pub deny: Vec<String>,
-    /// Devices whose messages may wake an agent at once; everyone else waits for the user.
-    pub wake_now: Vec<String>,
-    /// "HH:MM" local time; no instant wake-ups in between.
+    /// "HH:MM" local time; guests are turned away in between.
     pub quiet_start: String,
     pub quiet_end: String,
-    /// Instant wake-ups per sender and agent per hour.
-    pub wake_rate: u32,
 }
 
 impl Default for Policy {
     fn default() -> Self {
-        Self { mode: "tailnet".into(), allow: vec![], deny: vec![], wake_now: vec![], quiet_start: String::new(), quiet_end: String::new(), wake_rate: 6 }
-    }
-}
-
-/// How an incoming message may reach an agent.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub enum Wake { None, Batch, Now }
-
-impl Wake {
-    pub fn parse(s: Option<&str>) -> Self {
-        match s { Some("now") => Self::Now, Some("none") => Self::None, _ => Self::Batch }
+        Self { mode: "tailnet".into(), allow: vec![], deny: vec![], quiet_start: String::new(), quiet_end: String::new() }
     }
 }
 
@@ -76,7 +60,7 @@ pub fn matches(rule: &str, who: &Ident) -> bool {
 impl Policy {
     /// Normalise and check what the user typed; an invalid rule is an error, never ignored.
     pub fn cleaned(mut self) -> Result<Self, String> {
-        for list in [&mut self.allow, &mut self.deny, &mut self.wake_now] {
+        for list in [&mut self.allow, &mut self.deny] {
             let mut out: Vec<String> = Vec::new();
             for r in list.iter().map(|r| r.trim().to_lowercase()).filter(|r| !r.is_empty()) {
                 if !valid_rule(&r) { return Err(format!("无效的规则：{r}（可以写设备名、MagicDNS 名、tag:名称 或 user:登录名）")); }
@@ -88,7 +72,6 @@ impl Policy {
         for t in [&self.quiet_start, &self.quiet_end] {
             if !t.is_empty() && hm(t).is_none() { return Err(format!("时间格式应为 HH:MM：{t}")); }
         }
-        self.wake_rate = self.wake_rate.min(1000);
         Ok(self)
     }
 
@@ -99,7 +82,14 @@ impl Policy {
         Ok(())
     }
 
-    /// Whether `now` (local minutes since midnight) falls in quiet hours.
+    /// Whether it is quiet hours right now.
+    pub fn quiet_now(&self) -> bool {
+        use chrono::Timelike;
+        let t = chrono::Local::now();
+        self.quiet_at(t.hour() * 60 + t.minute())
+    }
+
+    /// Whether `minutes` (local, since midnight) falls in quiet hours.
     pub fn quiet_at(&self, minutes: u32) -> bool {
         let (Some(s), Some(e)) = (hm(&self.quiet_start), hm(&self.quiet_end)) else { return false };
         if s == e { return false; }
@@ -111,33 +101,6 @@ fn hm(t: &str) -> Option<u32> {
     let (h, m) = t.trim().split_once(':')?;
     let (h, m): (u32, u32) = (h.parse().ok()?, m.parse().ok()?);
     (h < 24 && m < 60).then_some(h * 60 + m)
-}
-
-/// Remembers instant wake-ups so one chatty sender can't keep an agent busy.
-#[derive(Default)]
-pub struct Rate(Mutex<HashMap<String, Vec<Instant>>>);
-
-impl Rate {
-    /// Count one wake-up for `key` if fewer than `limit` happened in the last hour.
-    pub fn take(&self, key: &str, limit: u32) -> bool {
-        let mut m = self.0.lock().unwrap_or_else(|p| p.into_inner());
-        let hits = m.entry(key.to_owned()).or_default();
-        hits.retain(|t| t.elapsed() < Duration::from_secs(3600));
-        if hits.len() as u32 >= limit { return false; }
-        hits.push(Instant::now());
-        true
-    }
-}
-
-/// The level a message actually gets: what it asked for, capped by the sender's
-/// rights, then quiet hours and the rate limit. Returns the level and why.
-pub fn wake(p: &Policy, who: &Ident, requested: Wake, agent: &str, minutes: u32, rate: &Rate) -> (Wake, &'static str) {
-    let cap = if p.wake_now.iter().any(|r| matches(r, who)) { Wake::Now } else { Wake::Batch };
-    let eff = requested.min(cap);
-    if eff < requested { return (eff, "需要你确认（该设备没有直接唤醒权限）"); }
-    if eff == Wake::Now && p.quiet_at(minutes) { return (Wake::Batch, "免打扰时段"); }
-    if eff == Wake::Now && !rate.take(&format!("{}|{agent}", who.node), p.wake_rate) { return (Wake::Batch, "超过每小时唤醒次数"); }
-    (eff, "")
 }
 
 pub fn is_tailnet(ip: &IpAddr) -> bool {
@@ -203,30 +166,6 @@ pub fn me() -> Option<Node> {
         .map(|ip| Node { node: ip.clone(), host: String::new(), ip, online: true, me: true })
 }
 
-/// `name` | `name.tailnet.ts.net` | `100.x.y.z` → the one matching machine. Exact names and
-/// IPs stay exact; a short name prefers the single online match, so a rebuilt machine
-/// that kept its hostname is found, and two candidates are an error rather than a guess.
-pub fn resolve(peer: &str) -> Result<Node, String> {
-    pick(nodes(), peer)
-}
-
-fn pick(nodes: Vec<Node>, peer: &str) -> Result<Node, String> {
-    let p = peer.trim().trim_end_matches('.').to_lowercase();
-    let is_ip = p.parse::<IpAddr>().is_ok();
-    let hits: Vec<Node> = nodes.into_iter().filter(|n| {
-        if is_ip { n.ip == p } else if p.contains('.') { n.node == p } else { n.node.split('.').next() == Some(&p) || n.host.to_lowercase() == p }
-    }).collect();
-    let cands: Vec<Node> = if is_ip || p.contains('.') { hits } else {
-        let on: Vec<Node> = hits.iter().filter(|n| n.online).cloned().collect();
-        if on.is_empty() { hits } else { on }
-    };
-    match cands.len() {
-        0 => Err(format!("Tailscale 网络里没有 {peer}")),
-        1 => Ok(cands.into_iter().next().unwrap_or_else(|| unreachable!())),
-        _ => Err(format!("{peer} 对应多台设备（{}），请写完整的 MagicDNS 名", cands.iter().map(|n| n.node.as_str()).collect::<Vec<_>>().join("、"))),
-    }
-}
-
 /// Who `ip` is, according to Tailscale (cached for a minute). None if it can't say.
 pub fn whois(ip: &IpAddr) -> Option<Ident> {
     type Cache = Mutex<HashMap<IpAddr, (Instant, Option<Ident>)>>;
@@ -270,29 +209,15 @@ mod tests {
     }
 
     #[test]
-    fn wake_levels() {
-        let rate = Rate::default();
-        let mut p = Policy::default();
-        assert_eq!(wake(&p, &who(), Wake::Now, "a", 600, &rate).0, Wake::Batch);
-        p.wake_now = vec!["box".into()];
-        p.wake_rate = 1;
-        assert_eq!(wake(&p, &who(), Wake::Now, "a", 600, &rate).0, Wake::Now);
-        assert_eq!(wake(&p, &who(), Wake::Now, "a", 600, &rate).0, Wake::Batch);
-        p.quiet_start = "23:00".into(); p.quiet_end = "08:00".into();
+    fn quiet_hours() {
+        let p = Policy { quiet_start: "23:00".into(), quiet_end: "08:00".into(), ..Default::default() };
         assert!(p.quiet_at(23 * 60 + 5) && p.quiet_at(60) && !p.quiet_at(12 * 60));
-        assert_eq!(wake(&p, &who(), Wake::None, "b", 600, &rate).0, Wake::None);
+        assert!(!Policy::default().quiet_at(60));
+        assert!(Policy { quiet_start: "25:00".into(), ..Default::default() }.cleaned().is_err());
     }
 
     #[test]
-    fn peer_resolution() {
-        let n = |node: &str, ip: &str, online| Node { node: node.into(), host: node.split('.').next().unwrap_or("").into(), ip: ip.into(), online, me: false };
-        let ns = vec![n("box.t.ts.net", "100.64.0.1", false), n("box-1.t.ts.net", "100.64.0.2", true), n("srv.t.ts.net", "100.64.0.3", true)];
-        assert_eq!(pick(ns.clone(), "srv").unwrap().ip, "100.64.0.3");
-        assert_eq!(pick(ns.clone(), "100.64.0.1").unwrap().node, "box.t.ts.net");
-        assert!(pick(ns.clone(), "nope").is_err());
-        let mut dup = ns.clone();
-        dup.push(Node { host: "srv".into(), ..n("srv-2.t.ts.net", "100.64.0.4", true) });
-        assert!(pick(dup, "srv").is_err());
+    fn tailnet_ips() {
         assert!(is_tailnet(&"100.101.2.3".parse().unwrap()) && !is_tailnet(&"100.128.0.1".parse().unwrap()));
         assert!(is_tailnet(&"fd7a:115c:a1e0::1".parse().unwrap()));
     }
