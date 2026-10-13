@@ -145,6 +145,12 @@ impl Hub {
                 if spec.command == "npx" && !args.iter().any(|a| a == "--prefer-offline") {
                     args.insert(0, "--prefer-offline".into());
                 }
+                // A PowerShell script picked as the agent program runs through PowerShell.
+                let (command, args) = if command.extension().is_some_and(|e| e.eq_ignore_ascii_case("ps1")) {
+                    let mut a = vec!["-NoProfile".into(), "-ExecutionPolicy".into(), "Bypass".into(), "-File".into(), command.to_string_lossy().into_owned()];
+                    a.extend(args);
+                    (PathBuf::from("powershell"), a)
+                } else { (command, args) };
                 let launch = Launch {
                     command: command.to_string_lossy().into_owned(),
                     args,
@@ -362,8 +368,14 @@ fn login_path() -> String {
 /// Full path of `cmd` on `path`, if it is there.
 /// On Windows `npx` is `npx.cmd`, so the usual executable extensions are tried too.
 pub fn which(cmd: &str, path: &str) -> Option<PathBuf> {
-    let exts: &[&str] = if cfg!(windows) { &["", ".exe", ".cmd", ".bat", ".com"] } else { &[""] };
-    let with_ext = |p: PathBuf| exts.iter().map(|e| PathBuf::from(format!("{}{e}", p.display()))).find(|p| p.is_file());
+    // Windows: npm drops an extensionless POSIX shell script (`claude`) next to
+    // `claude.cmd`; launching that script fails with os error 193 ("not a valid
+    // Win32 application"). So try real executable extensions first, and take a
+    // bare name only when it already carries one of them.
+    let exts: &[&str] = if cfg!(windows) { &[".exe", ".cmd", ".bat", ".com", ""] } else { &[""] };
+    let runnable = |p: &std::path::Path| p.is_file() && (!cfg!(windows) || p.extension().and_then(|e| e.to_str())
+        .is_some_and(|e| ["exe", "cmd", "bat", "com", "ps1"].contains(&e.to_ascii_lowercase().as_str())));
+    let with_ext = |p: PathBuf| exts.iter().map(|e| PathBuf::from(format!("{}{e}", p.display()))).find(|p| runnable(p));
     if cmd.contains('/') || cmd.contains('\\') { return with_ext(PathBuf::from(cmd)); }
     path.split(PATH_SEP).filter(|d| !d.is_empty()).find_map(|d| with_ext(PathBuf::from(d).join(cmd)))
 }
