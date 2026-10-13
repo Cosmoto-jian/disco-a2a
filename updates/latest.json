@@ -1,19 +1,19 @@
 {
-  "version": "1.4.0",
-  "notes": "统一界面字号、首屏直接聊天、头像实时状态、记忆开关、多人多 agent 群聊、@agent /命令、删除可撤销",
-  "pub_date": "2026-10-13T15:32:33Z",
+  "version": "1.4.1",
+  "notes": "修复 1.4.0 启动卡死导致 agent、群聊、Discord 全部不显示；修复改名卡死、待办面板崩溃。",
+  "pub_date": "2026-10-13T18:13:04Z",
   "platforms": {
     "darwin-aarch64": {
-      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVUcDdocWFJV0FyVjc0VHp6SHZHUkt1YkRGMUdicTJYVGtrYjN2c1kwZmFFYmc5aTJibXo5Uk9PdmEyRXVrZVd1TEZpbDcyYU9uTDJEbmswdFIxN1Q0LzBpMlJEZkl4cHdrPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkxOTA1NTUyCWZpbGU6RGlzY29fMS40LjBfdW5pdmVyc2FsLmFwcC50YXIuZ3oKcmduSFFJUytyOWtQS3BmZ1JXcTRPeS9Bd3VUb3FJY3cyRVRlbklhSnpvd3VUSmE2elhwNXVVTGY5VTdZdWptNlY5UVpxc3RGbW5HUWZwUTFhSFpDQnc9PQo=",
-      "url": "https://github.com/Cosmoto-jian/disco-a2a/releases/download/v1.4.0/Disco_1.4.0_universal.app.tar.gz"
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVUcDdocWFJV0FyVi9nTFlScHdwL2RWN2FOUnFyZE9mYmJpQWIrWU1KZnNGTWhJTHpVL0RTTzM2NStPOXZmTWkwc1EvR29KUkVDRkVvTDlLWkRjaWFia05vekdudlZpbndrPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkxOTE1MTgzCWZpbGU6RGlzY29fMS40LjFfdW5pdmVyc2FsLmFwcC50YXIuZ3oKSSsvSksrcFVEZGRnU3JPU1RFV0FsN1hJWTJsR1NEaDU5ZDcrUmdDL1FMOStNTzhpSkJJVk9wYkNqc0VwdW9hSTlEdHc5Nm1ZUENRYVR3a0tVWWNGQUE9PQo=",
+      "url": "https://github.com/Cosmoto-jian/disco-a2a/releases/download/v1.4.1/Disco_1.4.1_universal.app.tar.gz"
     },
     "darwin-x86_64": {
-      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVUcDdocWFJV0FyVjc0VHp6SHZHUkt1YkRGMUdicTJYVGtrYjN2c1kwZmFFYmc5aTJibXo5Uk9PdmEyRXVrZVd1TEZpbDcyYU9uTDJEbmswdFIxN1Q0LzBpMlJEZkl4cHdrPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkxOTA1NTUyCWZpbGU6RGlzY29fMS40LjBfdW5pdmVyc2FsLmFwcC50YXIuZ3oKcmduSFFJUytyOWtQS3BmZ1JXcTRPeS9Bd3VUb3FJY3cyRVRlbklhSnpvd3VUSmE2elhwNXVVTGY5VTdZdWptNlY5UVpxc3RGbW5HUWZwUTFhSFpDQnc9PQo=",
-      "url": "https://github.com/Cosmoto-jian/disco-a2a/releases/download/v1.4.0/Disco_1.4.0_universal.app.tar.gz"
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVUcDdocWFJV0FyVi9nTFlScHdwL2RWN2FOUnFyZE9mYmJpQWIrWU1KZnNGTWhJTHpVL0RTTzM2NStPOXZmTWkwc1EvR29KUkVDRkVvTDlLWkRjaWFia05vekdudlZpbndrPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkxOTE1MTgzCWZpbGU6RGlzY29fMS40LjFfdW5pdmVyc2FsLmFwcC50YXIuZ3oKSSsvSksrcFVEZGRnU3JPU1RFV0FsN1hJWTJsR1NEaDU5ZDcrUmdDL1FMOStNTzhpSkJJVk9wYkNqc0VwdW9hSTlEdHc5Nm1ZUENRYVR3a0tVWWNGQUE9PQo=",
+      "url": "https://github.com/Cosmoto-jian/disco-a2a/releases/download/v1.4.1/Disco_1.4.1_universal.app.tar.gz"
     },
     "windows-x86_64": {
-      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVUcDdocWFJV0FyVnh5YzFMUGVqWGRBcXVXbmV2a20ybVRiUWpUVnZ3dmJnTWVWeStnTnpZSzJFNkN1SnhoQW4yRFZFWFIwUk5hVGk1d3FkNmZiWEtTRGJXRWpQa2E3RmdNPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkxOTA1NTUzCWZpbGU6RGlzY29fMS40LjBfeDY0LXNldHVwLmV4ZQpkOWhmcWNEUWdBR3BWd2R6aDdnK2hqZXl4dno3Wmt5RG9SZXV1RjFFelA2QWc4N0VZUWFQK3Z0a2Mwd3lYREd0Ly9LZFErbGJodVJjbFhJZ2c3YU1CQT09Cg==",
-      "url": "https://github.com/Cosmoto-jian/disco-a2a/releases/download/v1.4.0/Disco_1.4.0_x64-setup.exe"
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVUcDdocWFJV0FyVnhNaGYzRjN1bEJORCtzbHR2Q1RsdzI3WGdsaG12T1htRk5QZGR5NEsyVXhCek5jTzN0WVR3dmJRT1RpMWlrdkphbHBMVU0xeVhPOC9SQ3EwLy9KbUFjPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkxOTE1MTg0CWZpbGU6RGlzY29fMS40LjFfeDY0LXNldHVwLmV4ZQpDczduYloxZHRUb3VEWHVpeTB5ejBwWk56RE5KNTFaY0NscW1sZDhmNUFqK2NaNmEvTEI0NzBnSzdNQmtVY1RvK2diYjNKRTcwdDJkK0NwNTFCWFVBUT09Cg==",
+      "url": "https://github.com/Cosmoto-jian/disco-a2a/releases/download/v1.4.1/Disco_1.4.1_x64-setup.exe"
     }
   }
 }
