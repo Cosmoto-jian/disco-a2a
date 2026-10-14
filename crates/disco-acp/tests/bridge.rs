@@ -62,3 +62,24 @@ async fn kill_ends_the_turn() {
     while let Some(ev) = rx.recv().await { last = Some(ev); }
     assert!(!matches!(last, Some(AgentEvent::Done { phase: TaskPhase::Completed, .. })));
 }
+
+/// Probe a real agent: `DISCO_REAL="npx -y @agentclientprotocol/claude-agent-acp" cargo test -p disco-acp --test bridge real_agent -- --ignored --nocapture`
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn real_agent() {
+    let cmd = std::env::var("DISCO_REAL").expect("DISCO_REAL");
+    let mut parts = cmd.split_whitespace().map(str::to_owned);
+    let launch = Launch { command: parts.next().unwrap(), args: parts.collect(), env: vec![], cwd: std::env::temp_dir(),
+        prompt_timeout: Duration::from_secs(60), config: vec![], mcp: None };
+    let t = std::time::Instant::now();
+    let agent = AcpAgent::spawn(launch).await;
+    println!("spawn: {:?} after {:?}", agent.as_ref().err(), t.elapsed());
+    let agent = agent.unwrap();
+    println!("configs: {:?} after {:?}", agent.configs("dm").await, t.elapsed());
+    println!("logins: {:?}", agent.logins());
+    println!("problem: {:?}", agent.problem());
+    let mut rx = agent.prompt("dm2", "say hi").await.unwrap();
+    while let Some(ev) = rx.recv().await {
+        if let AgentEvent::Done { phase, stop_reason } = ev { println!("turn: {phase:?} {stop_reason:?} after {:?}", t.elapsed()); break; }
+    }
+}

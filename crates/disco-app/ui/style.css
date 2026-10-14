@@ -238,6 +238,8 @@ dialog::backdrop { background:rgba(0,0,0,.28); }
 .model-pill .lbl { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
 .model-pill .chev { width:6px; height:6px; border-right:1.5px solid var(--mute); border-bottom:1.5px solid var(--mute); rotate:45deg; translate:0 -2px; flex:none; }
 .model-pill.busy { opacity:.6; pointer-events:none; }
+.model-pill.warn .dot { background:var(--red, #e5484d); }
+.model-pill.warn { color:var(--red, #e5484d); }
 .icon-btn { -webkit-app-region:no-drag; width:28px; height:28px; border:0; border-radius:8px; background:none; color:var(--mute); font-size:18px; line-height:1; cursor:pointer; }
 .icon-btn:hover { background:var(--hover); color:var(--fg); }
 /* anchored menu */

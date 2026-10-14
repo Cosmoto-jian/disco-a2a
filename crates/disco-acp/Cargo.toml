@@ -10,6 +10,11 @@ name = "mock-acp-agent"
 path = "src/bin/mock_acp_agent.rs"
 test = false
 
+[[bin]]
+name = "mock-raw-agent"
+path = "src/bin/mock_raw_agent.rs"
+test = false
+
 [dependencies]
 disco-types.workspace = true
 agent-client-protocol.workspace = true
@@ -18,6 +23,7 @@ tokio-util.workspace = true
 futures.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+serde_json.workspace = true
 
 [lints]
 workspace = true

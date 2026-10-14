@@ -187,5 +187,12 @@ Token 复制不完整，或者之后又点过 Reset Token。回开发者后台�
 **新加的 agent 在 Discord 里没有频道**
 在设置里点 **同步频道**。
 
+**Claude Code / Codex / Hermes 打不开，或选不了模型**
+- 顶部模型按钮变成红色「需要登录」或「无法启动」时，点它能看到原因。
+- 需要登录时，聊天里会出现一张登录卡片：选「在终端登录」会打开终端运行这个 agent 自己的登录命令，完成后回来再发一次消息；其他方式（如 ChatGPT、API Key）由 agent 自己完成。
+- Disco 会读取你终端里的环境变量（`~/.zshrc` 里的 API Key、BASE_URL、代理、nvm 的 Node），改了这些之后要完全退出并重新打开 Disco。
+- Claude Code 适配器需要 Node.js 22 以上（`node -v` 查看）。
+- Hermes 需要 ACP 扩展：终端运行 `hermes acp --check`，按提示安装。
+
 **Disco 更新**
 App 会自动检查更新，macOS 和 Windows 同步发布。

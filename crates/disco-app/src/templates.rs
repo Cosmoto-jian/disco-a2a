@@ -99,3 +99,12 @@ pub fn conda_envs(home: &Path) -> Vec<CondaEnv> {
     }
     out
 }
+
+/// Lowest Node.js major the template's ACP adapter runs on (from its package `engines`).
+pub fn node_min(id: &str) -> Option<u32> {
+    match id {
+        "claude-code" => Some(22), // @agentclientprotocol/claude-agent-acp
+        "pi" => Some(20),          // pi-acp
+        _ => None,
+    }
+}

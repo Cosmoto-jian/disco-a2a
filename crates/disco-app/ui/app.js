@@ -467,9 +467,17 @@ listen("space", ({ payload: t }) => { if (S.thread === t && !$("#space .doc-edit
 // Model picker: only the agent's own model list (ACP session config, category "model").
 async function loadConfigs(agent, t) {
   const box = $("#cfgs");
-  let list = [];
-  try { list = await invoke("agent_configs", { agent }); } catch { list = []; }
+  let list = [], err = "";
+  try { list = await invoke("agent_configs", { agent }); } catch (e) { err = String(e); }
   if (S.thread !== t || !box?.isConnected) return;
+  if (err) {
+    // Say it can't start, and why, instead of silently showing no model menu.
+    const login = /登录|authentication/i.test(err);
+    const pill = h("button", { class: "model-pill warn", title: err }, h("span", { class: "dot" }), h("span", { class: "lbl" }, login ? "需要登录" : "无法启动"));
+    pill.onclick = () => toast(err);
+    box.replaceChildren(pill);
+    return;
+  }
   const c = list.find((x) => x.category === "model") ?? list.find((x) => x.id === "model");
   if (!c || c.options.length < 2) return;
   const label = () => c.options.find(([v]) => v === c.current)?.[1] ?? c.current;

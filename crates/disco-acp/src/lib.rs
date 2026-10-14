@@ -6,7 +6,7 @@
 //! (whole process group) when the handle drops.
 #![forbid(unsafe_code)]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
@@ -14,13 +14,13 @@ use std::time::Duration;
 
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::schema::v1::{
-    CancelNotification, ContentBlock, EnvVariable, InitializeRequest, McpServer, McpServerStdio, NewSessionRequest, PermissionOptionKind, PromptRequest,
+    AuthCapabilities, AuthMethod, AuthenticateRequest, CancelNotification, ClientCapabilities, ContentBlock, EnvVariable, InitializeRequest, McpServer, NewSessionResponse, McpServerStdio, NewSessionRequest, PermissionOptionKind, PromptRequest,
     RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
     SelectedPermissionOutcome, SessionConfigKind, SessionConfigOption, SessionConfigOptionCategory,
     SessionConfigSelectOptions, SessionId, SessionNotification, SessionUpdate,
     SetSessionConfigOptionRequest, TextContent,
 };
-use agent_client_protocol::{Agent, ByteStreams, ConnectionTo};
+use agent_client_protocol::{Agent, ByteStreams, ConnectionTo, ErrorCode, UntypedMessage};
 use disco_types::{AgentEvent, PermissionChoice, PermissionDecision, TaskPhase};
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
@@ -75,6 +75,34 @@ pub struct ConfigChoice {
     pub options: Vec<(String, String)>,
 }
 
+/// A way the agent offers to sign in (ACP `authMethods`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Login {
+    pub id: String,
+    pub name: String,
+    pub description: String,
+    /// Sign in by running the agent's own command with these extra args (and env) in a
+    /// terminal; `None` = the agent signs in by itself when asked (browser, saved key …).
+    pub terminal: Option<TerminalLogin>,
+}
+
+/// Extra args and env for the agent's command when signing in from a terminal.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct TerminalLogin { pub args: Vec<String>, pub env: Vec<(String, String)> }
+
+/// Why the agent can't work right now, kept so the app can say it instead of failing silently.
+#[derive(Debug, Clone, Default)]
+struct Health {
+    /// The last session that could not start (or the connection's end), with the agent's own words.
+    error: Option<String>,
+    /// That error was ACP `auth_required`.
+    needs_login: bool,
+    logins: Vec<Login>,
+    /// Last lines the agent wrote to stderr.
+    stderr: VecDeque<String>,
+}
+type Shared = Arc<Mutex<Health>>;
+
 type Configs = Arc<Mutex<Vec<ConfigChoice>>>;
 /// Slash commands the agent advertises: (name without `/`, description).
 type Commands = Arc<Mutex<Vec<(String, String)>>>;
@@ -103,6 +131,33 @@ fn choices(opts: &[SessionConfigOption]) -> Vec<ConfigChoice> {
         .collect()
 }
 
+/// Older agents (Hermes, early adapters) still announce models and modes the pre-config
+/// way: `models {availableModels, currentModelId}` and `modes {availableModes, currentModeId}`.
+/// Turned into the same choices; `skip` holds the categories real config options already cover.
+fn legacy_choices(v: &serde_json::Value, skip: &[ConfigChoice]) -> Vec<ConfigChoice> {
+    let s = |x: &serde_json::Value| x.as_str().unwrap_or_default().to_owned();
+    let mut out = Vec::new();
+    for (key, list, cur, id_field, id, name) in [
+        ("models", "availableModels", "currentModelId", "modelId", "model", "Model"),
+        ("modes", "availableModes", "currentModeId", "id", "mode", "Mode"),
+    ] {
+        let m = &v[key];
+        let Some(items) = m[list].as_array().filter(|a| !a.is_empty()) else { continue };
+        if skip.iter().any(|c| c.category == id || c.id == id) { continue; }
+        let options = items.iter().map(|x| { let v = s(&x[id_field]); let n = s(&x["name"]); (v.clone(), if n.is_empty() { v } else { n }) }).collect();
+        out.push(ConfigChoice { id: id.into(), name: name.into(), category: id.into(), current: s(&m[cur]), options });
+    }
+    out
+}
+
+fn login_of(m: &AuthMethod) -> Login {
+    let terminal = match m {
+        AuthMethod::Terminal(t) => Some(TerminalLogin { args: t.args.clone(), env: t.env.iter().map(|(k, v)| (k.clone(), v.clone())).collect() }),
+        _ => None,
+    };
+    Login { id: m.id().to_string(), name: m.name().to_owned(), description: m.description().unwrap_or_default().to_owned(), terminal }
+}
+
 type Pending = Arc<Mutex<HashMap<String, oneshot::Sender<PermissionDecision>>>>;
 /// ACP session id -> event channel of the prompt currently running in it.
 type Sinks = Arc<Mutex<HashMap<String, mpsc::Sender<AgentEvent>>>>;
@@ -115,6 +170,8 @@ enum Cmd {
     Cancel { key: String },
     /// Change a session setting in every open session (and every later one).
     Set { id: String, value: String, done: oneshot::Sender<Result<(), String>> },
+    /// ACP `authenticate` with one of the advertised methods.
+    Login { id: String, done: oneshot::Sender<Result<(), String>> },
 }
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -127,6 +184,7 @@ pub struct AcpAgent {
     pending: Pending,
     configs: Configs,
     commands: Commands,
+    health: Shared,
     child: Mutex<tokio::process::Child>,
 }
 
@@ -155,8 +213,9 @@ impl AcpAgent {
         let mut child = c.spawn().map_err(|e| AcpError::Spawn(launch.command.clone(), e))?;
         let stdin = child.stdin.take().ok_or(AcpError::Gone)?;
         let stdout = child.stdout.take().ok_or(AcpError::Gone)?;
+        let health: Shared = Arc::default();
         if let Some(stderr) = child.stderr.take() {
-            tokio::spawn(drain_stderr(stderr));
+            tokio::spawn(drain_stderr(stderr, health.clone()));
         }
 
         let (cmd_tx, cmd_rx) = mpsc::channel::<Cmd>(32);
@@ -164,8 +223,8 @@ impl AcpAgent {
         let configs: Configs = Arc::default();
         let commands: Commands = Arc::default();
         let transport = ByteStreams::new(stdin.compat_write(), stdout.compat());
-        tokio::spawn(run_connection(transport, launch, cmd_rx, pending.clone(), configs.clone(), commands.clone()));
-        Ok(Self { cmd: cmd_tx, pending, configs, commands, child: Mutex::new(child) })
+        tokio::spawn(run_connection(transport, launch, cmd_rx, pending.clone(), configs.clone(), commands.clone(), health.clone()));
+        Ok(Self { cmd: cmd_tx, pending, configs, commands, health, child: Mutex::new(child) })
     }
 
     /// Send one prompt in the session named `key` (created on first use);
@@ -181,12 +240,42 @@ impl AcpAgent {
         self.cmd.send(Cmd::Warm { key: key.into(), ready: None }).await.map_err(|_| AcpError::Gone)
     }
 
-    /// The settings the agent offers, once the session for `key` exists.
+    /// The settings the agent offers, once the session for `key` exists. When the session
+    /// can't start, the agent's reason (see [`Self::problem`]) instead of an empty list.
     pub async fn configs(&self, key: impl Into<String>) -> Result<Vec<ConfigChoice>, AcpError> {
         let (tx, rx) = oneshot::channel();
-        self.cmd.send(Cmd::Warm { key: key.into(), ready: Some(tx) }).await.map_err(|_| AcpError::Gone)?;
+        self.cmd.send(Cmd::Warm { key: key.into(), ready: Some(tx) }).await.map_err(|_| self.gone())?;
         let _ = rx.await;
-        Ok(lock(&self.configs).clone())
+        let got = lock(&self.configs).clone();
+        match self.problem() {
+            Some((why, _)) if got.is_empty() => Err(AcpError::Protocol(why)),
+            _ => Ok(got),
+        }
+    }
+
+    /// Why the last session failed to start, and whether signing in would fix it.
+    /// Includes the tail of the agent's stderr, which is usually where the real cause is.
+    pub fn problem(&self) -> Option<(String, bool)> {
+        let h = lock(&self.health);
+        let why = h.error.clone()?;
+        let tail: Vec<&str> = h.stderr.iter().map(String::as_str).filter(|l| !why.contains(*l)).collect();
+        let why = if tail.is_empty() { why } else { format!("{why}\n{}", tail.join("\n")) };
+        Some((why, h.needs_login))
+    }
+
+    /// The sign-in methods the agent advertised.
+    pub fn logins(&self) -> Vec<Login> { lock(&self.health).logins.clone() }
+
+    /// Sign in with one of [`Self::logins`] that the agent handles itself.
+    pub async fn login(&self, id: impl Into<String>) -> Result<(), AcpError> {
+        let (done, rx) = oneshot::channel();
+        self.cmd.send(Cmd::Login { id: id.into(), done }).await.map_err(|_| self.gone())?;
+        rx.await.map_err(|_| self.gone())?.map_err(AcpError::Protocol)
+    }
+
+    /// `Gone`, with the reason when the agent said why it stopped.
+    fn gone(&self) -> AcpError {
+        match self.problem() { Some((why, _)) => AcpError::Protocol(why), None => AcpError::Gone }
     }
 
     /// The slash commands the agent offers (known once a session has started).
@@ -230,11 +319,16 @@ impl AcpAgent {
     }
 }
 
-async fn drain_stderr(stderr: tokio::process::ChildStderr) {
+async fn drain_stderr(stderr: tokio::process::ChildStderr, health: Shared) {
     use tokio::io::AsyncBufReadExt;
     let mut lines = tokio::io::BufReader::new(stderr).lines();
     while let Ok(Some(l)) = lines.next_line().await {
         tracing::debug!(target: "acp_child", "{l}");
+        let l = l.trim();
+        if l.is_empty() { continue; }
+        let mut h = lock(&health);
+        if h.stderr.len() == 6 { h.stderr.pop_front(); }
+        h.stderr.push_back(l.chars().take(300).collect());
     }
 }
 
@@ -274,6 +368,14 @@ fn map_update(u: SessionUpdate) -> Option<AgentEvent> {
     }
 }
 
+/// `session/new`, read raw so fields this protocol version no longer types
+/// (the legacy `models` / `modes`) are not lost.
+async fn open_session(conn: &ConnectionTo<Agent>, launch: &Launch, key: &str) -> agent_client_protocol::Result<(NewSessionResponse, serde_json::Value)> {
+    let raw = conn.send_request(UntypedMessage::new("session/new", new_session(launch, key))?).block_task().await?;
+    let typed = serde_json::from_value(raw.clone()).map_err(|e| agent_client_protocol::Error::internal_error().data(e.to_string()))?;
+    Ok((typed, raw))
+}
+
 fn new_session(launch: &Launch, key: &str) -> NewSessionRequest {
     let req = NewSessionRequest::new(launch.cwd.clone());
     let Some(m) = &launch.mcp else { return req };
@@ -289,6 +391,7 @@ async fn run_connection<W, R>(
     pending: Pending,
     configs: Configs,
     commands: Commands,
+    health: Shared,
 ) where
     W: futures::AsyncWrite + Send + 'static,
     R: futures::AsyncRead + Send + 'static,
@@ -298,6 +401,7 @@ async fn run_connection<W, R>(
     let sinks_p = sinks.clone();
     let pending_p = pending.clone();
     let configs_n = configs.clone();
+    let health_c = health.clone();
     let result = agent_client_protocol::Client
         .builder()
         .name("disco")
@@ -347,12 +451,28 @@ async fn run_connection<W, R>(
             agent_client_protocol::on_receive_request!(),
         )
         .connect_with(transport, async move |conn: ConnectionTo<Agent>| {
-            conn.send_request(InitializeRequest::new(ProtocolVersion::V1)).block_task().await?;
+            // Advertise terminal sign-in so agents list their login commands (claude-agent-acp only does then).
+            let caps = ClientCapabilities::new().auth(AuthCapabilities::new().terminal(true));
+            let init = conn.send_request(InitializeRequest::new(ProtocolVersion::V1).client_capabilities(caps)).block_task().await;
+            let init = match init {
+                Ok(r) => r,
+                Err(e) => { lock(&health_c).error = Some(format!("初始化失败：{e}")); return Err(e); }
+            };
+            lock(&health_c).logins = init.auth_methods.iter().map(login_of).collect();
+            // Config ids served through the legacy `session/set_model` / `set_mode` calls.
+            let legacy: Mutex<HashSet<String>> = Mutex::default();
             // Disco context key -> (ACP session, per-session turn lock).
             let mut sessions: HashMap<String, (SessionId, Arc<tokio::sync::Mutex<()>>)> = HashMap::new();
             let mut prefs: Vec<(String, String)> = launch.config.clone();
             // Apply one setting to one session; keeps `configs` in sync with the agent.
             let set = async |sid: &SessionId, id: &str, value: &str| -> Result<(), String> {
+                if lock(&legacy).contains(id) {
+                    let (method, field) = if id == "model" { ("session/set_model", "modelId") } else { ("session/set_mode", "modeId") };
+                    let msg = UntypedMessage::new(method, serde_json::json!({ "sessionId": sid.to_string(), field: value })).map_err(|e| e.to_string())?;
+                    conn.send_request(msg).block_task().await.map_err(|e| e.to_string())?;
+                    for c in lock(&configs).iter_mut().filter(|c| c.id == id) { c.current = value.to_owned(); }
+                    return Ok(());
+                }
                 let r = conn.send_request(SetSessionConfigOptionRequest::new(sid.clone(), id.to_owned(), value))
                     .block_task().await.map_err(|e| e.to_string())?;
                 *lock(&configs) = choices(&r.config_options);
@@ -372,6 +492,12 @@ async fn run_connection<W, R>(
                         }
                         continue;
                     }
+                    Cmd::Login { id, done } => {
+                        let r = conn.send_request(AuthenticateRequest::new(id)).block_task().await.map(|_| ()).map_err(|e| e.to_string());
+                        if r.is_ok() { let mut h = lock(&health_c); h.error = None; h.needs_login = false; }
+                        let _ = done.send(r);
+                        continue;
+                    }
                     Cmd::Set { id, value, done } => {
                         prefs.retain(|(k, _)| *k != id);
                         prefs.push((id.clone(), value.clone()));
@@ -389,9 +515,17 @@ async fn run_connection<W, R>(
                 };
                 let (session, turn) = match sessions.get(&key) {
                     Some(s) => s.clone(),
-                    None => match conn.send_request(new_session(&launch, &key)).block_task().await {
-                        Ok(r) => {
-                            let offered = choices(r.config_options.as_deref().unwrap_or_default());
+                    None => match open_session(&conn, &launch, &key).await {
+                        Ok((r, raw)) => {
+                            {
+                                let mut h = lock(&health_c);
+                                h.error = None;
+                                h.needs_login = false;
+                            }
+                            let mut offered = choices(r.config_options.as_deref().unwrap_or_default());
+                            let old = legacy_choices(&raw, &offered);
+                            lock(&legacy).extend(old.iter().map(|c| c.id.clone()));
+                            offered.extend(old);
                             for (id, value) in &prefs {
                                 if offered.iter().any(|c| c.id == *id && c.current != *value && c.options.iter().any(|(v, _)| v == value))
                                     && let Err(e) = set(&r.session_id, id, value).await
@@ -403,6 +537,11 @@ async fn run_connection<W, R>(
                             sessions.entry(key).or_insert((r.session_id, Arc::default())).clone()
                         }
                         Err(e) => {
+                            {
+                                let mut h = lock(&health_c);
+                                h.needs_login = matches!(e.code, ErrorCode::AuthRequired);
+                                h.error = Some(e.to_string());
+                            }
                             if let Some((_, events)) = job {
                                 let _ = events.send(AgentEvent::Done { phase: TaskPhase::Failed, stop_reason: Some(e.to_string()) }).await;
                             }
@@ -414,6 +553,7 @@ async fn run_connection<W, R>(
                 if let Some(r) = ready { let _ = r.send(()); }
                 let Some((text, events)) = job else { continue };
                 let (conn, sinks, pending, timeout) = (conn.clone(), sinks.clone(), pending.clone(), launch.prompt_timeout);
+                let health = health_c.clone();
                 tokio::spawn(async move {
                     let _turn = turn.lock().await;
                     let sid = session.to_string();
@@ -425,7 +565,15 @@ async fn run_connection<W, R>(
                             phase: TaskPhase::Completed,
                             stop_reason: Some(format!("{:?}", r.stop_reason).to_lowercase()),
                         },
-                        Ok(Err(e)) => AgentEvent::Done { phase: TaskPhase::Failed, stop_reason: Some(e.to_string()) },
+                        Ok(Err(e)) => {
+                            // Some agents (claude-agent-acp) only find out at the first prompt.
+                            if matches!(e.code, ErrorCode::AuthRequired) {
+                                let mut h = lock(&health);
+                                h.needs_login = true;
+                                h.error = Some(e.to_string());
+                            }
+                            AgentEvent::Done { phase: TaskPhase::Failed, stop_reason: Some(e.to_string()) }
+                        }
                         Err(_) => AgentEvent::Done { phase: TaskPhase::Failed, stop_reason: Some("timeout".into()) },
                     };
                     let prefix = format!("{sid}/");
@@ -439,6 +587,11 @@ async fn run_connection<W, R>(
         .await;
     if let Err(e) = result {
         tracing::warn!("acp connection ended: {e}");
+        let mut h = lock(&health);
+        if h.error.is_none() { h.error = Some(format!("agent 已退出：{e}")); }
+    } else {
+        let mut h = lock(&health);
+        if h.error.is_none() { h.error = Some("agent 已退出".into()); }
     }
 }
 

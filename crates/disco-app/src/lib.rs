@@ -43,6 +43,8 @@ const SET_AVATAR: &str = "avatar/";
 /// Names the bot owner(s) go by on Discord, one per line.
 const SET_OWNER_NAMES: &str = "discord_owner_names";
 const AGENT_CATEGORY: &str = "Disco Agents";
+/// Title prefix of the inbox card that offers an agent's sign-in methods.
+const LOGIN_TITLE: &str = "需要登录";
 const GROUP_CATEGORY: &str = "Disco 群聊";
 /// Memory notes live in settings as `mem/<scope>/<millis>`; scope is `all` or an agent name.
 pub(crate) const MEM: &str = "mem/";
@@ -307,8 +309,30 @@ impl Core {
                     self.post_message(&thread, "system", &format!("Discord 发送失败：{e}"));
                 }
             }
-            Err(e) => self.post_message(&thread, "system", &fail_line(&agent, &e)),
+            Err(e) => self.report_failure(&thread, &agent, &e),
         }
+    }
+
+    /// Say why a turn failed; when the agent only needs a login, also offer its sign-in
+    /// methods as a card (in the app and on Discord), and carry out the one picked.
+    fn report_failure(&self, thread: &str, agent: &str, e: &str) {
+        self.post_message(thread, "system", &fail_line(agent, e));
+        self.offer_login(thread, agent);
+    }
+
+    fn offer_login(&self, thread: &str, agent: &str) {
+        let core: Arc<Core> = self.app.state::<Arc<Core>>().inner().clone();
+        let (thread, agent) = (thread.to_owned(), agent.to_owned());
+        tauri::async_runtime::spawn(async move {
+            let Some(logins) = core.hub.wants_login(&agent).await else { return };
+            if core.inbox.list().iter().any(|i| i.agent == agent && i.title.starts_with(LOGIN_TITLE)) { return; }
+            let label = |l: &disco_acp::Login| if l.terminal.is_some() { format!("在终端登录：{}", l.name) } else { l.name.clone() };
+            let rx = core.inbox_question(&thread, &agent, &format!("{LOGIN_TITLE}，选一种方式"), logins.iter().map(label).collect(), false);
+            let Ok(pick) = rx.await else { return };
+            let Some(l) = logins.iter().find(|l| label(l) == pick) else { return };
+            let line = core.hub.login(&agent, &l.id).await.unwrap_or_else(|e| format!("{agent} 登录失败：{e}"));
+            core.post_message(&thread, "system", &line);
+        });
     }
 
     /// Start agents and their DM sessions ahead of use (all of them, or `only`).
@@ -327,7 +351,7 @@ impl Core {
                 async move {
                     for c in ctxs {
                         if let Err(e) = core.hub.warm(&r, &secret_get, &c).await {
-                            if check { core.post_message(&format!("dm:{}", r.name), "system", &fail_line(&r.name, &e)); }
+                            if check { core.report_failure(&format!("dm:{}", r.name), &r.name, &e); }
                             break;
                         }
                     }
@@ -527,7 +551,7 @@ impl Core {
                             mentions(&answer, &g.members, Some(agent)).into_iter().map(|m| (m, agent.clone())).collect()
                         }
                         Err(e) => {
-                            self.post_message(thread, "system", &fail_line(agent, &e));
+                            self.report_failure(thread, agent, &e);
                             Vec::new()
                         }
                     }
@@ -753,6 +777,9 @@ fn hint(e: &str) -> Option<&'static str> {
         } else {
             "需要原生版 Claude Code：在终端运行 `curl -fsSL https://claude.ai/install.sh | bash`，然后完全退出并重新打开 Disco"
         }),
+        (&["authentication required"], "需要登录：点卡片里的登录方式；也可以在终端里先运行一次这个 agent 登录（如 `claude` 里输入 /login、`codex login`、`hermes setup`）"),
+        (&["no module named 'acp'", "acp_adapter", "hermes acp --check"], "Hermes 缺 ACP 扩展：在终端运行 `hermes acp --check`，按提示安装（`cd ~/.hermes/hermes-agent && uv pip install -e '.[acp]'`）后重新打开 Disco"),
+        (&["unsupported engine", "requires node", "syntaxerror: unexpected token"], "Node.js 太旧：升级到 22 以上（`nvm install 22` 或 nodejs.org），然后完全退出并重新打开 Disco"),
         (&["os error 193", "not a valid win32"], "Windows 无法直接运行这个命令：升级到最新版 Disco，或在添加 agent 时填 .cmd / .exe 的完整路径"),
         (&["no llm provider", "api key", "api_key", "unauthorized", "401", "not logged in", "authentication"],
             "这个 agent 还没登录或缺少 API Key：先在终端里运行一次它完成登录（如 `claude` 后输入 /login），再完全退出并重新打开 Disco"),
@@ -1120,7 +1147,11 @@ fn send(core: St<'_>, thread: String, text: String) -> CmdResult<()> {
 #[tauri::command]
 async fn agent_configs(core: St<'_>, agent: String) -> CmdResult<Vec<hub::ConfigView>> {
     let row = core.agent(&agent)?;
-    core.hub.configs(&row, &secret_get, &format!("dm:{agent}")).await
+    let thread = format!("dm:{agent}");
+    let r = core.hub.configs(&row, &secret_get, &thread).await;
+    // Opening the chat is where a missing login first shows: offer it right there.
+    core.offer_login(&thread, &agent);
+    r.map_err(|e| fail_line(&agent, &e))
 }
 
 /// Pick a model / reasoning level / mode for an agent: applied to its open sessions

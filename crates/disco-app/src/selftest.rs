@@ -123,6 +123,33 @@ pub fn spawn(app: AppHandle, mock: String) {
         let _ = check!("Discord 另一个 Disco 的 agent @m1", { let n = count(&core, "group:chan1", "m1");
             core.on_incoming(disco_discord::Incoming { webhook_id: Some("hook9".into()), ..msg("chan1", "hook9", "coder", "@m1 帮我看看") }); wait_msg(&core, "group:chan1", "m1", n, 30).await });
 
+        // Older model API (Hermes) and ACP sign-in, with the raw mock agent.
+        let raw = mock.replace("mock-acp-agent", "mock-raw-agent");
+        let raw_spec = |name: &str, arg: &str| crate::NewAgent { command: Some(format!("\"{raw}\" {arg}")), ..spec(name) };
+        let _ = check!("旧版模型接口 列出模型", { within(20, crate::add_agent(st(), raw_spec("r1", ""))).await??;
+            let list = within(20, crate::agent_configs(st(), "r1".into())).await??;
+            let m = list.iter().find(|c| c.category == "model").ok_or(format!("没有模型：{}", list.len()))?;
+            if m.options.len() == 2 { Ok(m.current.clone()) } else { Err(format!("{:?}", m.options)) } });
+        let _ = check!("旧版模型接口 切换模型", { within(10, crate::set_agent_config(st(), "r1".into(), "model".into(), "m-smart".into())).await??;
+            let n = count(&core, "dm:r1", "r1"); crate::send(st(), "dm:r1".into(), "hi".into())?;
+            wait_msg(&core, "dm:r1", "r1", n, 20).await.and_then(|b| if b == "raw m-smart" { Ok(b) } else { Err(b) }) });
+        let _ = check!("需要登录 → 卡片", { within(20, crate::add_agent(st(), raw_spec("r2", "auth"))).await??;
+            let n = count(&core, "dm:r2", "system"); crate::send(st(), "dm:r2".into(), "hi".into())?;
+            let line = wait_msg(&core, "dm:r2", "system", n, 20).await?;
+            let card = within(10, async { loop {
+                if let Some(i) = core.inbox.list().into_iter().find(|i| i.agent == "r2") { return i; }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            } }).await?;
+            let labels: Vec<String> = card.options.iter().map(|o| o.label.clone()).collect();
+            if !line.contains("💡") || labels != ["Mock Key", "在终端登录：Mock Terminal"] { return Err(format!("{line} {labels:?}")); }
+            let n = count(&core, "dm:r2", "system");
+            let opt = card.options[0].id.clone();
+            core.inbox_answer(&card.id, inbox::Answer { option: Some(opt), text: None }, "selftest").await?;
+            wait_msg(&core, "dm:r2", "system", n, 10).await.and_then(|b| if b.contains("已登录") { Ok(b) } else { Err(b) }) });
+        let _ = check!("登录后可以聊", { let n = count(&core, "dm:r2", "r2"); crate::send(st(), "dm:r2".into(), "hi".into())?;
+            wait_msg(&core, "dm:r2", "r2", n, 20).await });
+        for r in ["r1", "r2"] { let _ = within(10, crate::remove_agent(st(), r.into(), Some(true))).await; }
+
         // the rest of the surface
         let _ = check!("messages", crate::messages(st(), gt.clone()).map(|v| format!("{} 条", v.len())));
         let _ = check!("待办 增/完成/删", {

@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use disco_a2a::{Credential, RemoteAgent};
-use disco_acp::{AcpAgent, Launch, McpStdio};
+use disco_acp::{AcpAgent, Launch, Login, McpStdio};
 use disco_store::AgentRow;
 use disco_types::{AgentEvent, PermissionDecision, TaskPhase};
 use futures::StreamExt;
@@ -63,6 +63,12 @@ pub struct Hub {
     /// The user's login-shell PATH: GUI apps start with a bare one, so npx and
     /// Homebrew tools would otherwise be invisible.
     pub user_path: String,
+    /// The rest of the login-shell environment (API keys, base URLs, proxies set in
+    /// ~/.zshrc): an app opened from the Dock never sees them otherwise. Empty on Windows,
+    /// where apps already inherit the user's environment.
+    pub user_env: Vec<(String, String)>,
+    /// How each agent was launched, to run its sign-in command in a terminal.
+    launches: std::sync::Mutex<HashMap<String, Launch>>,
     /// Port of the loopback Disco MCP endpoint (see mcp.rs), once it listens.
     pub mcp_port: std::sync::OnceLock<u16>,
     /// MCP token -> agent name. Each ACP agent gets its own token, so a tool call
@@ -76,7 +82,8 @@ pub type CredLookup = dyn Fn(&str) -> Option<String> + Send + Sync;
 
 impl Hub {
     pub fn new() -> Self {
-        Self { live: Mutex::default(), slots: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT)), user_path: login_path(), mcp_port: Default::default(), mcp_tokens: Default::default() }
+        let (user_path, user_env) = login_env();
+        Self { live: Mutex::default(), slots: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT)), user_path, user_env, launches: Default::default(), mcp_port: Default::default(), mcp_tokens: Default::default() }
     }
 
     async fn runtime(&self, row: &AgentRow, secret: &CredLookup) -> Result<Runtime, String> {
@@ -135,7 +142,7 @@ impl Hub {
                     cwd = wt;
                 }
                 let mut path = self.user_path.clone();
-                let mut env = Vec::new();
+                let mut env = self.user_env.clone();
                 if !spec.conda.is_empty() {
                     let prefix = PathBuf::from(&spec.conda);
                     if !prefix.join("conda-meta").is_dir() { return Err(format!("conda 环境不存在：{}", spec.conda)); }
@@ -153,6 +160,9 @@ impl Hub {
                     && std::env::var_os("CLAUDE_CODE_EXECUTABLE").is_none()
                     && let Some(exe) = which("claude.exe", &path) {
                     env.push(("CLAUDE_CODE_EXECUTABLE".into(), exe.to_string_lossy().into_owned()));
+                }
+                if let Some(need) = crate::templates::node_min(&spec.template) && let Some(have) = node_major(&path) && have < need {
+                    return Err(format!("Node.js 版本太旧（v{have}）：这个 agent 需要 Node {need} 以上。升级 Node（如 `nvm install {need}` 或从 nodejs.org 安装）后完全退出并重新打开 Disco"));
                 }
                 let command = which(&spec.command, &path).ok_or_else(|| match spec.command.as_str() {
                     "npx" | "node" => "找不到 npx：请先安装 Node.js（https://nodejs.org），然后重启 Disco".to_owned(),
@@ -184,6 +194,7 @@ impl Hub {
                     config: spec.config.into_iter().collect(),
                     mcp: self.mcp_for(&row.name),
                 };
+                self.launches.lock().unwrap_or_else(|p| p.into_inner()).insert(row.name.clone(), launch.clone());
                 Runtime::Acp(Arc::new(AcpAgent::spawn(launch).await.map_err(|e| e.to_string())?))
             }
             t => return Err(format!("暂不支持的类型 {t}")),
@@ -283,6 +294,41 @@ impl Hub {
         }
     }
 
+    async fn acp(&self, agent: &str) -> Option<Arc<AcpAgent>> {
+        let cell = self.live.lock().await.get(agent).cloned();
+        match cell.as_ref().and_then(|c| c.get()) { Some(Runtime::Acp(a)) => Some(a.clone()), _ => None }
+    }
+
+    /// The sign-in methods `agent` offers, when its last session failed for want of a login.
+    pub async fn wants_login(&self, agent: &str) -> Option<Vec<Login>> {
+        let a = self.acp(agent).await?;
+        let (_, needs) = a.problem()?;
+        Some(a.logins()).filter(|l| needs && !l.is_empty())
+    }
+
+    /// Sign `agent` in with method `id`: the agent does it itself (browser, saved key),
+    /// or its own command runs the login in a terminal window. Returns what to tell the user.
+    pub async fn login(&self, agent: &str, id: &str) -> Result<String, String> {
+        let a = self.acp(agent).await.ok_or("agent 没在运行，先给它发一条消息")?;
+        let m = a.logins().into_iter().find(|l| l.id == id).ok_or("没有这种登录方式")?;
+        match &m.terminal {
+            None => {
+                a.login(id).await.map_err(|e| e.to_string())?;
+                Ok(format!("{agent} 已登录（{}），可以继续聊了。", m.name))
+            }
+            Some(t) => {
+                let launch = self.launches.lock().unwrap_or_else(|p| p.into_inner()).get(agent).cloned().ok_or("找不到启动方式")?;
+                let args: Vec<String> = launch.args.iter().chain(&t.args).cloned().collect();
+                let path = launch.env.iter().find(|(k, _)| k == "PATH").map(|(_, v)| v.clone()).unwrap_or_else(|| self.user_path.clone());
+                let env: Vec<(String, String)> = std::iter::once(("PATH".to_owned(), path)).chain(t.env.iter().cloned()).collect();
+                open_terminal(&launch.command, &args, &env, &launch.cwd, agent)?;
+                // A fresh process picks up the new credentials on the next message.
+                self.drop_agent(agent).await;
+                Ok(format!("已在终端打开 {agent} 的登录（{}）。按提示完成后回到这里再发一次消息。", m.name))
+            }
+        }
+    }
+
     pub async fn is_live(&self, agent: &str) -> bool {
         self.live.lock().await.get(agent).is_some_and(|c| c.initialized())
     }
@@ -349,6 +395,9 @@ fn join_path(parts: impl Iterator<Item = String>) -> String {
 /// Windows: a GUI app's PATH is already the user's PATH; add where npm, volta,
 /// scoop and bun put their shims.
 #[cfg(windows)]
+fn login_env() -> (String, Vec<(String, String)>) { (login_path(), Vec::new()) }
+
+#[cfg(windows)]
 fn login_path() -> String {
     let env = |k: &str| std::env::var(k).unwrap_or_default();
     let home = dirs_home();
@@ -358,36 +407,102 @@ fn login_path() -> String {
     join_path(std::iter::once(env("PATH")).chain(extra))
 }
 
-/// The PATH the user's terminal would have. GUI apps start with a bare PATH, and
-/// Node from nvm/volta/fnm usually lives in ~/.zshrc, so ask an interactive login
-/// shell (bounded to 4 s in case an rc file waits for input) and add the usual
-/// install locations as a fallback.
+/// What the user's terminal would have: PATH plus every variable their shell rc files
+/// export. GUI apps start with a bare environment, and Node from nvm/volta/fnm, API keys,
+/// base URLs and proxies usually live in ~/.zshrc. Asks an interactive login shell
+/// (bounded to 4 s in case an rc file waits for input) and adds the usual install
+/// locations to PATH as a fallback.
 #[cfg(not(windows))]
-fn login_path() -> String {
-    const MARK: &str = "__DISCO_PATH__";
-    let base = std::env::var("PATH").unwrap_or_default();
+fn login_env() -> (String, Vec<(String, String)>) {
+    const MARK: &str = "__DISCO_ENV__";
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".into());
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let out = std::process::Command::new(shell)
-            .args(["-ilc", &format!("printf '{MARK}%s{MARK}' \"$PATH\"")])
+            .args(["-ilc", &format!("printf '{MARK}'; env -0")])
             .stdin(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .output();
-        let _ = tx.send(out.ok().and_then(|o| String::from_utf8(o.stdout).ok()).unwrap_or_default());
+        let _ = tx.send(out.ok().map(|o| String::from_utf8_lossy(&o.stdout).into_owned()).unwrap_or_default());
     });
     let raw = rx.recv_timeout(std::time::Duration::from_secs(4)).unwrap_or_default();
-    let from_shell = raw.split(MARK).nth(1).unwrap_or("").to_owned();
+    let vars = parse_env(raw.rsplit_once(MARK).map(|(_, e)| e).unwrap_or(""));
+    let shell_path = vars.iter().find(|(k, _)| k == "PATH").map(|(_, v)| v.clone()).unwrap_or_default();
+    let keep = vars.into_iter().filter(|(k, _)| k != "PATH" && !SHELL_ONLY.contains(&k.as_str()) && !k.starts_with("TERM")).collect();
+    (login_path(shell_path), keep)
+}
+
+/// Shell bookkeeping that must not leak into an agent's environment.
+#[cfg(not(windows))]
+const SHELL_ONLY: &[&str] = &["PWD", "OLDPWD", "SHLVL", "_", "PS1", "PS2", "PROMPT", "RPROMPT", "ZDOTDIR", "SHELL_SESSION_ID", "TMUX", "STY", "ITERM_SESSION_ID", "ITERM_PROFILE", "COLORTERM", "LINES", "COLUMNS"];
+
+/// `env -0` output: NUL-separated `KEY=value` pairs (values may contain newlines).
+#[cfg(not(windows))]
+fn parse_env(raw: &str) -> Vec<(String, String)> {
+    raw.split('\0').filter_map(|kv| kv.split_once('=')).filter(|(k, _)| !k.is_empty() && !k.contains(char::is_whitespace))
+        .map(|(k, v)| (k.to_owned(), v.to_owned())).collect()
+}
+
+#[cfg(not(windows))]
+fn login_path(from_shell: String) -> String {
+    let base = std::env::var("PATH").unwrap_or_default();
     let home = dirs_home();
     let mut extra: Vec<String> = [".volta/bin", ".local/bin", ".bun/bin", ".cargo/bin", ".npm-global/bin", "Library/pnpm"]
         .iter().map(|d| home.join(d).to_string_lossy().into_owned()).collect();
-    // Newest nvm node, if any.
+    // Newest nvm node, if any (by version number: v9 is older than v22).
     if let Ok(rd) = std::fs::read_dir(home.join(".nvm/versions/node")) {
-        let mut v: Vec<_> = rd.filter_map(|e| e.ok()).map(|e| e.path()).collect();
-        v.sort();
-        if let Some(latest) = v.last() { extra.push(latest.join("bin").to_string_lossy().into_owned()); }
+        let ver = |p: &PathBuf| p.file_name().and_then(|n| n.to_str()).map(|n| n.trim_start_matches('v').split('.').map(|x| x.parse::<u32>().unwrap_or(0)).collect::<Vec<_>>()).unwrap_or_default();
+        if let Some(latest) = rd.filter_map(|e| e.ok()).map(|e| e.path()).max_by_key(ver) { extra.push(latest.join("bin").to_string_lossy().into_owned()); }
     }
     join_path(std::iter::once(from_shell).chain(["/opt/homebrew/bin".into(), "/usr/local/bin".into()]).chain(extra).chain(std::iter::once(base)))
+}
+
+/// Major version of the `node` on `path`.
+fn node_major(path: &str) -> Option<u32> {
+    let node = which("node", path)?;
+    let out = quiet_cmd(node).arg("--version").env("PATH", path).stdin(std::process::Stdio::null()).output().ok()?;
+    String::from_utf8_lossy(&out.stdout).trim().trim_start_matches('v').split('.').next()?.parse().ok()
+}
+
+/// Open a terminal window that runs `cmd args` (an agent's own login command) with `env`.
+fn open_terminal(cmd: &str, args: &[String], env: &[(String, String)], cwd: &std::path::Path, agent: &str) -> Result<(), String> {
+    let name: String = agent.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '-' }).collect();
+    let file = std::env::temp_dir().join(format!("disco-login-{name}.{}", if cfg!(windows) { "cmd" } else if cfg!(target_os = "macos") { "command" } else { "sh" }));
+    std::fs::write(&file, login_script(cmd, args, env, cwd)).map_err(|e| e.to_string())?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o700));
+    }
+    let f = file.to_string_lossy().into_owned();
+    let opened = if cfg!(windows) {
+        quiet_cmd("cmd").args(["/c", "start", "", &f]).spawn().is_ok()
+    } else if cfg!(target_os = "macos") {
+        std::process::Command::new("open").args(["-a", "Terminal", &f]).status().is_ok_and(|s| s.success())
+    } else {
+        ["x-terminal-emulator", "gnome-terminal", "konsole", "xterm"].iter().any(|t| std::process::Command::new(t).args(["-e", "sh", &f]).spawn().is_ok())
+    };
+    if opened { Ok(()) } else { Err(format!("打不开终端，请手动运行：{f}")) }
+}
+
+#[cfg(windows)]
+fn login_script(cmd: &str, args: &[String], env: &[(String, String)], cwd: &std::path::Path) -> String {
+    let q = |s: &str| format!("\"{}\"", s.replace('"', "\"\""));
+    let mut script = format!("@echo off\r\ncd /d {}\r\n", q(&cwd.to_string_lossy()));
+    for (k, v) in env { script.push_str(&format!("set \"{k}={v}\"\r\n")); }
+    let line: Vec<String> = std::iter::once(cmd).chain(args.iter().map(String::as_str)).map(q).collect();
+    script.push_str(&format!("{}\r\necho.\r\necho 完成后可以关闭这个窗口，回到 Disco。\r\npause\r\n", line.join(" ")));
+    script
+}
+
+#[cfg(not(windows))]
+fn login_script(cmd: &str, args: &[String], env: &[(String, String)], cwd: &std::path::Path) -> String {
+    let q = |s: &str| format!("'{}'", s.replace('\'', "'\\''"));
+    let mut script = format!("#!/bin/sh\ncd {}\n", q(&cwd.to_string_lossy()));
+    for (k, v) in env { script.push_str(&format!("export {k}={}\n", q(v))); }
+    let line: Vec<String> = std::iter::once(cmd).chain(args.iter().map(String::as_str)).map(q).collect();
+    script.push_str(&format!("{}\necho\necho '完成后可以关闭这个窗口，回到 Disco。'\n", line.join(" ")));
+    script
 }
 
 /// Full path of `cmd` on `path`, if it is there.
@@ -421,4 +536,19 @@ pub fn quiet_cmd(program: impl AsRef<std::ffi::OsStr>) -> std::process::Command 
     #[cfg(windows)]
     { use std::os::windows::process::CommandExt; c.creation_flags(0x0800_0000); }
     c
+}
+
+#[cfg(all(test, not(windows)))]
+mod env_tests {
+    #[test]
+    fn parses_env_dump() {
+        let v = super::parse_env("A=1\0MULTI=x\ny\0BAD\0=skip\0B=a=b\0");
+        assert_eq!(v, vec![("A".into(), "1".into()), ("MULTI".into(), "x\ny".into()), ("B".into(), "a=b".into())]);
+    }
+
+    #[test]
+    fn login_script_quotes() {
+        let s = super::login_script("/x/agent", &["--cli".into(), "it's".into()], &[("PATH".into(), "/a b".into())], std::path::Path::new("/tmp"));
+        assert!(s.contains("export PATH='/a b'") && s.contains("'/x/agent' '--cli' 'it'\\''s'"), "{s}");
+    }
 }
