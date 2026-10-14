@@ -58,7 +58,7 @@ pub fn spawn(app: AppHandle, mock: String) {
         let st = || app.state::<Arc<Core>>();
         let _ = check!("overview(空)", within(5, crate::overview(st())).await.and_then(|r| r.map(|o| format!("{} agents", o.agents.len()))));
         let spec = |name: &str| crate::NewAgent { template: "command".into(), name: name.into(), url: None, header_name: None, header_value: None,
-            command: Some(format!("\"{mock}\"")), cwd: None, count: None, worktree: None, conda: None };
+            command: Some(format!("\"{mock}\"")), cwd: None, count: None, worktree: None, conda: None, model: None };
         let _ = check!("add_agent m1", within(20, crate::add_agent(st(), spec("m1"))).await.and_then(|r| r.map(|v| v.join(","))));
         let _ = check!("add_agent m2", within(20, crate::add_agent(st(), spec("m2"))).await.and_then(|r| r.map(|v| v.join(","))));
         let _ = check!("overview(2)", within(5, crate::overview(st())).await.and_then(|r| r.and_then(|o| if o.agents.len() == 2 { Ok("2 agents".into()) } else { Err(format!("{} agents", o.agents.len())) })));
@@ -169,6 +169,17 @@ pub fn spawn(app: AppHandle, mock: String) {
         let _ = check!("stop_all", within(10, crate::stop_all(st())).await.and_then(|r| r).map(|n| format!("{n}")));
         crate::resume(st());
         let _ = check!("恢复后私聊", { let n = count(&core, "dm:m1", "m1"); crate::send(st(), "dm:m1".into(), "回来了".into())?; wait_msg(&core, "dm:m1", "m1", n, 30).await });
+        let _ = check!("OpenAI 兼容 agent", {
+            let base = mock_openai().await?;
+            let o = crate::NewAgent { template: "openai".into(), name: "o1".into(), url: Some(format!("{base}/chat/completions")), header_name: None, header_value: Some("k".into()),
+                command: None, cwd: None, count: None, worktree: None, conda: None, model: None };
+            within(10, crate::add_agent(st(), o)).await??;
+            let n = count(&core, "dm:o1", "o1");
+            crate::send(st(), "dm:o1".into(), "记一个待办".into())?;
+            let b = wait_msg(&core, "dm:o1", "o1", n, 30).await?;
+            if !b.contains("好了") { return Err(b); }
+            if !crate::mcp::todos(&core, "dm:o1").iter().any(|t| t.text == "来自模型") { return Err("工具调用没生效".into()); }
+            Ok(b) });
         let _ = check!("对方群可回话", {
             let pc = |ctx: &str| { let _ = core.db().set_setting(&format!("{}st", crate::share::PEER_CTX), ctx); core.peer_channel("st") };
             if pc("group:1234567890").as_deref() != Some("1234567890") { return Err("认不出 Discord 群".into()); }
@@ -181,4 +192,31 @@ pub fn spawn(app: AppHandle, mock: String) {
         println!("SELFTEST {}", if fails == 0 { "OK".to_string() } else { format!("{fails} FAILED") });
         std::process::exit(if fails == 0 { 0 } else { 1 });
     });
+}
+
+/// A tiny OpenAI-compatible server: lists one model; asks for `todo_add` when tools are
+/// offered, then answers with what the tool returned. Returns its base URL.
+async fn mock_openai() -> Result<String, String> {
+    use axum::{routing::{get, post}, Json};
+    use serde_json::{json, Value};
+    async fn chat(Json(req): Json<Value>) -> String {
+        let msgs = req["messages"].as_array().cloned().unwrap_or_default();
+        let sse = |delta: Value| format!("data: {}\n\n", json!({ "choices": [{ "index": 0, "delta": delta }] }));
+        if let Some(t) = msgs.iter().rev().find(|m| m["role"] == "tool") {
+            format!("{}{}data: [DONE]\n\n", sse(json!({ "content": "好了：" })), sse(json!({ "content": t["content"] })))
+        } else if req.get("tools").is_some() {
+            format!("{}{}data: [DONE]\n\n",
+                sse(json!({ "tool_calls": [{ "index": 0, "id": "c1", "type": "function", "function": { "name": "todo_add", "arguments": "{\"text\":" } }] })),
+                sse(json!({ "tool_calls": [{ "index": 0, "function": { "arguments": "\"来自模型\"}" } }] })))
+        } else {
+            format!("{}data: [DONE]\n\n", sse(json!({ "content": "好了（没有工具）" })))
+        }
+    }
+    let app = axum::Router::new()
+        .route("/v1/models", get(|| async { Json(json!({ "data": [{ "id": "mock-model" }] })) }))
+        .route("/v1/chat/completions", post(chat));
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.map_err(|e| e.to_string())?;
+    let port = l.local_addr().map_err(|e| e.to_string())?.port();
+    tokio::spawn(async move { let _ = axum::serve(l, app).await; });
+    Ok(format!("http://127.0.0.1:{port}/v1"))
 }

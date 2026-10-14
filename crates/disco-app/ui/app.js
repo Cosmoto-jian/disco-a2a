@@ -246,13 +246,13 @@ async function openThread(t) {
   const g = isGroup && S.ov.groups.find((g) => `group:${g.id}` === t);
   const a = !isGroup && S.ov.agents.find((a) => a.name === name);
   const multi = isGroup && (g.people.length || g.guests.length);
-  const sub = isGroup ? `${g.members.length} 个 agent${multi ? ` · ${g.people.length + 1} 人 · 多人群：@ 才回答` : ` · 组长 ${g.lead ?? "—"}`}${g.id.startsWith("local-") ? "" : " · Discord 同步"}` : peer ? `${peer.guest} 通过共享在用你的 ${peer.agent}` : a ? `${a.kind === "acp" ? "本机" : "A2A"} · ${a.detail}` : "";
+  const sub = isGroup ? `${g.members.length} 个 agent${multi ? ` · ${g.people.length + 1} 人 · 多人群：@ 才回答` : ` · 组长 ${g.lead ?? "—"}`}${g.id.startsWith("local-") ? "" : " · Discord 同步"}` : peer ? `${peer.guest} 通过共享在用你的 ${peer.agent}` : a ? `${{ acp: "本机", openai: "模型 API" }[a.kind] ?? "A2A"} · ${a.detail}` : "";
   const pane = $("#pane");
   pane.replaceChildren(
     h("div", { class: "head", "data-tauri-drag-region": true }, a ? Object.assign(avatar(name, { live: a.live }), { title: "更换形象", onclick: () => avatarDialog(name), className: `av pickable${a.live ? " live" : ""}` }) : avatar(peer ? peer.agent : name, { group: isGroup }),
       h("div", {}, h("h2", { title: a ? "双击重命名" : "", ondblclick: a ? (e) => inlineRename(e.currentTarget, a.name) : null }, name), h("small", {}, sub)), h("span", { class: "sp" }),
       isGroup ? h("div", { id: "members" }) : null,
-      a && a.kind === "acp" ? h("div", { id: "cfgs" }) : null,
+      a && a.kind !== "a2a" ? h("div", { id: "cfgs" }) : null,
       !peer ? memorySwitch(t) : null,
       !peer ? h("button", { class: "btn space-btn", title: "待办和群文档（agent 也能读写）", onclick: () => toggleSpace(t) }, "待办", h("span", { class: "count", id: "todo-count" })) : null,
       isGroup ? h("button", { class: "btn", title: "让成员分工并行处理一个任务，最后由组长汇总", onclick: () => { const i = $("#input"); if (!i.value.startsWith("/team ")) i.value = `/team ${i.value}`; i.focus(); i.dispatchEvent(new Event("input")); } }, "团队") : null,
@@ -278,7 +278,7 @@ async function openThread(t) {
   });
   ta.focus();
   drawMembers(); syncComposer();
-  if (a && a.kind === "acp") loadConfigs(name, t);
+  if (a && a.kind !== "a2a") loadConfigs(name, t);
   if (!peer) loadSpace(t);
   if (isGroup) invoke("team_state", { thread: t }).then((st) => { if (st) { S.team[t] = st; renderTeam(t); } }).catch(() => {});
   const draw = (msgs) => {
@@ -525,6 +525,13 @@ function popover(anchor, items) {
     class: `pop-item${it.on ? " on" : ""}${it.danger ? " danger" : ""}`,
     onclick: () => { close(); it.run(); },
   }, h("span", {}, it.label), it.on ? h("span", { class: "pop-check" }) : null)));
+  // Long lists (a provider's hundreds of models) get a filter box.
+  if (items.length > 12) {
+    const f = h("input", { class: "pop-filter", placeholder: "筛选…", spellcheck: false });
+    f.oninput = () => { const q = f.value.toLowerCase(); for (const b of pop.querySelectorAll(".pop-item")) b.hidden = !b.textContent.toLowerCase().includes(q); };
+    f.onkeydown = (e) => { if (e.key === "Enter") pop.querySelector(".pop-item:not([hidden])")?.click(); };
+    pop.prepend(f); setTimeout(() => f.focus());
+  }
   document.body.append(pop);
   const r = anchor.getBoundingClientRect();
   pop.style.top = `${r.bottom + 6}px`;
@@ -535,7 +542,7 @@ function popover(anchor, items) {
   addEventListener("mousedown", out, true); addEventListener("keydown", esc, true);
 }
 function agentMenu(anchor, name) {
-  const local = S.ov.agents.find((a) => a.name === name)?.kind === "acp";
+  const local = S.ov.agents.find((a) => a.name === name)?.kind !== "a2a";
   popover(anchor, [
     { label: "更换形象…", run: () => avatarDialog(name) },
     ...(local ? [{ label: "共享给朋友…", run: () => shareDialog(name) }] : []),
@@ -794,6 +801,7 @@ async function renderGallery() {
   const found2 = have.length ? [h("div", { class: "asec" }, `${here}上检测到`, h("i", {}, String(have.length))),
     h("div", { class: "alist" }, ...have.map((t) => agentRow({ ...t, kind: "acp" }, t.found)))] : [];
   const more = h("div", { class: "alist" },
+    agentRow({ id: "openai", name: "OpenAI 兼容模型", kind: "openai" }, "OpenRouter、DeepSeek、Ollama 等，填地址和 Key"),
     agentRow({ id: "command", name: "其他本地 agent", kind: "command" }, "任意支持 ACP 的程序"),
     agentRow({ id: "invite", name: "朋友的邀请码", kind: "invite" }, "接入别人通过 Disco 共享的 agent"),
     agentRow({ id: "a2a", name: "远程 A2A agent", kind: "a2a" }, "通过 URL 接入"));
@@ -834,6 +842,7 @@ const MARKS = {
   opencode: ["#334155", '<path d="m9 7-5 5 5 5M15 7l5 5-5 5"/>'],
   dsh: ["#475569", '<path d="M5 8l4 4-4 4M11 17h8"/>'],
   command: ["#64748b", '<path d="m6.5 8 4 4-4 4M12.5 16.5h5"/>'],
+  openai: ["#0ea5e9", '<path d="M12 3.5 19.4 7.8v8.4L12 20.5 4.6 16.2V7.8z"/><path d="M12 12 19.4 7.8M12 12 4.6 7.8M12 12v8.5"/>'],
   invite: ["#10a37f", '<circle cx="12" cy="12" r="3.6"/><path d="M15.6 12v1.4a2.5 2.5 0 0 0 5 0V12a8.6 8.6 0 1 0-3.4 6.9"/>'],
   a2a: ["#5865f2", '<circle cx="6" cy="12" r="2.5"/><circle cx="18" cy="12" r="2.5"/><path d="M8.5 12h7M12 6.5c2 0 4 1 5.5 3.2M12 17.5c-2 0-4-1-5.5-3.2"/>'],
 };
@@ -875,7 +884,21 @@ function agentForm(t) {
   let look = null;
   const parts = [h("div", { class: "frow" }, h("span", {}, "名称"), name),
     h("div", { class: "frow top" }, h("span", {}, "形象"), avatarPicker(t.letter ?? t.name, { form: FORM_KEYS[hash(t.id) % FORM_KEYS.length], palette: "brand", base: t.color }, (v) => { look = v; }))];
-  let cmd, url, hn, hv;
+  let cmd, url, hn, hv, model;
+  if (t.kind === "openai") {
+    url = h("input", { class: "fld", placeholder: "Base URL，如 https://openrouter.ai/api/v1", spellcheck: false });
+    hv = h("input", { class: "fld", type: "password", placeholder: IS_WIN ? "API Key（本地模型可不填，存凭据管理器）" : "API Key（本地模型可不填，存钥匙串）" });
+    model = h("input", { class: "fld", placeholder: "模型，如 deepseek-chat（不填用第一个）", spellcheck: false });
+    const PRESETS = [["OpenRouter", "https://openrouter.ai/api/v1", ""], ["DeepSeek", "https://api.deepseek.com/v1", "deepseek-chat"],
+      ["OpenAI", "https://api.openai.com/v1", ""], ["Ollama", "http://localhost:11434/v1", ""], ["LM Studio", "http://localhost:1234/v1", ""]];
+    const chips = h("div", { class: "chips" }, ...PRESETS.map(([n, u, m]) => h("button", { type: "button", class: "chip2", onclick: (e) => {
+      url.value = u; if (m && !model.value) model.value = m; if (!name.value) name.value = n.toLowerCase().replace(/\s+/g, "-");
+      chips.querySelectorAll(".chip2").forEach((c) => c.classList.toggle("on", c === e.currentTarget)); (u.includes("localhost") ? model : hv).focus();
+    } }, n)));
+    parts.push(h("div", { class: "frow" }, h("span", {}, "常用"), chips), h("div", { class: "frow" }, h("span", {}, "地址"), url),
+      h("div", { class: "frow" }, h("span", {}, "Key"), hv), h("div", { class: "frow" }, h("span", {}, "模型"), model),
+      h("p", { class: "hint2" }, "Key 只存在这台电脑上。添加后在对话顶部可以随时切换模型；它也能用 Disco 工具记待办、写群文档。"));
+  }
   if (t.kind === "command") {
     cmd = h("input", { class: "fld", placeholder: "/path/to/agent --acp", spellcheck: false });
     parts.push(h("div", { class: "frow" }, h("span", {}, "程序"), cmd, h("button", { type: "button", class: "ghost", onclick: async () => {
@@ -888,7 +911,7 @@ function agentForm(t) {
     hv = h("input", { class: "fld", type: "password", placeholder: IS_WIN ? "鉴权值（可选，存凭据管理器）" : "鉴权值（可选，存钥匙串）" });
     parts.push(h("div", { class: "frow" }, h("span", {}, "URL"), url), h("div", { class: "frow" }, h("span", {}, "鉴权"), hn, hv));
   }
-  if (t.kind !== "a2a") {
+  if (t.kind !== "a2a" && t.kind !== "openai") {
     const folder = h("button", { type: "button", class: "pill" }, "主目录");
     folder.onclick = async () => { const p = await invoke("choose_path", {}); if (p) { st.cwd = p; folder.textContent = baseName(p); folder.title = p; folder.classList.add("set"); } };
     const chips = h("div", { class: "chips" });
@@ -910,7 +933,7 @@ function agentForm(t) {
     go.disabled = true; err.textContent = "";
     try {
       const added = await invoke("add_agent", { spec: { template: t.id, name: name.value, url: url?.value ?? null, headerName: hn?.value || null, headerValue: hv?.value || null,
-        command: cmd?.value ?? null, cwd: st.cwd || null, count: st.count, worktree: st.count > 1, conda: st.conda || null } });
+        command: cmd?.value ?? null, cwd: st.cwd || null, count: st.count, worktree: st.count > 1, conda: st.conda || null, model: model?.value || null } });
       if (look) for (const n of added) await invoke("set_avatar", { name: n, avatar: look }).catch(() => {});
       await load(); setTab("chats"); openThread(`dm:${name.value.trim()}`);
     } catch (e) { err.textContent = String(e); go.disabled = false; }

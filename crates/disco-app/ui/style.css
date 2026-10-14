@@ -511,3 +511,5 @@ input[type=number].fld.t { width:64px; }
 .m.sys code.cp:hover { background:var(--sel); }
 .frun { display:flex; align-items:center; gap:10px; width:min(420px, 90%); padding:10px 12px; border:1px solid var(--line); border-radius:10px; margin-top:8px; text-align:left; }
 .frun small { flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+
+.pop-filter { position:sticky; top:-5px; z-index:1; width:100%; height:28px; margin:-1px 0 4px; border:0; border-radius:7px; padding:0 9px; background:var(--list); color:var(--fg); outline:none; box-shadow:inset 0 0 0 1px var(--line); }

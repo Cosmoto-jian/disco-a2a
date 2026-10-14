@@ -51,6 +51,7 @@ pub struct ConfigView {
 enum Runtime {
     A2a(Arc<RemoteAgent>),
     Acp(Arc<AcpAgent>),
+    Openai(Arc<crate::openai::OpenAi>),
 }
 
 type Cell = Arc<tokio::sync::OnceCell<Runtime>>;
@@ -209,6 +210,16 @@ impl Hub {
                 self.launches.lock().unwrap_or_else(|p| p.into_inner()).insert(row.name.clone(), launch.clone());
                 Runtime::Acp(Arc::new(AcpAgent::spawn(launch).await.map_err(|e| e.to_string())?))
             }
+            "openai" => {
+                let spec: LocalSpec = row.card_json.as_deref().and_then(|j| serde_json::from_str(j).ok()).unwrap_or_default();
+                let model = spec.config.get("model").cloned().ok_or("还没选模型")?;
+                let key = row.credential_ref.as_deref().and_then(secret);
+                let mcp = self.mcp_for(&row.name).and_then(|m| {
+                    let get = |k: &str| m.env.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone());
+                    Some((get("DISCO_MCP_PORT")?.parse().ok()?, get("DISCO_MCP_TOKEN")?))
+                });
+                Runtime::Openai(Arc::new(crate::openai::OpenAi::new(&row.endpoint, key, model, crate::openai::client(&self.user_env), mcp)))
+            }
             t => return Err(format!("暂不支持的类型 {t}")),
         };
         Ok(rt)
@@ -270,13 +281,27 @@ impl Hub {
                 // Only a closed stream means the process died; a failed turn keeps it warm.
                 out.unwrap_or_else(|| Err("agent 进程已退出".into()))
             }
+            Runtime::Openai(o) => {
+                let mut out = None;
+                let mut f = |ev: AgentEvent| { if let Some(r) = finish(ev) { out = Some(r); } };
+                match o.prompt(context, text, &mut f).await { Err(e) => Err(e), Ok(()) => out.unwrap_or(Ok(())) }
+            }
         };
         outcome.map(|()| answer)
     }
 
     /// Settings the agent offers; starts it (and its `context` session) if needed.
     pub async fn configs(&self, row: &AgentRow, secret: &CredLookup, context: &str) -> Result<Vec<ConfigView>, String> {
-        let Runtime::Acp(a) = self.runtime(row, secret).await? else { return Ok(Vec::new()) };
+        let a = match self.runtime(row, secret).await? {
+            Runtime::Acp(a) => a,
+            Runtime::Openai(o) => {
+                let current = o.model.lock().unwrap_or_else(|p| p.into_inner()).clone();
+                let mut ids = o.models().await.unwrap_or_default();
+                if !ids.contains(&current) { ids.insert(0, current.clone()); }
+                return Ok(vec![ConfigView { id: "model".into(), name: "模型".into(), category: "model".into(), current, options: ids.into_iter().map(|m| (m.clone(), m)).collect() }]);
+            }
+            Runtime::A2a(_) => return Ok(Vec::new()),
+        };
         let list = a.configs(context).await.map_err(|e| e.to_string())?;
         Ok(list.into_iter().map(|c| ConfigView { id: c.id, name: c.name, category: c.category, current: c.current, options: c.options }).collect())
     }
@@ -286,6 +311,7 @@ impl Hub {
         let cell = self.live.lock().await.get(agent).cloned();
         match cell.as_ref().and_then(|c| c.get()) {
             Some(Runtime::Acp(a)) => a.set_config(id, value).await.map_err(|e| e.to_string()),
+            Some(Runtime::Openai(o)) if id == "model" => { *o.model.lock().unwrap_or_else(|p| p.into_inner()) = value.to_owned(); Ok(()) }
             _ => Ok(()),
         }
     }
@@ -295,6 +321,7 @@ impl Hub {
         let cell = self.live.lock().await.get(agent).cloned();
         match cell.as_ref().and_then(|c| c.get()) {
             Some(Runtime::Acp(a)) => a.cancel(context).await.is_ok(),
+            Some(Runtime::Openai(o)) => o.cancel(context),
             _ => false,
         }
     }

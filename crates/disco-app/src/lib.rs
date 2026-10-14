@@ -3,6 +3,7 @@
 #![forbid(unsafe_code)]
 
 mod hub;
+mod openai;
 mod inbox;
 mod mcp;
 mod memory;
@@ -231,7 +232,7 @@ impl Core {
         }
         let row = self.agent(agent)?;
         // Memory goes only to agents running on this Mac, never to a remote one.
-        let first = row.transport == "acp" && self.memory_on(context) && self.primed.lock().unwrap_or_else(|p| p.into_inner()).insert(format!("{agent}|{context}"));
+        let first = row.transport != "a2a" && self.memory_on(context) && self.primed.lock().unwrap_or_else(|p| p.into_inner()).insert(format!("{agent}|{context}"));
         let with_mem;
         let prompt = if first { with_mem = format!("{}{prompt}", self.memory_preamble(agent, context)); with_mem.as_str() } else { prompt };
         // Team members work behind the scenes: no bubbles, only the activity strip
@@ -965,6 +966,9 @@ pub(crate) struct NewAgent {
     worktree: Option<bool>,
     /// Conda environment prefix the agent runs in.
     conda: Option<String>,
+    /// OpenAI-compatible agents: the model id (blank = the first the endpoint lists).
+    #[serde(default)]
+    model: Option<String>,
 }
 
 #[tauri::command]
@@ -986,15 +990,37 @@ impl NewAgent {
     /// A remote A2A agent behind a bearer token (Disco invites).
     pub(crate) fn remote(name: String, url: String, token: String) -> Self {
         Self { template: "a2a".into(), name, url: Some(url), header_name: Some("authorization".into()), header_value: Some(format!("Bearer {token}")),
-            command: None, cwd: None, count: None, worktree: None, conda: None }
+            command: None, cwd: None, count: None, worktree: None, conda: None, model: None }
     }
 }
 
 pub(crate) async fn add_agent_rows(core: &Core, spec: NewAgent) -> CmdResult<Vec<String>> {
-    let NewAgent { template, name, url, header_name, header_value, command, cwd, count, worktree, conda } = spec;
+    let NewAgent { template, name, url, header_name, header_value, command, cwd, count, worktree, conda, model } = spec;
     let name = valid_name(&name)?;
-    let kind = match template.as_str() { "a2a" => "a2a", "command" => "command", _ => "acp" };
+    let kind = match template.as_str() { "a2a" => "a2a", "command" => "command", "openai" => "openai", _ => "acp" };
     let row = match kind {
+        "openai" => {
+            let base = openai::normalize(url.as_deref().unwrap_or(""));
+            if !base.starts_with("http") { return Err("Base URL 需以 http(s) 开头，如 https://openrouter.ai/api/v1".into()); }
+            let key = header_value.map(|k| k.trim().to_owned()).filter(|k| !k.is_empty());
+            let http = openai::client(&core.hub.user_env);
+            let listed = openai::models(&http, &base, key.as_deref()).await;
+            // A wrong key fails here, not on the first message; endpoints without /models still pass.
+            if let Err(e) = &listed && e.contains("API Key") { return Err(e.clone()); }
+            let model = match model.map(|m| m.trim().to_owned()).filter(|m| !m.is_empty()) {
+                Some(m) => m,
+                None => listed.as_ref().ok().and_then(|l| l.first().cloned()).ok_or("填一个模型名，如 deepseek-chat")?,
+            };
+            let credential_ref = match &key {
+                Some(k) => { let account = format!("agent/{name}"); secret_set(&account, k)?; Some(account) }
+                None => None,
+            };
+            let host = base.split("://").nth(1).and_then(|h| h.split('/').next()).unwrap_or(&base).to_owned();
+            let spec = LocalSpec { template: "openai".into(), description: format!("{model} · {host}"), config: [("model".to_owned(), model)].into(), ..Default::default() };
+            let row = AgentRow { id: uuid::Uuid::new_v4().to_string(), name: name.clone(), transport: "openai".into(), endpoint: base, credential_ref, card_json: serde_json::to_string(&spec).ok() };
+            core.db().upsert_agent(&row).map_err(err)?;
+            return Ok(vec![name]);
+        }
         "a2a" => {
             let url = url.filter(|u| u.starts_with("http")).ok_or("URL 需以 http(s) 开头")?;
             let cred = match (header_name.filter(|s| !s.is_empty()), header_value.filter(|s| !s.is_empty())) {

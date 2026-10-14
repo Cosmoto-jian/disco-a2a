@@ -113,7 +113,7 @@ impl Core {
         }
         if total > BUDGET { out.push_str("（记忆较多，以上只是索引；需要细节时用 memory_read 读对应主题。）\n"); }
         out.push_str(&format!("（需要长期记住的事实或偏好，单独一行以「{}」开头写出，Disco 会保存。）\n", crate::MEM_TAG));
-        if self.hub.mcp_port.get().is_some() && self.agent(agent).is_ok_and(|r| r.transport == "acp") {
+        if self.hub.mcp_port.get().is_some() && self.agent(agent).is_ok_and(|r| r.transport != "a2a") {
             out.push_str("（你有 disco 工具：overview 看自己在哪，post 发到群或通知用户，ask 请教其他 agent，ask_user 向用户提问（选择或确认），todo_add/todo_list/todo_done 管待办，doc_read/doc_write 读写群文档，remember 按主题保存长期记忆，memory_read 读记忆。）\n");
         }
         out.push('\n');
