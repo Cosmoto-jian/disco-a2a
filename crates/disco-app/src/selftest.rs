@@ -40,7 +40,7 @@ pub fn spawn(app: AppHandle, mock: String) {
         let c2 = core.clone();
         tauri::async_runtime::spawn(async move {
             loop {
-                for it in c2.inbox.list() {
+                for it in c2.inbox.list().into_iter().filter(|i| i.kind == "permission") {
                     let opt = it.options.iter().find(|o| o.allow).map(|o| o.id.clone());
                     let _ = c2.inbox_answer(&it.id, inbox::Answer { option: opt, text: None }, "selftest").await;
                 }

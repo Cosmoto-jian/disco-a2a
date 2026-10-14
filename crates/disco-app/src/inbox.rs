@@ -148,7 +148,14 @@ impl Core {
     /// Answer an item. `via` names the surface for the record ("Disco" / "Discord").
     /// Returns the line describing the outcome.
     pub(crate) async fn inbox_answer(&self, id: &str, ans: Answer, via: &str) -> Result<String, String> {
-        let Some(e) = lock(&self.inbox.items).remove(id) else { return Err("这一项已经处理过或已失效".into()) };
+        let Some(e) = ({
+            let mut items = lock(&self.inbox.items);
+            // An empty answer to a question leaves it open instead of losing it.
+            let empty = |e: &Entry| e.item.kind == "question" && ans.option.as_ref().is_none_or(|o| !e.item.options.iter().any(|x| x.id == *o))
+                && ans.text.as_deref().is_none_or(|t| t.trim().is_empty());
+            if items.get(id).is_some_and(empty) { return Err("回答不能为空".into()); }
+            items.remove(id)
+        }) else { return Err("这一项已经处理过或已失效".into()) };
         self.inbox_changed();
         let label = ans.option.as_ref().and_then(|o| e.item.options.iter().find(|x| x.id == *o)).map(|o| o.label.clone());
         let line = match e.reply {
