@@ -238,7 +238,7 @@ async function openThread(t) {
       isGroup ? h("div", { id: "members" }) : null,
       a && a.kind === "acp" ? h("div", { id: "cfgs" }) : null,
       !peer ? memorySwitch(t) : null,
-      !peer ? h("button", { class: "btn space-btn", title: "待办和群文档（agent 也能读写）", onclick: () => toggleSpace(t) }, "待办 · 文档", h("span", { class: "count", id: "todo-count" })) : null,
+      !peer ? h("button", { class: "btn space-btn", title: "待办和群文档（agent 也能读写）", onclick: () => toggleSpace(t) }, "待办", h("span", { class: "count", id: "todo-count" })) : null,
       isGroup ? h("button", { class: "btn", title: "让成员分工并行处理一个任务，最后由组长汇总", onclick: () => { const i = $("#input"); if (!i.value.startsWith("/team ")) i.value = `/team ${i.value}`; i.focus(); i.dispatchEvent(new Event("input")); } }, "团队") : null,
       isGroup ? h("button", { class: "btn", onclick: () => groupDialog(g) }, "成员") : null,
       a ? h("button", { class: "icon-btn", title: "更多", onclick: (e) => agentMenu(e.currentTarget, a.name) }, "⋯") : null),

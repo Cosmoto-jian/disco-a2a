@@ -355,7 +355,7 @@ dialog[open]::backdrop { animation:fade .2s var(--ease); }
 }
 
 /* space drawer: to-dos + group doc */
-.space-btn { display:inline-flex; align-items:center; gap:6px; }
+.space-btn { display:inline-flex; align-items:center; gap:6px; white-space:nowrap; flex-shrink:0; }
 .space-btn .count:not(:empty) { min-width:18px; height:18px; padding:0 5px; border-radius:9px; background:var(--acc); color:#fff; font-size:var(--fs); line-height:18px; text-align:center; }
 #space { position:absolute; top:0; right:0; bottom:0; width:340px; background:var(--main); border-left:1px solid var(--line); box-shadow:-8px 0 24px rgba(0,0,0,.06); padding:6px 16px 16px; overflow:auto; display:flex; flex-direction:column; gap:8px; z-index:5; animation:slidein .22s var(--ease); -webkit-user-select:text; user-select:text; }
 @keyframes slidein { from { transform:translateX(24px); opacity:0; } }
