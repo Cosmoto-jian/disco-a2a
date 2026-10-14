@@ -74,6 +74,10 @@ pub struct Hub {
     /// MCP token -> agent name. Each ACP agent gets its own token, so a tool call
     /// can only ever act as the agent it was handed to.
     pub mcp_tokens: std::sync::Mutex<HashMap<String, String>>,
+    /// Agent -> the conversation of its latest turn. Agents that can't take MCP servers
+    /// per session (pi reads them from its own mcp.json) call Disco without a session
+    /// key; their tools act where the agent was last asked something.
+    pub last_context: std::sync::Mutex<HashMap<String, String>>,
 }
 
 pub const MAX_CONCURRENT: usize = 8;
@@ -83,7 +87,7 @@ pub type CredLookup = dyn Fn(&str) -> Option<String> + Send + Sync;
 impl Hub {
     pub fn new() -> Self {
         let (user_path, user_env) = login_env();
-        Self { live: Mutex::default(), slots: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT)), user_path, user_env, launches: Default::default(), mcp_port: Default::default(), mcp_tokens: Default::default() }
+        Self { live: Mutex::default(), slots: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT)), user_path, user_env, launches: Default::default(), mcp_port: Default::default(), mcp_tokens: Default::default(), last_context: Default::default() }
     }
 
     async fn runtime(&self, row: &AgentRow, secret: &CredLookup) -> Result<Runtime, String> {
@@ -188,6 +192,11 @@ impl Hub {
                     a.extend(args);
                     (PathBuf::from("powershell"), a)
                 } else { (command, args) };
+                let mcp = self.mcp_for(&row.name);
+                // The port and token also go in the agent's own environment, for agents that
+                // load MCP servers from their config instead of from ACP (pi).
+                if let Some(m) = &mcp { env.extend(m.env.iter().cloned()); }
+                if spec.template == "pi" && let Some(m) = &mcp { register_pi_mcp(&env, &m.command); }
                 let launch = Launch {
                     command: command.to_string_lossy().into_owned(),
                     args,
@@ -195,7 +204,7 @@ impl Hub {
                     cwd,
                     prompt_timeout: Duration::from_secs(15 * 60),
                     config: spec.config.into_iter().collect(),
-                    mcp: self.mcp_for(&row.name),
+                    mcp,
                 };
                 self.launches.lock().unwrap_or_else(|p| p.into_inner()).insert(row.name.clone(), launch.clone());
                 Runtime::Acp(Arc::new(AcpAgent::spawn(launch).await.map_err(|e| e.to_string())?))
@@ -252,6 +261,7 @@ impl Hub {
                 out.unwrap_or(Ok(()))
             }
             Runtime::Acp(a) => {
+                self.last_context.lock().unwrap_or_else(|p| p.into_inner()).insert(row.name.clone(), context.to_owned());
                 let mut rx = a.prompt(context, text).await.map_err(|e| e.to_string())?;
                 let mut out = None;
                 while let Some(ev) = rx.recv().await {
@@ -481,6 +491,29 @@ fn login_path(from_shell: String) -> String {
     join_path(std::iter::once(from_shell).chain(["/opt/homebrew/bin".into(), "/usr/local/bin".into()]).chain(extra).chain(std::iter::once(base)))
 }
 
+/// pi's ACP adapter ignores the MCP servers Disco hands each session; pi itself reads
+/// them from `<agent dir>/mcp.json`. Add (or repoint) a `disco` entry there once. It
+/// inherits DISCO_MCP_PORT/TOKEN from the environment, so it only does anything when pi
+/// runs inside Disco; in a plain terminal it answers with no tools.
+fn register_pi_mcp(env: &[(String, String)], exe: &std::path::Path) {
+    let dir = env.iter().rev().find(|(k, _)| k == "PI_CODING_AGENT_DIR").map(|(_, v)| PathBuf::from(v))
+        .or_else(|| std::env::var_os("PI_CODING_AGENT_DIR").map(PathBuf::from))
+        .unwrap_or_else(|| dirs_home().join(".pi").join("agent"));
+    let file = dir.join("mcp.json");
+    let mut doc: serde_json::Value = match std::fs::read_to_string(&file) {
+        Ok(text) => match serde_json::from_str(&text) { Ok(v) => v, Err(_) => return }, // never clobber a file we can't read
+        Err(_) => serde_json::json!({}),
+    };
+    let want = serde_json::json!({ "command": exe.to_string_lossy(), "args": ["--mcp"], "exposure": "direct" });
+    let Some(root) = doc.as_object_mut() else { return };
+    let servers = root.entry("mcpServers").or_insert_with(|| serde_json::json!({}));
+    let Some(servers) = servers.as_object_mut() else { return };
+    if servers.get("disco") == Some(&want) { return; }
+    servers.insert("disco".into(), want);
+    let _ = std::fs::create_dir_all(&dir);
+    if let Ok(text) = serde_json::to_string_pretty(&doc) { let _ = std::fs::write(&file, text + "\n"); }
+}
+
 /// The user's own `claude` / `codex` on `path` (not an ACP adapter of the same name).
 fn own_cli(name: &str, path: &str) -> Option<PathBuf> {
     // Windows: only a real .exe; node can't spawn npm's .cmd shims without a shell.
@@ -584,6 +617,24 @@ mod env_tests {
         let (path, vars) = super::login_env();
         assert!(!path.is_empty() && t.elapsed().as_secs() < 6, "{:?}", t.elapsed());
         assert!(vars.iter().all(|(k, _)| k != "PATH" && k != "PWD"));
+    }
+
+    #[test]
+    fn pi_mcp_entry_merges() {
+        let d = std::env::temp_dir().join(format!("disco-pi-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join("mcp.json"), r#"{"mcpServers":{"mine":{"command":"x"}},"other":1}"#).unwrap();
+        let env = vec![("PI_CODING_AGENT_DIR".to_owned(), d.to_string_lossy().into_owned())];
+        super::register_pi_mcp(&env, std::path::Path::new("/Apps/Disco"));
+        let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(d.join("mcp.json")).unwrap()).unwrap();
+        assert_eq!(v["mcpServers"]["mine"]["command"], "x");
+        assert_eq!(v["other"], 1);
+        assert_eq!(v["mcpServers"]["disco"]["command"], "/Apps/Disco");
+        assert_eq!(v["mcpServers"]["disco"]["args"][0], "--mcp");
+        std::fs::write(d.join("mcp.json"), "{ broken").unwrap();
+        super::register_pi_mcp(&env, std::path::Path::new("/Apps/Disco"));
+        assert_eq!(std::fs::read_to_string(d.join("mcp.json")).unwrap(), "{ broken", "never clobber an unreadable config");
     }
 
     #[test]

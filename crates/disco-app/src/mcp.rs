@@ -32,6 +32,8 @@ pub fn stdio_proxy() {
     let port: u16 = std::env::var("DISCO_MCP_PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(0);
     let token = std::env::var("DISCO_MCP_TOKEN").unwrap_or_default();
     let context = std::env::var("DISCO_CONTEXT").unwrap_or_default();
+    // Started outside Disco (e.g. pi in a terminal reading its mcp.json): no tools, no noise.
+    let offline = port == 0;
     let out = Arc::new(std::sync::Mutex::new(std::io::stdout()));
     let mut jobs = Vec::new();
     for line in std::io::stdin().lock().lines() {
@@ -39,7 +41,7 @@ pub fn stdio_proxy() {
         if line.trim().is_empty() { continue; }
         let (out, token, context) = (out.clone(), token.clone(), context.clone());
         jobs.push(std::thread::spawn(move || {
-            let reply = match forward(port, &token, &context, &line) {
+            let reply = match if offline { Ok(offline_reply(&line)) } else { forward(port, &token, &context, &line) } {
                 Ok(body) => body,
                 Err(e) => match serde_json::from_str::<Value>(&line).ok().and_then(|v| v.get("id").cloned()) {
                     Some(id) => json!({"jsonrpc": "2.0", "id": id, "error": {"code": -32000, "message": format!("Disco 没有响应：{e}")}}).to_string(),
@@ -55,6 +57,22 @@ pub fn stdio_proxy() {
         jobs.retain(|j| !j.is_finished());
     }
     for j in jobs { let _ = j.join(); }
+}
+
+/// Answers when Disco isn't running: an empty server, so the host just shows no tools.
+fn offline_reply(line: &str) -> String {
+    let Ok(msg) = serde_json::from_str::<Value>(line) else { return String::new() };
+    let Some(id) = msg.get("id").cloned() else { return String::new() };
+    let result = match msg.get("method").and_then(Value::as_str).unwrap_or("") {
+        "initialize" => json!({
+            "protocolVersion": msg.pointer("/params/protocolVersion").and_then(Value::as_str).unwrap_or("2025-06-18"),
+            "capabilities": { "tools": {} },
+            "serverInfo": { "name": "disco", "version": env!("CARGO_PKG_VERSION") },
+        }),
+        "tools/list" => json!({ "tools": [] }),
+        _ => json!({}),
+    };
+    json!({ "jsonrpc": "2.0", "id": id, "result": result }).to_string()
 }
 
 fn forward(port: u16, token: &str, context: &str, line: &str) -> std::io::Result<String> {
@@ -91,7 +109,10 @@ async fn handle(State(core): State<Arc<Core>>, headers: HeaderMap, body: String)
     let token = headers.get("authorization").and_then(|v| v.to_str().ok()).and_then(|v| v.strip_prefix("Bearer ")).unwrap_or("");
     let agent = core.hub.mcp_tokens.lock().unwrap_or_else(|p| p.into_inner()).get(token).cloned();
     let Some(agent) = agent else { return StatusCode::UNAUTHORIZED.into_response() };
-    let Ok(Envelope { context, msg }) = serde_json::from_str(&body) else { return StatusCode::BAD_REQUEST.into_response() };
+    let Ok(Envelope { mut context, msg }) = serde_json::from_str(&body) else { return StatusCode::BAD_REQUEST.into_response() };
+    if context.is_empty() {
+        context = core.hub.last_context.lock().unwrap_or_else(|p| p.into_inner()).get(&agent).cloned().unwrap_or_else(|| format!("dm:{agent}"));
+    }
     // Notifications (no id) need no answer.
     let Some(id) = msg.get("id").cloned() else { return StatusCode::ACCEPTED.into_response() };
     let params = msg.get("params").cloned().unwrap_or(Value::Null);
@@ -462,5 +483,16 @@ impl EmitSpace for tauri::AppHandle {
     fn emit_space(&self, thread: &str) -> tauri::Result<()> {
         use tauri::Emitter;
         self.emit("space", thread)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn offline_is_an_empty_server() {
+        let init = super::offline_reply(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26"}}"#);
+        assert!(init.contains("\"protocolVersion\":\"2025-03-26\""));
+        assert!(super::offline_reply(r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#).contains("\"tools\":[]"));
+        assert!(super::offline_reply(r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#).is_empty());
     }
 }
