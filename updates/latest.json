@@ -1,19 +1,19 @@
 {
-  "version": "1.5.0",
-  "notes": "Claude Code / Codex / Hermes 启动修复：继承终端环境、登录卡片、兼容旧版模型接口、显示真实错误",
-  "pub_date": "2026-10-14T04:39:13Z",
+  "version": "1.5.1",
+  "notes": "Claude Code / Codex 直接使用终端里的 claude / codex，登录、配置、模型与终端一致",
+  "pub_date": "2026-10-14T05:13:57Z",
   "platforms": {
     "darwin-aarch64": {
-      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVUcDdocWFJV0FyVjFCdUlnSlJFckhxMlZPWjNQUXVRMDIveGJxSm92UVI3MWhFQ3FqVmVWZ0p5cVM5ckhSRWJSQzZBdUEzMEg5T0ZKbTVaRHJZV1M2bUJzTklqYU5jMndnPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkxOTUyNzUyCWZpbGU6RGlzY29fMS41LjBfdW5pdmVyc2FsLmFwcC50YXIuZ3oKV1BKU0hSSER1YjBlaWRMb1lpTms3cGh5SXA3dDBzVHZtanZ3SEN1VUlRZmJ4cTlpeml0RXpNZUpmVTJVa1kzM2J0U0c3dDFCcEZPRlVYeGwwS2NpQmc9PQo=",
-      "url": "https://github.com/Cosmoto-jian/disco-a2a/releases/download/v1.5.0/Disco_1.5.0_universal.app.tar.gz"
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVUcDdocWFJV0FyVjVpdGhOWi8vdVc0M3lVMnpsNitpQVBPUEh5L1FZbVNDOUNydWVBa28yK055SHRuaCtWeUs3eTEyS2MxdDRiblY5SEU0T285VFR3QXdnR2lsMytTbkE4PQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkxOTU0ODM2CWZpbGU6RGlzY29fMS41LjFfdW5pdmVyc2FsLmFwcC50YXIuZ3oKRDhoUkxjWnNkR0FtUDZ5dGFCMTVwNzJCZUtQT0V3TWI3REgxaTVaSkpUbE1iOWtGVWJGNkh5S2xTMk5LQjNVY0dlZm04OGNmOWVKVmgvRC85MDFUQ1E9PQo=",
+      "url": "https://github.com/Cosmoto-jian/disco-a2a/releases/download/v1.5.1/Disco_1.5.1_universal.app.tar.gz"
     },
     "darwin-x86_64": {
-      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVUcDdocWFJV0FyVjFCdUlnSlJFckhxMlZPWjNQUXVRMDIveGJxSm92UVI3MWhFQ3FqVmVWZ0p5cVM5ckhSRWJSQzZBdUEzMEg5T0ZKbTVaRHJZV1M2bUJzTklqYU5jMndnPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkxOTUyNzUyCWZpbGU6RGlzY29fMS41LjBfdW5pdmVyc2FsLmFwcC50YXIuZ3oKV1BKU0hSSER1YjBlaWRMb1lpTms3cGh5SXA3dDBzVHZtanZ3SEN1VUlRZmJ4cTlpeml0RXpNZUpmVTJVa1kzM2J0U0c3dDFCcEZPRlVYeGwwS2NpQmc9PQo=",
-      "url": "https://github.com/Cosmoto-jian/disco-a2a/releases/download/v1.5.0/Disco_1.5.0_universal.app.tar.gz"
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVUcDdocWFJV0FyVjVpdGhOWi8vdVc0M3lVMnpsNitpQVBPUEh5L1FZbVNDOUNydWVBa28yK055SHRuaCtWeUs3eTEyS2MxdDRiblY5SEU0T285VFR3QXdnR2lsMytTbkE4PQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkxOTU0ODM2CWZpbGU6RGlzY29fMS41LjFfdW5pdmVyc2FsLmFwcC50YXIuZ3oKRDhoUkxjWnNkR0FtUDZ5dGFCMTVwNzJCZUtQT0V3TWI3REgxaTVaSkpUbE1iOWtGVWJGNkh5S2xTMk5LQjNVY0dlZm04OGNmOWVKVmgvRC85MDFUQ1E9PQo=",
+      "url": "https://github.com/Cosmoto-jian/disco-a2a/releases/download/v1.5.1/Disco_1.5.1_universal.app.tar.gz"
     },
     "windows-x86_64": {
-      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVUcDdocWFJV0FyVnpld0hTWWE0bGhiZldvR09pQVBlOWxwbnZGeUlEZ0tQUy9vSGpKcEZCR3ZlQ05WU0JyZGhCUGQra3hubElnWjZvODlOL0M1VU9RbGhRRkltQXhmUmdrPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkxOTUyNzUzCWZpbGU6RGlzY29fMS41LjBfeDY0LXNldHVwLmV4ZQpHUXpQOXBOR216ZEtJU2pLWDc3bmJDaE5Cb09qcVJ1VDBtckZabG9DL2NwT0w5V3NlNHBSY0ZtcVBFRWRld0ZMd1BjakgyUTRCbUhxaUFPNms3ejBCQT09Cg==",
-      "url": "https://github.com/Cosmoto-jian/disco-a2a/releases/download/v1.5.0/Disco_1.5.0_x64-setup.exe"
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVUcDdocWFJV0FyVitCN0tHMWJzaWZ4QTJjbmp2Mjdvc28zblZ3cjBHL2lIK3hjNWJnUVpFYnBXVHUrMWgrajJSUEZCcE1TQTJFWURpUUM0SDRFeSsrMVpDNTdWbFBiVnc4PQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkxOTU0ODM3CWZpbGU6RGlzY29fMS41LjFfeDY0LXNldHVwLmV4ZQpLMUQ0MUpaUkFsTDJIckJsOXR2cU52SUlxSGh2UWtpVVJ5QmxwaVhSWkpVYkNKOGlmTnZ0Y1ZpbHU2REVrNUovTC93Z0dPUXdBYzFCVTJZUzh1ODdDQT09Cg==",
+      "url": "https://github.com/Cosmoto-jian/disco-a2a/releases/download/v1.5.1/Disco_1.5.1_x64-setup.exe"
     }
   }
 }
