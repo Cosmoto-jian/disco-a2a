@@ -1,19 +1,19 @@
 {
-  "version": "1.5.3",
-  "notes": "首页换成机器人图标和小动画",
-  "pub_date": "2026-10-14T06:07:01Z",
+  "version": "1.5.4",
+  "notes": "pi 也能用 Disco 工具",
+  "pub_date": "2026-10-14T12:08:09Z",
   "platforms": {
     "darwin-aarch64": {
-      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVUcDdocWFJV0FyVjJMYWlRYVJRbSsrMWFBam0wVXlSYlJsQnBTb3Q2dEd2TWtvdW95alhvaUZoWlByUWRwUDlRUlc3Y2Fqejgxa3A5L3BkZEV3SUQ3eHJ0R0hKY2tUa1FzPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkxOTU4MDIwCWZpbGU6RGlzY29fMS41LjNfdW5pdmVyc2FsLmFwcC50YXIuZ3oKTlphSnlXd0RVeG1JbDlpakVzeEJxb2VWcmkxOE1yZUtVVGVPWUtSbXFWRkVLUC9RWUttdnAyd0lZaXZrNC82YVd2bHZvOGU2OFcvdmxGaHVERnVoRGc9PQo=",
-      "url": "https://github.com/Cosmoto-jian/disco-a2a/releases/download/v1.5.3/Disco_1.5.3_universal.app.tar.gz"
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVUcDdocWFJV0FyVnlVR2RjZUVDeUxIamtSUFJGQVZSRWI2SkwwM2taZkpNMk9ieWxObDRmTlJGM000TVk2b1RWeTcraDFoVWkyT2ZKUnhJS0RSTmxiZ2kvVzlPelAzeFFjPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkxOTc5Njc1CWZpbGU6RGlzY29fMS41LjRfdW5pdmVyc2FsLmFwcC50YXIuZ3oKMTJqQW01TTVrWXNzc1pTc0ZkM3ZLTytDd00ydmFPV0ltdzlmYlZSN25Vejg0czAwMUpnZlA0QUgwRktiUzdjSkV4QWV4V0pteFRZN2hKNDU5Mk1BQkE9PQo=",
+      "url": "https://github.com/Cosmoto-jian/disco-a2a/releases/download/v1.5.4/Disco_1.5.4_universal.app.tar.gz"
     },
     "darwin-x86_64": {
-      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVUcDdocWFJV0FyVjJMYWlRYVJRbSsrMWFBam0wVXlSYlJsQnBTb3Q2dEd2TWtvdW95alhvaUZoWlByUWRwUDlRUlc3Y2Fqejgxa3A5L3BkZEV3SUQ3eHJ0R0hKY2tUa1FzPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkxOTU4MDIwCWZpbGU6RGlzY29fMS41LjNfdW5pdmVyc2FsLmFwcC50YXIuZ3oKTlphSnlXd0RVeG1JbDlpakVzeEJxb2VWcmkxOE1yZUtVVGVPWUtSbXFWRkVLUC9RWUttdnAyd0lZaXZrNC82YVd2bHZvOGU2OFcvdmxGaHVERnVoRGc9PQo=",
-      "url": "https://github.com/Cosmoto-jian/disco-a2a/releases/download/v1.5.3/Disco_1.5.3_universal.app.tar.gz"
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVUcDdocWFJV0FyVnlVR2RjZUVDeUxIamtSUFJGQVZSRWI2SkwwM2taZkpNMk9ieWxObDRmTlJGM000TVk2b1RWeTcraDFoVWkyT2ZKUnhJS0RSTmxiZ2kvVzlPelAzeFFjPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkxOTc5Njc1CWZpbGU6RGlzY29fMS41LjRfdW5pdmVyc2FsLmFwcC50YXIuZ3oKMTJqQW01TTVrWXNzc1pTc0ZkM3ZLTytDd00ydmFPV0ltdzlmYlZSN25Vejg0czAwMUpnZlA0QUgwRktiUzdjSkV4QWV4V0pteFRZN2hKNDU5Mk1BQkE9PQo=",
+      "url": "https://github.com/Cosmoto-jian/disco-a2a/releases/download/v1.5.4/Disco_1.5.4_universal.app.tar.gz"
     },
     "windows-x86_64": {
-      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVUcDdocWFJV0FyVisxZnB1QmJjTU44V0Z3a3dKWTVmQndKVU9KemJsd2FVZXBaRGcyQTZJdFhheVFGcXhnamUreHNoRC9zWlMvanNDbEx0RDB4MUZPMW9TUStXTzRwSlFzPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkxOTU4MDIxCWZpbGU6RGlzY29fMS41LjNfeDY0LXNldHVwLmV4ZQpuU2NDTDdnZDBIZytma2t4TDIvbURKMUZQVzNpZWRrMDN5ZS8rL3FqeEtjdTUwZFk3d2tnN2p5ZFFwWEF6YlpjZG9rY2t0Ty9vYnRkOWk3eFhKdzJDZz09Cg==",
-      "url": "https://github.com/Cosmoto-jian/disco-a2a/releases/download/v1.5.3/Disco_1.5.3_x64-setup.exe"
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVUcDdocWFJV0FyVjNqVys3dFBSbERrREJLc0tFM0UzRU10RjkycjNMM3VIeTdYbURzZCtJR3YxWE1MN2did3ZDR2c3Y2tscFY5cXdncWJMNzAwaEVZc1FFUTVKM2NPYlFzPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkxOTc5Njc2CWZpbGU6RGlzY29fMS41LjRfeDY0LXNldHVwLmV4ZQpwdlFjcG5jRG5TV2hYSHcxMkZBK2JwZkg4VldtRnEyTStLQWlRUXYxUEFUM1U3UUhqcWZ1Z3FrZ20yV1BxRUx2Tk9VdHpSMlBtd3dwcVRJdjlGZHlCUT09Cg==",
+      "url": "https://github.com/Cosmoto-jian/disco-a2a/releases/download/v1.5.4/Disco_1.5.4_x64-setup.exe"
     }
   }
 }

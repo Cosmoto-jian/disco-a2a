@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import datetime
 """Publish an auto-update: sign the CI-built macOS .app.tar.gz and Windows NSIS
 installer, and write updates/latest.json.
 
@@ -45,7 +46,7 @@ def main():
         "version": ver,
         "notes": notes,
         # RFC 3339, which the Tauri updater requires.
-        "pub_date": subprocess.run(["date", "-u", "+%Y-%m-%dT%H:%M:%SZ"], capture_output=True, text=True).stdout.strip(),
+        "pub_date": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "platforms": {"darwin-aarch64": signed["mac"], "darwin-x86_64": signed["mac"], "windows-x86_64": signed["win"]},
     }
     os.makedirs(os.path.join(ROOT, "updates"), exist_ok=True)
