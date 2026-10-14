@@ -1137,7 +1137,7 @@ const MOD = IS_WIN ? "Ctrl+" : "⌘";
 function blank() {
   S.thread = null;
   const none = !S.ov?.agents.length;
-  const box = h("div", { class: "blank" }, h("div", { class: "logo" }, "D"), h("b", {}, "Disco"),
+  const box = h("div", { class: "blank" }, h("div", { class: "logo" }, h("img", { src: "logo.png", alt: "" }), h("i"), h("i"), h("i")), h("b", {}, "Disco"),
     none ? h("p", {}, "正在找这台电脑上的 agent…") : h("p", {}, "选一个会话开始"),
     none ? null : h("div", { class: "keys" },
       h("span", {}, h("kbd", {}, `${MOD}K`), " 搜索"), h("span", {}, h("kbd", {}, `${MOD}1–5`), " 切换"), h("span", {}, h("kbd", {}, `${MOD}N`), " 新建")));
