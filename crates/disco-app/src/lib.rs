@@ -810,7 +810,7 @@ struct GroupView { id: String, name: String, guild_id: String, lead: Option<Stri
 #[derive(Serialize)]
 struct Head { thread: String, author: String, body: String, ts: i64 }
 #[derive(Serialize)]
-struct PeerView { thread: String, guest: String, agent: String }
+struct PeerView { thread: String, guest: String, agent: String, talk: bool }
 #[derive(Serialize)]
 struct Overview {
     peers: Vec<PeerView>,
@@ -843,7 +843,7 @@ async fn overview(core: St<'_>) -> CmdResult<Overview> {
         let avatar = core.db().setting(&format!("{SET_AVATAR}{}", a.name)).unwrap_or_default();
         agents.push(AgentView { live: core.hub.is_live(&a.name).await, name: a.name, kind: a.transport, template, detail, avatar });
     }
-    let peers = core.shares().into_iter().map(|(id, s)| PeerView { thread: format!("peer:{id}"), guest: s.guest, agent: s.agent }).collect();
+    let peers = core.shares().into_iter().map(|(id, s)| PeerView { talk: core.peer_channel(&id).is_some(), thread: format!("peer:{id}"), guest: s.guest, agent: s.agent }).collect();
     // Read every setting first, one lock at a time: a `core.db()` temporary inside the
     // struct literal below would stay locked to the end of the statement, and any later
     // `db()` in it (roster, the switches) would then deadlock the whole app.
@@ -1138,6 +1138,9 @@ fn send(core: St<'_>, thread: String, text: String) -> CmdResult<()> {
     } else if let Some(ch) = thread.strip_prefix("group:") {
         let ch = ch.to_owned();
         tauri::async_runtime::spawn(async move { core.group(ch, "me".into(), text, false).await });
+    } else if let Some(id) = thread.strip_prefix("peer:") {
+        let id = id.to_owned();
+        tauri::async_runtime::spawn(async move { let _ = core.peer_say(&id, &text).await; });
     } else {
         return Err("未知会话".into());
     }

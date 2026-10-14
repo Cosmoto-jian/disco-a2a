@@ -169,6 +169,11 @@ pub fn spawn(app: AppHandle, mock: String) {
         let _ = check!("stop_all", within(10, crate::stop_all(st())).await.and_then(|r| r).map(|n| format!("{n}")));
         crate::resume(st());
         let _ = check!("恢复后私聊", { let n = count(&core, "dm:m1", "m1"); crate::send(st(), "dm:m1".into(), "回来了".into())?; wait_msg(&core, "dm:m1", "m1", n, 30).await });
+        let _ = check!("对方群可回话", {
+            let pc = |ctx: &str| { let _ = core.db().set_setting(&format!("{}st", crate::share::PEER_CTX), ctx); core.peer_channel("st") };
+            if pc("group:1234567890").as_deref() != Some("1234567890") { return Err("认不出 Discord 群".into()); }
+            if pc("group:local-x").is_some() || pc("dm:x").is_some() { return Err("本地群/私聊不该能回话".into()); }
+            Ok(String::new()) });
         let bad = crate::NewAgent { command: Some("/nonexistent/agent --acp".into()), ..spec("bad") };
         let _ = check!("自检提示", { within(10, crate::add_agent(st(), bad)).await??; wait_msg(&core, "dm:bad", "system", 0, 10).await });
         let _ = check!("remove_agent", within(10, crate::remove_agent(st(), "bad".into(), Some(true))).await.and_then(|r| r).map(|_| String::new()));

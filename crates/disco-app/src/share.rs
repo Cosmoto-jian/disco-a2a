@@ -144,6 +144,8 @@ impl Core {
         }
         let _ = self.db().set_setting(&format!("share_used/{id}/{}", today()), &(used + 1).to_string());
         let thread = format!("peer:{id}");
+        // Where the guest last used the agent; a Discord-synced group there lets the owner talk back.
+        let _ = self.db().set_setting(&format!("{PEER_CTX}{id}"), guest_ctx);
         self.post_message(&thread, &share.guest, text);
         let context = format!("peer:{id}|{guest_ctx}");
         let deny = share.mode != "ask";
@@ -170,6 +172,29 @@ impl Core {
             Err(e) => self.post_message(&thread, "system", &crate::fail_line(&share.agent, e)),
         }
         res
+    }
+}
+
+pub(crate) const PEER_CTX: &str = "peer_ctx/";
+
+impl Core {
+    /// The Discord channel of the guest's group the shared agent was last used in, if any.
+    pub(crate) fn peer_channel(&self, id: &str) -> Option<String> {
+        let ctx = self.db().setting(&format!("{PEER_CTX}{id}"))?;
+        let ch = ctx.strip_prefix("group:")?;
+        (!ch.is_empty() && ch.bytes().all(|b| b.is_ascii_digit())).then(|| ch.to_owned())
+    }
+
+    /// The owner speaks in the guest's group: post to its Discord channel as the owner,
+    /// exactly like typing there. The guest's Disco routes it (and any @mentions) as usual.
+    pub(crate) async fn peer_say(&self, id: &str, text: &str) -> Result<(), String> {
+        let ch = self.peer_channel(id).ok_or("对方最近不是在 Discord 同步的群里用你的 agent，没有可以回话的群")?;
+        let d = self.discord_rest().ok_or("先在设置里连上 Discord，才能在对方的群里说话")?;
+        let thread = format!("peer:{id}");
+        self.post_message(&thread, "me", text);
+        let r = d.post(&ch, &format!("**{}**：{}", owner_name(), self.with_pings(text))).await;
+        if let Err(e) = &r { self.post_message(&thread, "system", &format!("Discord 发送失败：{e}（你的 Bot 需要在对方的 Discord 服务器里）")); }
+        r
     }
 }
 
