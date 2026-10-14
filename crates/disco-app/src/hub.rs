@@ -414,6 +414,9 @@ fn login_path() -> String {
 /// locations to PATH as a fallback.
 #[cfg(not(windows))]
 fn login_env() -> (String, Vec<(String, String)>) {
+    // Started from a terminal: the environment is already the user's, and an interactive
+    // shell would grab that terminal (and stop Disco when it next writes to it).
+    if std::fs::File::open("/dev/tty").is_ok() { return (login_path(String::new()), Vec::new()); }
     const MARK: &str = "__DISCO_ENV__";
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".into());
     use std::os::unix::process::CommandExt;
