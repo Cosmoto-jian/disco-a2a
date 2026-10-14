@@ -144,8 +144,11 @@ impl Core {
         }
         let _ = self.db().set_setting(&format!("share_used/{id}/{}", today()), &(used + 1).to_string());
         let thread = format!("peer:{id}");
-        // Where the guest last used the agent; a Discord-synced group there lets the owner talk back.
-        let _ = self.db().set_setting(&format!("{PEER_CTX}{id}"), guest_ctx);
+        // The guest's Discord-synced group the agent was last used in lets the owner talk back.
+        // Only a group is remembered: a later DM or delegated `ask:` turn must not erase it.
+        if discord_group(guest_ctx).is_some() {
+            let _ = self.db().set_setting(&format!("{PEER_CTX}{id}"), guest_ctx);
+        }
         self.post_message(&thread, &share.guest, text);
         let context = format!("peer:{id}|{guest_ctx}");
         let deny = share.mode != "ask";
@@ -182,9 +185,7 @@ const PEER_OK: &str = "peer_ok/";
 impl Core {
     /// The Discord channel of the guest's group the shared agent was last used in, if any.
     pub(crate) fn peer_channel(&self, id: &str) -> Option<String> {
-        let ctx = self.db().setting(&format!("{PEER_CTX}{id}"))?;
-        let ch = ctx.strip_prefix("group:")?;
-        (!ch.is_empty() && ch.bytes().all(|b| b.is_ascii_digit())).then(|| ch.to_owned())
+        discord_group(&self.db().setting(&format!("{PEER_CTX}{id}"))?).map(str::to_owned)
     }
 
     /// What still keeps the owner from talking in the guest's group ("" = nothing).
@@ -197,8 +198,11 @@ impl Core {
     /// server of the guest's group: only then does the spectator view turn into a chat.
     pub(crate) async fn peer_check(&self, id: &str) -> Option<String> {
         let ch = self.peer_channel(id)?;
-        let owners = self.owners.lock().unwrap_or_else(|p| p.into_inner()).clone();
-        let missing = match self.discord_rest() {
+        let mut owners = self.owners.lock().unwrap_or_else(|p| p.into_inner()).clone();
+        let rest = self.discord_rest();
+        // Owners are learned when the gateway connects; ask Discord if that has not happened yet.
+        if owners.is_empty() && let Some(d) = &rest { owners = d.owner_ids().await.unwrap_or_default(); }
+        let missing = match rest {
             None => "先在设置里连上 Discord，才能加入对方的群聊".to_owned(),
             Some(d) => match d.channel_guild(&ch).await {
                 Err(_) => "你的 Bot 还不在对方的服务器里：把设置里的「邀请 Bot」链接发给对方，请他授权".into(),
@@ -228,6 +232,12 @@ impl Core {
         if let Err(e) = &r { self.post_message(&thread, "system", &format!("Discord 发送失败：{e}（你的 Bot 需要在对方的 Discord 服务器里）")); }
         r
     }
+}
+
+/// The Discord channel id in an A2A context `group:<channel>` (local groups have none).
+fn discord_group(ctx: &str) -> Option<&str> {
+    let ch = ctx.strip_prefix("group:")?;
+    (!ch.is_empty() && ch.bytes().all(|b| b.is_ascii_digit())).then_some(ch)
 }
 
 fn eq_ct(a: &[u8], b: &[u8]) -> bool {

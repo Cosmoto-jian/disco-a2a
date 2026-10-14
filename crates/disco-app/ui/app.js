@@ -261,7 +261,7 @@ async function openThread(t) {
       isGroup ? h("button", { class: "btn", onclick: () => groupDialog(g) }, "成员") : null,
       a ? h("button", { class: "icon-btn", title: "更多", onclick: (e) => agentMenu(e.currentTarget, a.name) }, "⋯") : null),
     h("div", { id: "log" }),
-    peer && !peer.talk ? h("div", { class: "peer-note" }, peer.group ? `对方在同步到 Discord 的群里用你的 agent。${peer.missing}` : "这是对方的私聊，你只能旁观。想一起聊，请对方建一个同步到 Discord 的群，把你和你的 Bot 拉进去。") : h("div", { id: "composer" },
+    peer && !peer.talk ? h("div", { class: "peer-note" }, peer.group ? `对方在同步到 Discord 的群里用你的 agent。${peer.missing}` : "你现在只能旁观。想一起聊：对方建一个同步到 Discord 的群，拉你和你的 Bot 进去，再在群里 @ 一次你的 agent，这里就会变成聊天。") : h("div", { id: "composer" },
       peer ? null : h("button", { class: "attach", type: "button", title: "放一个文件到共享空间，agent 都能读到", onclick: () => attachFile(t) },
         Object.assign(h("span"), { innerHTML: '<svg viewBox="0 0 24 24"><path d="M20.5 11.5 12.4 19.6a5 5 0 0 1-7.1-7.1l8.5-8.5a3.3 3.3 0 0 1 4.7 4.7l-8.5 8.5a1.7 1.7 0 0 1-2.4-2.4l7.8-7.8"/></svg>' })),
       h("textarea", { id: "input", rows: 1, placeholder: peer ? `在 ${peer.guest} 的群里说话（经 Discord 同步）` : isGroup ? "@名字 叫 agent 回答，@all 一起回答，/help 看群规" : `给 ${name} 发消息，/ 看它的命令` }),
