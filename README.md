@@ -106,3 +106,7 @@ cargo test --workspace
 ```
 
 正式安装包由 GitHub Actions 打包：macOS universal `.dmg`（`macos-app.yml`），Windows x64 安装程序（`windows-app.yml`）。
+
+## 致谢
+
+添加 Agent 页里的官方图标来自 [LobeHub Icons](https://github.com/lobehub/lobe-icons)（MIT）。各图标商标归其所有者。

@@ -8,11 +8,13 @@
 <body>
 <nav id="rail">
   <div class="drag" data-tauri-drag-region></div>
+  <button id="expand" class="tab" title="展开列表（⌘\）"><svg viewBox="0 0 24 24"><path d="m10 7 5 5-5 5M4 4v16"/></svg><small>列表</small></button>
   <button class="tab on" data-tab="chats" title="聊天"><svg viewBox="0 0 24 24"><path d="M4 5h16v11H8l-4 4z"/></svg><small>聊天</small></button>
   <button class="tab" data-tab="groups" title="群聊"><svg viewBox="0 0 24 24"><circle cx="9" cy="8" r="3.2"/><circle cx="17" cy="9" r="2.6"/><path d="M3 19c0-3.3 2.7-5.5 6-5.5s6 2.2 6 5.5M15 14.2c3 0 6 1.6 6 4.8"/></svg><small>群聊</small></button>
   <button class="tab" data-tab="agents" title="Agent"><svg viewBox="0 0 24 24"><rect x="5" y="8" width="14" height="11" rx="3"/><path d="M12 4v4M9 13h.01M15 13h.01M3 13v2M21 13v2"/></svg><small>Agent</small></button>
-  <button class="tab" data-tab="inbox" title="待处理：权限请求和 agent 的提问"><svg viewBox="0 0 24 24"><path d="M4 13l2.5-7h11L20 13v6H4z"/><path d="M4 13h4.5l1 2h5l1-2H20"/></svg><small>待处理</small><i id="inbox-badge" class="badge"></i></button>
   <span class="grow"></span>
+  <span class="rail-sep"></span>
+  <button class="tab" data-tab="inbox" title="待处理：权限请求和 agent 的提问"><svg viewBox="0 0 24 24"><path d="M4 13l2.5-7h11L20 13v6H4z"/><path d="M4 13h4.5l1 2h5l1-2H20"/></svg><small>待处理</small><i id="inbox-badge" class="badge"></i></button>
   <button id="kill" title="运行中。点两下：全部停止所有 agent"><i></i><small>运行中</small></button>
   <button class="tab" data-tab="settings" title="设置（⌘,）"><svg viewBox="0 0 24 24"><path d="M10.3 3.2h3.4l.5 2.4 1.7.9 2.3-.8 1.7 2.9-1.8 1.6v2l1.8 1.6-1.7 2.9-2.3-.8-1.7 1-.5 2.3h-3.4l-.5-2.3-1.7-1-2.3.8-1.7-2.9 1.8-1.6v-2L4.1 8.6l1.7-2.9 2.3.8 1.7-.9z"/><circle cx="12" cy="12" r="2.6"/></svg><small>设置</small></button>
 </nav>
@@ -21,6 +23,7 @@
   <header data-tauri-drag-region>
     <label class="search"><svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="6"/><path d="m20 20-4.3-4.3"/></svg><input id="search" placeholder="搜索" autocomplete="off"><kbd id="search-kbd">⌘K</kbd></label>
     <button id="list-add" class="icon" title="新建"><svg viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg></button>
+    <button id="collapse" class="icon" title="收起列表（⌘\）"><svg viewBox="0 0 24 24"><path d="m13 7-5 5 5 5M18 7l-5 5 5 5"/></svg></button>
   </header>
   <div id="paused-bar" hidden>已全部停止 <button id="resume">恢复</button></div>
   <ul id="items"></ul>
@@ -32,6 +35,7 @@
 </main>
 
 <dialog id="dlg"><form method="dialog" id="dlg-form"></form></dialog>
+<script src="logos.js"></script>
 <script src="app.js"></script>
 </body>
 </html>

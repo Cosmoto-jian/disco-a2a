@@ -1,5 +1,5 @@
 [hidden] { display:none !important; }
-:root { --fs:13px;
+:root { --fs:13px; --rail-w:88px; --list-w:270px;
   color-scheme: light dark;
   --rail:rgba(236,237,240,.82); --list:#f8f9fa; --main:#ffffff; --line:rgba(0,0,0,.06); --fg:#1d1d1f; --mute:#8e8e93;
   --bubble:#f1f1f3; --me:#5865f2; --me-fg:#fff; --hover:#ebebee; --sel:#e2e3ff; --acc:#5865f2; --red:#e5484d; --green:#30a46c;
@@ -16,7 +16,7 @@ html { -webkit-text-size-adjust:100%; text-size-adjust:100%; }
 h1, h2, h3, h4, h5 { font-size:var(--fs); font-weight:600; }
 input, textarea, select, code, pre, kbd { font-family:inherit; font-size:var(--fs); }
 code, pre { font-family:ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
-body { display:grid; grid-template-columns:68px 290px 1fr; font:var(--fs)/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI Variable Text", "Segoe UI", "PingFang SC", "Microsoft YaHei UI", "Microsoft YaHei", sans-serif; color:var(--fg); background:var(--main); overflow:hidden; -webkit-user-select:none; user-select:none; }
+body { display:grid; grid-template-columns:var(--rail-w) var(--list-w) 1fr; transition:grid-template-columns .28s var(--ease, ease); font:var(--fs)/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI Variable Text", "Segoe UI", "PingFang SC", "Microsoft YaHei UI", "Microsoft YaHei", sans-serif; color:var(--fg); background:var(--main); overflow:hidden; -webkit-user-select:none; user-select:none; }
 button { font:inherit; color:inherit; cursor:pointer; }
 svg { width:22px; height:22px; fill:none; stroke:currentColor; stroke-width:1.7; stroke-linecap:round; stroke-linejoin:round; }
 
@@ -25,11 +25,20 @@ svg { width:22px; height:22px; fill:none; stroke:currentColor; stroke-width:1.7;
 #rail .drag { height:44px; width:100%; }
 .win #rail .drag { height:12px; }
 #rail .grow { flex:1; }
-.tab { width:56px; height:50px; border:0; border-radius:11px; background:none; color:var(--mute); display:grid; place-items:center; transition:background .15s, color .15s; }
+/* below the line: things to check on, each with its own count */
+.rail-sep { width:44px; height:1px; background:var(--line); margin:4px 0; flex:none; }
+#kill small b { font-weight:600; margin-left:3px; }
+/* the list collapses to give the chat the whole width */
+#expand { display:none; }
+body.collapsed { --list-w:0px; }
+body.collapsed #list { visibility:hidden; border-right:0; }
+body.collapsed #expand { display:grid; }
+#list { overflow:hidden; min-width:0; }
+.tab { width:70px; height:54px; position:relative; gap:3px; align-content:center; border:0; border-radius:11px; background:none; color:var(--mute); display:grid; place-items:center; transition:background .15s, color .15s; }
 .tab:hover { background:var(--hover); }
 .tab.on { color:var(--acc); background:var(--sel); }
 /* emergency stop as a quiet status pill: two clicks to stop, one to resume */
-#kill { width:56px; border:0; background:none; padding:6px 0; border-radius:10px; color:var(--mute); display:flex; flex-direction:column; align-items:center; gap:5px; transition:background .15s, color .15s; }
+#kill { width:70px; border:0; background:none; padding:6px 0; border-radius:10px; color:var(--mute); display:flex; flex-direction:column; align-items:center; gap:5px; transition:background .15s, color .15s; }
 #kill i { width:8px; height:8px; border-radius:50%; background:var(--green); box-shadow:0 0 0 3px color-mix(in srgb, var(--green) 18%, transparent); animation:breathe 2.6s ease-in-out infinite; }
 #kill small { font-size:11px; line-height:1; white-space:nowrap; }
 #kill:hover { background:var(--hover); }
@@ -236,6 +245,9 @@ dialog::backdrop { background:rgba(0,0,0,.28); }
 .page.add .lead { color:var(--mute); margin:4px 0 0; }
 .brand { width:38px; height:38px; flex:none; border-radius:10px; display:grid; place-items:center; color:#fff; background:linear-gradient(145deg, color-mix(in srgb, var(--b) 72%, #fff), var(--b)); box-shadow:inset 0 0 0 1px rgba(255,255,255,.14), 0 1px 3px color-mix(in srgb, var(--b) 30%, transparent); }
 .brand svg { width:21px; height:21px; stroke-width:1.9; }
+.brand.logo { background:#fff; color:#111; box-shadow:inset 0 0 0 1px rgba(0,0,0,.09), 0 1px 2px rgba(0,0,0,.05); }
+.brand.logo svg { width:24px; height:24px; fill:currentColor; stroke:none; }
+.brand.logo.sm svg { width:13px; height:13px; }
 .brand.sm { width:18px; height:18px; border-radius:5px; } .brand.sm svg { width:12px; height:12px; stroke-width:2.2; }
 code.path { display:inline-block; max-width:100%; margin-top:3px; font:11.5px ui-monospace, Menlo, monospace; padding:1px 6px; border-radius:4px; background:color-mix(in srgb, var(--fg) 5%, transparent); color:var(--mute); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; vertical-align:top; }
 .callout { margin-top:22px; padding:12px 14px; border-radius:12px; background:color-mix(in srgb, var(--acc) 5%, var(--list)); box-shadow:inset 0 0 0 1px var(--line); display:flex; flex-direction:column; gap:9px; }
@@ -513,3 +525,33 @@ input[type=number].fld.t { width:64px; }
 .frun small { flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
 
 .pop-filter { position:sticky; top:-5px; z-index:1; width:100%; height:28px; margin:-1px 0 4px; border:0; border-radius:7px; padding:0 9px; background:var(--list); color:var(--fg); outline:none; box-shadow:inset 0 0 0 1px var(--line); }
+
+/* busy agents: tinted row with a border and a plain-words status */
+#items li.busy { background:color-mix(in srgb, var(--green) 9%, transparent); box-shadow:inset 0 0 0 1px color-mix(in srgb, var(--green) 45%, transparent); }
+#items li.busy.on { background:color-mix(in srgb, var(--green) 14%, var(--sel)); }
+.busy-tag { flex:none; display:inline-flex; align-items:center; gap:5px; color:var(--green); font-size:12px; font-weight:500; white-space:nowrap; }
+.busy-tag::before { content:""; width:6px; height:6px; border-radius:50%; background:currentColor; animation:breathe 1.6s ease-in-out infinite; }
+#members .av.busy { box-shadow:0 0 0 2px var(--main), 0 0 0 3.5px var(--green); }
+/* agent list: card rows, path underneath, actions on hover */
+#items li.card { margin:0 0 6px; padding:10px; border-radius:12px; box-shadow:inset 0 0 0 1px var(--line); }
+#items li.card:hover { box-shadow:inset 0 0 0 1px color-mix(in srgb, var(--acc) 35%, var(--line)); background:none; }
+#items li.card.on { box-shadow:inset 0 0 0 1.5px var(--acc); background:var(--sel); }
+#items li.card.on::before { display:none; }
+#items li.card .sub { font:11.5px ui-monospace, SFMono-Regular, Menlo, monospace; }
+.tag { flex:none; font-size:10.5px; font-weight:500; line-height:16px; padding:0 6px; border-radius:6px; color:var(--mute); box-shadow:inset 0 0 0 1px var(--line); margin-left:6px; }
+#items li.card .name-row { display:flex; align-items:center; min-width:0; }
+.acts { display:flex; gap:2px; flex:none; opacity:0; transition:opacity .15s; }
+#items li.card:hover .acts, #items li.card.on .acts { opacity:1; }
+.acts button { width:26px; height:26px; border:0; border-radius:7px; background:none; color:var(--mute); display:grid; place-items:center; padding:0; }
+.acts button:hover { background:var(--hover); color:var(--fg); }
+.acts svg { width:15px; height:15px; stroke-width:1.9; }
+/* group mode: segmented control with what it means right now */
+.modebar { display:flex; align-items:center; gap:12px; padding:10px 22px; border-bottom:1px solid var(--line); }
+.pseg { display:inline-flex; padding:3px; border-radius:10px; background:color-mix(in srgb, var(--fg) 6%, transparent); }
+.pseg button { border:0; background:none; padding:4px 14px; border-radius:7px; color:var(--mute); font-size:var(--fs); transition:background .15s, color .15s, box-shadow .15s; }
+.pseg button.on { background:var(--main); color:var(--fg); font-weight:600; box-shadow:0 1px 3px rgba(0,0,0,.08); }
+.modebar .state { color:var(--mute); display:flex; align-items:center; gap:6px; }
+.modebar .state i { width:6px; height:6px; border-radius:50%; background:var(--mute); }
+.modebar .state.on i { background:var(--green); }
+.modebar .state b { color:var(--fg); font-weight:500; }
+.head small { display:block; }

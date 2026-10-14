@@ -7,7 +7,7 @@ const $ = (s, r = document) => r.querySelector(s);
 // typing: thread -> Set(agent); live: "thread|agent" -> streaming bubble
 // msgs: thread -> cached messages, so switching chats renders instantly.
 // status: "thread|agent" -> { st: "think" | "tool", tool }; "wait" comes from the inbox.
-const S = { tab: "chats", thread: null, ov: null, tpl: [], typing: {}, live: {}, inbox: [], team: {}, q: "", msgs: {}, found: null, status: {}, cmds: {}, unread: {} };
+const S = { teamMode: {}, tab: "chats", thread: null, ov: null, tpl: [], typing: {}, live: {}, inbox: [], team: {}, q: "", msgs: {}, found: null, status: {}, cmds: {}, unread: {} };
 const REDUCED = matchMedia("(prefers-reduced-motion: reduce)").matches;
 const COLORS = ["#5865f2", "#d97757", "#10a37f", "#7c5cff", "#e5484d", "#3b82f6", "#f59e0b", "#14b8a6"];
 
@@ -74,6 +74,9 @@ function statusOf(thread, agent) {
   const s = S.status[`${thread}|${agent}`];
   return s ? { st: s.st, label: `${agent} · ${ST_LABEL[s.st]}${s.tool ? "：" + s.tool : ""}` } : null;
 }
+// Agents replying right now, across every chat (for the rail count and busy rows).
+const busyAgents = () => new Set(Object.values(S.typing).flatMap((set) => [...set]));
+const OFFICIAL = new Set(["claude-code", "codex", "gemini", "qwen", "goose", "opencode", "hermes", "pi"]);
 function setStatus(thread, agent, st, tool) {
   const k = `${thread}|${agent}`;
   if (st) S.status[k] = { st, tool }; else delete S.status[k];
@@ -192,10 +195,17 @@ function drawList() {
         h("div", { class: "row" }, h("span", { class: "name" }, `${it.agent} · ${it.thread.startsWith("dm:") ? "私聊" : threadName(it.thread)}`), h("span", { class: "time" }, when(it.ts))),
         h("div", { class: "sub" }, `${it.kind === "permission" ? "🔐 请求执行" : "❓ 提问"}：${it.title}`))));
   } else if (S.tab === "agents") {
-    rows = S.ov.agents.map((a) => h("li", { class: S.thread === `dm:${a.name}` ? "on" : "", onclick: () => openThread(`dm:${a.name}`) },
+    const busy = busyAgents();
+    const act = (title, svg, run) => h("button", { title, html: `<svg viewBox="0 0 24 24">${svg}</svg>`, onclick: (e) => { e.stopPropagation(); run(e.currentTarget); } });
+    rows = S.ov.agents.map((a) => h("li", { class: `card${S.thread === `dm:${a.name}` ? " on" : ""}${busy.has(a.name) ? " busy" : ""}`, title: a.detail, onclick: () => openThread(`dm:${a.name}`) },
       avatar(a.name, { live: a.live }),
-      h("div", { class: "meta" }, h("div", { class: "name" }, a.name), h("div", { class: "sub" }, a.detail)),
-      h("button", { class: "more", title: "更多", onclick: (e) => { e.stopPropagation(); agentMenu(e.currentTarget, a.name); } }, "⋯")));
+      h("div", { class: "meta" },
+        h("div", { class: "name-row" }, h("span", { class: "name" }, a.name), a.kind === "acp" && OFFICIAL.has(a.template) ? h("span", { class: "tag" }, "官方") : null),
+        h("div", { class: "sub" }, a.kind === "acp" ? shortPath(a.detail) : a.detail)),
+      busy.has(a.name) ? h("span", { class: "busy-tag" }, "回复中") : h("div", { class: "acts" },
+        act("更换形象", '<path d="M12 3.5l2.2 5.3 5.3 2.2-5.3 2.2L12 18.5l-2.2-5.3L4.5 11l5.3-2.2z"/>', () => avatarDialog(a.name)),
+        a.kind !== "a2a" ? act("共享给朋友", '<circle cx="6" cy="12" r="2.5"/><circle cx="18" cy="6" r="2.5"/><circle cx="18" cy="18" r="2.5"/><path d="m8.2 10.8 7.6-3.6M8.2 13.2l7.6 3.6"/>', () => shareDialog(a.name)) : null,
+        act("更多", '<circle cx="5.5" cy="12" r=".9"/><circle cx="12" cy="12" r=".9"/><circle cx="18.5" cy="12" r=".9"/>', (el) => agentMenu(el, a.name)))));
   } else {
     rows = [h("li", { class: "on" }, avatar("Discord", { small: true }), h("div", { class: "meta" }, h("div", { class: "name" }, "Discord"), h("div", { class: "sub" }, S.ov.discord_status)))];
   }
@@ -218,11 +228,11 @@ function threadRow(t, head, fallback) {
   const title = peer ? h("span", { class: "name route" }, peer.guest, h("span", { class: "arrow", html: '<svg viewBox="0 0 24 24"><path d="M5 12h13M13 6.5 18.5 12 13 17.5"/></svg>' }), h("b", {}, peer.agent)) : h("span", { class: "name" }, name);
   const av = peer ? avatar(peer.agent, { small: false }) : avatar(name, { group: isGroup, live: live && !warn, status: isGroup ? null : statusOf(t, name) });
   if (warn) av.append(h("i", { class: "alert", title: "需要留意，点开看看" }, "!"));
-  return h("li", { class: `${S.thread === t ? "on" : ""}${unread ? " unread" : ""}`, onclick: () => openThread(t), onmouseenter: () => prefetch(t) },
+  return h("li", { class: `${S.thread === t ? "on" : ""}${unread ? " unread" : ""}${typing ? " busy" : ""}`, onclick: () => openThread(t), onmouseenter: () => prefetch(t) },
     av,
     waiting ? h("i", { class: "badge row-badge", title: `${waiting} 项等你处理` }, String(waiting)) : null,
     h("div", { class: "meta" },
-      h("div", { class: "row" }, title, h("span", { class: "time" }, when(head?.ts))),
+      h("div", { class: "row" }, title, typing ? h("span", { class: "busy-tag" }, "回复中") : h("span", { class: "time" }, when(head?.ts))),
       h("div", { class: "row" },
         h("div", { class: `sub${typing ? " typing" : ""}${warn ? " alert" : ""}` }, typing ? `${typing} ${isGroup ? "正在回复" : ST_LABEL[S.status[`${t}|${name}`]?.st] ?? "正在输入"}…` : head ? `${isGroup && head.author !== "me" && head.author !== "system" ? head.author + "：" : ""}${head.body}` : (fallback ?? "")),
         unread ? h("i", { class: "unread-n" }, unread > 99 ? "99+" : String(unread)) : null),
@@ -248,7 +258,7 @@ async function openThread(t) {
   const g = isGroup && S.ov.groups.find((g) => `group:${g.id}` === t);
   const a = !isGroup && S.ov.agents.find((a) => a.name === name);
   const multi = isGroup && (g.people.length || g.guests.length);
-  const sub = isGroup ? `${g.members.length} 个 agent${multi ? ` · ${g.people.length + 1} 人 · 多人群：@ 才回答` : ` · 组长 ${g.lead ?? "—"}`}${g.id.startsWith("local-") ? "" : " · Discord 同步"}` : peer ? `${peer.guest} 通过共享在用你的 ${peer.agent}` : a ? `${{ acp: "本机", openai: "模型 API" }[a.kind] ?? "A2A"} · ${a.detail}` : "";
+  const sub = isGroup ? `${g.members.length} 个 agent${multi ? ` · ${g.people.length + 1} 人 · 多人群：@ 才回答` : ` · 组长 ${g.lead ?? "—"}`}` : peer ? `${peer.guest} 通过共享在用你的 ${peer.agent}` : a ? `${{ acp: "本机", openai: "模型 API" }[a.kind] ?? "A2A"} · ${a.detail}` : "";
   const pane = $("#pane");
   pane.replaceChildren(
     h("div", { class: "head", "data-tauri-drag-region": true }, a ? Object.assign(avatar(name, { live: a.live }), { title: "更换形象", onclick: () => avatarDialog(name), className: `av pickable${a.live ? " live" : ""}` }) : avatar(peer ? peer.agent : name, { group: isGroup }),
@@ -257,14 +267,14 @@ async function openThread(t) {
       a && a.kind !== "a2a" ? h("div", { id: "cfgs" }) : null,
       !peer ? memorySwitch(t) : null,
       !peer ? h("button", { class: "btn space-btn", title: "待办和群文档（agent 也能读写）", onclick: () => toggleSpace(t) }, "待办", h("span", { class: "count", id: "todo-count" })) : null,
-      isGroup ? h("button", { class: "btn", title: "让成员分工并行处理一个任务，最后由组长汇总", onclick: () => { const i = $("#input"); if (!i.value.startsWith("/team ")) i.value = `/team ${i.value}`; i.focus(); i.dispatchEvent(new Event("input")); } }, "团队") : null,
-      isGroup ? h("button", { class: "btn", onclick: () => groupDialog(g) }, "成员") : null,
+      isGroup ? h("button", { class: "btn primary", onclick: () => groupDialog(g) }, "成员") : null,
       a ? h("button", { class: "icon-btn", title: "更多", onclick: (e) => agentMenu(e.currentTarget, a.name) }, "⋯") : null),
+    isGroup ? modeBar(t, g) : null,
     h("div", { id: "log" }),
     peer && !peer.talk ? h("div", { class: "peer-note" }, peer.group ? `对方在同步到 Discord 的群里用你的 agent。${peer.missing}` : "你现在只能旁观。想一起聊：对方建一个同步到 Discord 的群，拉你和你的 Bot 进去，再在群里 @ 一次你的 agent，这里就会变成聊天。") : h("div", { id: "composer" },
       peer ? null : h("button", { class: "attach", type: "button", title: "放一个文件到共享空间，agent 都能读到", onclick: () => attachFile(t) },
         Object.assign(h("span"), { innerHTML: '<svg viewBox="0 0 24 24"><path d="M20.5 11.5 12.4 19.6a5 5 0 0 1-7.1-7.1l8.5-8.5a3.3 3.3 0 0 1 4.7 4.7l-8.5 8.5a1.7 1.7 0 0 1-2.4-2.4l7.8-7.8"/></svg>' })),
-      h("textarea", { id: "input", rows: 1, placeholder: peer ? `在 ${peer.guest} 的群里说话（经 Discord 同步）` : isGroup ? "@名字 叫 agent 回答，@all 一起回答，/help 看群规" : `给 ${name} 发消息，/ 看它的命令` }),
+      h("textarea", { id: "input", rows: 1, placeholder: peer ? `在 ${peer.guest} 的群里说话（经 Discord 同步）` : isGroup ? (S.teamMode[t] ? "说一个任务，成员会分工处理，组长汇总" : "@名字 叫 agent 回答，@all 一起回答，/help 看群规") : `给 ${name} 发消息，/ 看它的命令` }),
       sendButton()));
   $("#pane").classList.remove("enter"); void $("#pane").offsetWidth; $("#pane").classList.add("enter");
   const ta = $("#input") ?? h("textarea");
@@ -303,6 +313,21 @@ async function openThread(t) {
   S.msgs[t] = fresh;
   if (!Array.isArray(had) || had.length !== fresh.length) draw(fresh);
 }
+// Group mode: plain chat or /team (split the task, lead sums up), plus where the group lives.
+function modeBar(t, g) {
+  const seg = h("div", { class: "pseg", role: "tablist" });
+  const draw = () => {
+    const team = !!S.teamMode[t];
+    seg.replaceChildren(
+      h("button", { class: team ? "" : "on", title: "@ 谁谁回答", onclick: () => { delete S.teamMode[t]; draw(); } }, "普通"),
+      h("button", { class: team ? "on" : "", title: "成员分工并行处理，最后由组长汇总", onclick: () => { S.teamMode[t] = true; draw(); } }, "团队"));
+    const i = $("#input"); if (i) i.placeholder = team ? "说一个任务，成员会分工处理，组长汇总" : "@名字 叫 agent 回答，@all 一起回答，/help 看群规";
+  };
+  draw();
+  const local = g.id.startsWith("local-");
+  return h("div", { class: "modebar" }, seg,
+    h("span", { class: `state${local ? "" : " on"}` }, h("i"), local ? "仅本地，不同步 Discord" : h("span", {}, "镜像到 ", h("b", {}, "Discord"))));
+}
 // The chat's memory switch: one row, the whole row toggles; Tab focuses, Space/Enter toggles.
 function memorySwitch(t) {
   const on = () => !S.ov.memory_off.includes(t);
@@ -325,7 +350,12 @@ function memorySwitch(t) {
 function drawMembers() {
   const box = $("#members"); if (!box) return;
   const g = S.ov.groups.find((g) => `group:${g.id}` === S.thread); if (!g) return;
-  box.replaceChildren(...g.members.map((m) => avatar(m, { small: true, status: statusOf(S.thread, m) ?? { st: "idle", label: m } })));
+  const busy = S.typing[S.thread] ?? new Set();
+  box.replaceChildren(...g.members.map((m) => {
+    const el = avatar(m, { small: true, status: statusOf(S.thread, m) ?? { st: "idle", label: m } });
+    if (busy.has(m)) { el.classList.add("busy"); el.title = `${m} · 回复中`; }
+    return el;
+  }));
 }
 // While any agent is replying here, the send button becomes a stop button.
 function syncComposer() {
@@ -659,8 +689,9 @@ async function attachFile(t) {
 }
 async function sendMsg() {
   if ($("#send")?.classList.contains("stop")) return stopHere();
-  const ta = $("#input"); const text = ta.value.trim();
+  const ta = $("#input"); let text = ta.value.trim();
   if (!text || !S.thread) return;
+  if (S.teamMode[S.thread] && !text.startsWith("/")) text = `/team ${text}`;
   ta.value = ""; ta.style.height = "auto"; if ($("#send")) $("#send").disabled = true;
   // Show it now; the backend's echo of the same message confirms it.
   const t = S.thread;
@@ -760,6 +791,7 @@ listen("typing", ({ payload: { thread, agent, on } }) => {
   if (!on && S.live[k] && !S.live[k].text) { S.live[k].el.remove(); delete S.live[k]; }
   if (!on && S.live[k]) { S.live[k].on = false; S.live[k].b.classList.remove("streaming"); }
   setStatus(thread, agent, on ? "think" : null);
+  drawKill();
 });
 listen("stream", ({ payload: { thread, agent, event } }) => {
   const live = S.live[liveKey(thread, agent)];
@@ -854,6 +886,7 @@ const MARKS = {
   a2a: ["#5865f2", '<circle cx="6" cy="12" r="2.5"/><circle cx="18" cy="12" r="2.5"/><path d="M8.5 12h7M12 6.5c2 0 4 1 5.5 3.2M12 17.5c-2 0-4-1-5.5-3.2"/>'],
 };
 function brandIcon(id, small = false) {
+  if (LOGOS[id]) return h("span", { class: `brand logo${small ? " sm" : ""}`, html: `<svg viewBox="0 0 24 24">${LOGOS[id]}</svg>` });
   const [c0, svg] = MARKS[id] ?? ["#8a8a8e", '<path d="M12 4v16M4 12h16"/>'];
   const c = BRAND[id] ?? c0;
   return h("span", { class: `brand${small ? " sm" : ""}`, style: `--b:${c}`, html: `<svg viewBox="0 0 24 24">${svg}</svg>` });
@@ -1234,6 +1267,7 @@ async function firstRun(box) {
 }
 function setTab(tab) {
   S.tab = tab;
+  if (tab !== "settings" && document.body.classList.contains("collapsed")) setCollapsed(false);
   document.querySelectorAll(".tab").forEach((b) => b.classList.toggle("on", b.dataset.tab === tab));
   if (tab === "agents") renderGallery();
   else if (tab === "settings") renderSettings();
@@ -1249,8 +1283,9 @@ let killArm = 0;
 function drawKill() {
   const k = $("#kill"), armed = !!killArm, paused = !!S.ov?.paused;
   k.className = paused ? "paused" : armed ? "armed" : "";
-  k.querySelector("small").textContent = paused ? "已停止" : armed ? "再点停止" : "运行中";
-  k.title = paused ? "已全部停止，点一下恢复" : "运行中。点两下：全部停止所有 agent";
+  const n = paused || armed ? 0 : busyAgents().size;
+  k.querySelector("small").replaceChildren(paused ? "已停止" : armed ? "再点停止" : "运行中", n ? h("b", {}, String(n)) : "");
+  k.title = paused ? "已全部停止，点一下恢复" : `${n ? `${n} 个 agent 正在回复。` : "运行中。"}点两下：全部停止所有 agent`;
 }
 $("#kill").onclick = async () => {
   if (S.ov.paused) { await invoke("resume"); await load(); drawKill(); toast("已恢复", 1500); return; }
@@ -1260,6 +1295,14 @@ $("#kill").onclick = async () => {
   toast(`已停止 ${n} 个 agent，新消息暂不转发`, 6000, ["恢复", async () => { await invoke("resume"); await load(); }]);
 };
 $("#resume").onclick = async () => { await invoke("resume"); await load(); };
+// The list column folds away (remembered); the rail keeps a button to bring it back.
+function setCollapsed(on) {
+  document.body.classList.toggle("collapsed", on);
+  try { localStorage.setItem("disco.collapsed", on ? "1" : ""); } catch {}
+}
+setCollapsed(!!(() => { try { return localStorage.getItem("disco.collapsed"); } catch { return ""; } })());
+$("#collapse").onclick = () => setCollapsed(true);
+$("#expand").onclick = () => setCollapsed(false);
 
 // Keyboard: ⌘K search, ⌘1–4 tabs, ⌘N new (group / agent), ↩ in search opens the first hit,
 // and typing anywhere in a chat goes to the composer.
@@ -1268,6 +1311,7 @@ addEventListener("keydown", (e) => {
   const typingInField = /^(INPUT|TEXTAREA|SELECT)$/.test(document.activeElement?.tagName) || document.activeElement?.isContentEditable;
   if (mod && e.key.toLowerCase() === "k") { e.preventDefault(); $("#search").focus(); $("#search").select(); return; }
   if (mod && /^[1-4]$/.test(e.key)) { e.preventDefault(); setTab(["chats", "groups", "agents", "inbox"][e.key - 1]); return; }
+  if (mod && e.key === "\\") { e.preventDefault(); setCollapsed(!document.body.classList.contains("collapsed")); return; }
   if (mod && e.key === ",") { e.preventDefault(); setTab("settings"); return; }
   if (mod && e.key.toLowerCase() === "n") { e.preventDefault(); if (S.tab === "agents") renderGallery(); else groupDialog(null); return; }
   if (!mod && !e.altKey && !typingInField && e.key.length === 1 && $("#input") && !$("#dlg").open) $("#input").focus();
