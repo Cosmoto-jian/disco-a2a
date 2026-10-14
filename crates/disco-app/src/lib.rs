@@ -811,7 +811,7 @@ struct GroupView { id: String, name: String, guild_id: String, lead: Option<Stri
 #[derive(Serialize)]
 struct Head { thread: String, author: String, body: String, ts: i64 }
 #[derive(Serialize)]
-struct PeerView { thread: String, guest: String, agent: String, talk: bool }
+struct PeerView { thread: String, guest: String, agent: String, talk: bool, group: bool, missing: String }
 #[derive(Serialize)]
 struct Overview {
     peers: Vec<PeerView>,
@@ -844,7 +844,10 @@ async fn overview(core: St<'_>) -> CmdResult<Overview> {
         let avatar = core.db().setting(&format!("{SET_AVATAR}{}", a.name)).unwrap_or_default();
         agents.push(AgentView { live: core.hub.is_live(&a.name).await, name: a.name, kind: a.transport, template, detail, avatar });
     }
-    let peers = core.shares().into_iter().map(|(id, s)| PeerView { talk: core.peer_channel(&id).is_some(), thread: format!("peer:{id}"), guest: s.guest, agent: s.agent }).collect();
+    let peers = core.shares().into_iter().map(|(id, s)| {
+        let missing = core.peer_missing(&id);
+        PeerView { talk: missing.as_deref() == Some(""), group: missing.is_some(), missing: missing.unwrap_or_default(), thread: format!("peer:{id}"), guest: s.guest, agent: s.agent }
+    }).collect();
     // Read every setting first, one lock at a time: a `core.db()` temporary inside the
     // struct literal below would stay locked to the end of the statement, and any later
     // `db()` in it (roster, the switches) would then deadlock the whole app.
@@ -1603,7 +1606,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             overview, detect_agents, conda_envs, choose_path, memories, forget, add_agent, remove_agent, rename_agent, set_avatar, stop_reply, messages, send, inbox, inbox_answer, net_policy, net_policy_set, send_file, team_state, team_files, agent_configs, set_agent_config,
             stop_all, resume, save_discord_token, discord_connect, discord_settings, discord_sync, diagnose, open_url, reveal_path, discord_channels, save_group, delete_group, restore_group, memory_restore, set_memory, agent_commands,
-            check_update, install_update, space, todo_new, todo_set, todo_remove, doc_save, reveal_doc, share::share_status, share::create_share, share::share_invite, share::revoke_share, share::accept_invite
+            check_update, install_update, space, todo_new, todo_set, todo_remove, doc_save, reveal_doc, share::share_status, share::peer_check, share::create_share, share::share_invite, share::revoke_share, share::accept_invite
         ])
         .run(tauri::generate_context!())
         .expect("error while running Disco");

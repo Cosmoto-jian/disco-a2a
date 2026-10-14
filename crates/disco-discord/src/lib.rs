@@ -220,6 +220,17 @@ impl Rest {
         self.call(reqwest::Method::POST, path, Some(body)).await
     }
 
+    /// The server a channel belongs to; Err when the bot cannot see the channel.
+    pub async fn channel_guild(&self, channel: &str) -> Result<String, String> {
+        let v = self.get(&format!("/channels/{channel}")).await?;
+        v["guild_id"].as_str().map(str::to_owned).ok_or_else(|| "不是服务器频道".into())
+    }
+
+    /// Whether `user` is a member of `guild` (needs no privileged intent).
+    pub async fn is_member(&self, guild: &str, user: &str) -> bool {
+        self.get(&format!("/guilds/{guild}/members/{user}")).await.is_ok()
+    }
+
     /// `(bot user id, bot name)`.
     pub async fn me(&self) -> Result<(String, String), String> {
         let v = self.get("/users/@me").await?;

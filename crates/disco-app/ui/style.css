@@ -195,7 +195,7 @@ dialog { border:0; border-radius:16px; padding:0; width:420px; background:var(--
 dialog::backdrop { background:rgba(0,0,0,.28); }
 #dlg-form { padding:20px; display:flex; flex-direction:column; gap:10px; }
 #dlg-form h3 { margin:0 0 4px; }
-#dlg-form label { font-size:var(--fs); color:var(--mute); display:flex; flex-direction:column; gap:4px; }
+#dlg-form label, #dlg-form .flabel { font-size:var(--fs); color:var(--mute); display:flex; flex-direction:column; gap:4px; }
 #dlg-form input, #dlg-form select { height:32px; border:1px solid var(--line); border-radius:8px; padding:0 10px; background:var(--list); color:var(--fg); font:inherit; }
 #dlg-form .checks { display:flex; flex-wrap:wrap; gap:6px 14px; color:var(--fg); font-size:var(--fs); }
 #dlg-form .checks label { flex-direction:row; align-items:center; color:var(--fg); font-size:var(--fs); }

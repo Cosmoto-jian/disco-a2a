@@ -182,7 +182,9 @@ function drawList() {
     rows = threads.map((t) => ({ t, head: heads[t] })).sort((a, b) => (b.head?.ts ?? 0) - (a.head?.ts ?? 0))
       .map(({ t, head }) => threadRow(t, head));
   } else if (S.tab === "groups") {
-    rows = S.ov.groups.map((g) => threadRow(`group:${g.id}`, heads[`group:${g.id}`], g.members.join("、")));
+    rows = [...S.ov.groups.map((g) => threadRow(`group:${g.id}`, heads[`group:${g.id}`], g.members.join("、"))),
+      // A friend's Discord-synced group your shared agent is in counts as a group too.
+      ...S.ov.peers.filter((p) => p.group).map((p) => threadRow(p.thread, heads[p.thread], p.talk ? `${p.guest} 的群 · 可以说话` : `${p.guest} 的群 · ${p.missing.split("：")[0]}`))];
   } else if (S.tab === "inbox") {
     rows = S.inbox.map((it) => h("li", { class: S.thread === it.thread ? "on" : "", onclick: () => openThread(it.thread) },
       avatar(it.agent),
@@ -259,7 +261,7 @@ async function openThread(t) {
       isGroup ? h("button", { class: "btn", onclick: () => groupDialog(g) }, "成员") : null,
       a ? h("button", { class: "icon-btn", title: "更多", onclick: (e) => agentMenu(e.currentTarget, a.name) }, "⋯") : null),
     h("div", { id: "log" }),
-    peer && !peer.talk ? h("div", { class: "peer-note" }, "这是对方的会话，你只能旁观。需要你批准的操作会在这里弹出。") : h("div", { id: "composer" },
+    peer && !peer.talk ? h("div", { class: "peer-note" }, peer.group ? `对方在同步到 Discord 的群里用你的 agent。${peer.missing}` : "这是对方的私聊，你只能旁观。想一起聊，请对方建一个同步到 Discord 的群，把你和你的 Bot 拉进去。") : h("div", { id: "composer" },
       peer ? null : h("button", { class: "attach", type: "button", title: "放一个文件到共享空间，agent 都能读到", onclick: () => attachFile(t) },
         Object.assign(h("span"), { innerHTML: '<svg viewBox="0 0 24 24"><path d="M20.5 11.5 12.4 19.6a5 5 0 0 1-7.1-7.1l8.5-8.5a3.3 3.3 0 0 1 4.7 4.7l-8.5 8.5a1.7 1.7 0 0 1-2.4-2.4l7.8-7.8"/></svg>' })),
       h("textarea", { id: "input", rows: 1, placeholder: peer ? `在 ${peer.guest} 的群里说话（经 Discord 同步）` : isGroup ? "@名字 叫 agent 回答，@all 一起回答，/help 看群规" : `给 ${name} 发消息，/ 看它的命令` }),
@@ -280,6 +282,11 @@ async function openThread(t) {
   drawMembers(); syncComposer();
   if (a && a.kind !== "a2a") loadConfigs(name, t);
   if (!peer) loadSpace(t);
+  // Joining their server takes effect without a restart: check again whenever the chat opens.
+  if (peer?.group) invoke("peer_check", { id: t.slice(5) }).then((m) => {
+    if (m == null || m === peer.missing || S.thread !== t) return;
+    Object.assign(peer, { missing: m, talk: m === "" }); $("#log")?.remove(); openThread(t); renderList();
+  }).catch(() => {});
   if (isGroup) invoke("team_state", { thread: t }).then((st) => { if (st) { S.team[t] = st; renderTeam(t); } }).catch(() => {});
   const draw = (msgs) => {
     const log = $("#log"); if (!log || S.thread !== t) return;
@@ -965,7 +972,9 @@ async function shareDialog(agent) {
       h("p", { class: "del-sub" }, "通过 Tailscale 私有网络共享，只有拿到邀请码的人能用，随时可以撤销。"))),
     st.problem ? h("div", { class: "warn" }, st.problem, " ", h("button", { type: "button", class: "linkish", onclick: () => invoke("open_url", { url: "https://tailscale.com/download" }) }, "下载 Tailscale")) : null,
     h("label", {}, "共享给", guest),
-    h("label", {}, "权限", modes),
+    // Not a <label>: a click anywhere in a label also clicks its first button, so the
+    // second choice could never stay selected.
+    h("div", { class: "flabel" }, "权限", modes),
     h("label", {}, "每天最多几条消息（0 = 不限）", limit),
     err, out,
     mine.length ? h("div", { class: "muted3" }, "已共享") : null, list,

@@ -185,6 +185,12 @@ pub fn spawn(app: AppHandle, mock: String) {
             if pc("group:1234567890").as_deref() != Some("1234567890") { return Err("认不出 Discord 群".into()); }
             if pc("group:local-x").is_some() || pc("dm:x").is_some() { return Err("本地群/私聊不该能回话".into()); }
             Ok(String::new()) });
+        let _ = check!("对方群需你和 Bot 都在", {
+            let _ = core.db().set_setting(&format!("{}st", crate::share::PEER_CTX), "group:1234567890");
+            let m = within(10, core.peer_check("st")).await?.unwrap_or_default();
+            if m.is_empty() { return Err("没连 Discord 却被当成可以说话".into()); }
+            if core.peer_say("st", "hi").await.is_ok() { return Err("没确认就发出去了".into()); }
+            Ok(m) });
         let bad = crate::NewAgent { command: Some("/nonexistent/agent --acp".into()), ..spec("bad") };
         let _ = check!("自检提示", { within(10, crate::add_agent(st(), bad)).await??; wait_msg(&core, "dm:bad", "system", 0, 10).await });
         let _ = check!("remove_agent", within(10, crate::remove_agent(st(), "bad".into(), Some(true))).await.and_then(|r| r).map(|_| String::new()));

@@ -176,6 +176,8 @@ impl Core {
 }
 
 pub(crate) const PEER_CTX: &str = "peer_ctx/";
+/// Result of the last talk check per share: "" = ready, else what is still missing.
+const PEER_OK: &str = "peer_ok/";
 
 impl Core {
     /// The Discord channel of the guest's group the shared agent was last used in, if any.
@@ -185,10 +187,40 @@ impl Core {
         (!ch.is_empty() && ch.bytes().all(|b| b.is_ascii_digit())).then(|| ch.to_owned())
     }
 
+    /// What still keeps the owner from talking in the guest's group ("" = nothing).
+    pub(crate) fn peer_missing(&self, id: &str) -> Option<String> {
+        self.peer_channel(id)?;
+        Some(self.db().setting(&format!("{PEER_OK}{id}")).unwrap_or_else(|| "正在确认你和你的 Bot 是否都在对方的服务器里…".into()))
+    }
+
+    /// Check (and remember) whether both the owner's Discord account and bot are in the
+    /// server of the guest's group: only then does the spectator view turn into a chat.
+    pub(crate) async fn peer_check(&self, id: &str) -> Option<String> {
+        let ch = self.peer_channel(id)?;
+        let owners = self.owners.lock().unwrap_or_else(|p| p.into_inner()).clone();
+        let missing = match self.discord_rest() {
+            None => "先在设置里连上 Discord，才能加入对方的群聊".to_owned(),
+            Some(d) => match d.channel_guild(&ch).await {
+                Err(_) => "你的 Bot 还不在对方的服务器里：把设置里的「邀请 Bot」链接发给对方，请他授权".into(),
+                Ok(guild) => {
+                    let mut me = false;
+                    for o in &owners { if d.is_member(&guild, o).await { me = true; break; } }
+                    if me { String::new() } else { "你的 Discord 账号还没进对方的服务器：请对方发一个邀请链接给你".into() }
+                }
+            },
+        };
+        let _ = self.db().set_setting(&format!("{PEER_OK}{id}"), &missing);
+        Some(missing)
+    }
+
     /// The owner speaks in the guest's group: post to its Discord channel as the owner,
     /// exactly like typing there. The guest's Disco routes it (and any @mentions) as usual.
     pub(crate) async fn peer_say(&self, id: &str, text: &str) -> Result<(), String> {
         let ch = self.peer_channel(id).ok_or("对方最近不是在 Discord 同步的群里用你的 agent，没有可以回话的群")?;
+        if let Some(m) = self.peer_missing(id).filter(|m| !m.is_empty()) {
+            self.post_message(&format!("peer:{id}"), "system", &m);
+            return Err(m);
+        }
         let d = self.discord_rest().ok_or("先在设置里连上 Discord，才能在对方的群里说话")?;
         let thread = format!("peer:{id}");
         self.post_message(&thread, "me", text);
@@ -324,6 +356,12 @@ impl AgentExecutor for PeerExec {
 }
 
 // ---------- commands
+
+/// Re-check whether the owner can talk in the guest's group; returns what is missing ("" = ready).
+#[tauri::command]
+pub async fn peer_check(core: St<'_>, id: String) -> CmdResult<Option<String>> {
+    Ok(core.peer_check(&id).await)
+}
 
 #[tauri::command]
 pub fn share_status(core: St<'_>) -> ShareStatus {
