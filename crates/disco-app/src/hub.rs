@@ -154,12 +154,15 @@ impl Hub {
                     env.extend([("CONDA_PREFIX".to_owned(), spec.conda.clone()), ("CONDA_DEFAULT_ENV".into(), name), ("CONDA_SHLVL".into(), "1".into())]);
                 }
                 env.push(("PATH".into(), path.clone()));
-                // Windows: the Claude ACP adapter looks for claude.exe inside an npm
-                // optional package that npx often skips; point it at the user's own.
-                if cfg!(windows) && std::iter::once(&spec.command).chain(&spec.args).any(|a| a.contains("claude"))
-                    && std::env::var_os("CLAUDE_CODE_EXECUTABLE").is_none()
-                    && let Some(exe) = which("claude.exe", &path) {
-                    env.push(("CLAUDE_CODE_EXECUTABLE".into(), exe.to_string_lossy().into_owned()));
+                // Same agent as in the terminal: the ACP adapters drive the user's own CLI
+                // (same login, same settings, same default model) instead of the copy npx
+                // bundles, which has never been logged in and ignores the user's setup.
+                let uses = |name: &str| std::iter::once(&spec.command).chain(&spec.args).any(|a| a.contains(name));
+                for (agent, cli, var) in [("claude", "claude", "CLAUDE_CODE_EXECUTABLE"), ("codex", "codex", "CODEX_PATH")] {
+                    if uses(agent) && std::env::var_os(var).is_none() && !env.iter().any(|(k, _)| k == var)
+                        && let Some(exe) = own_cli(cli, &path) {
+                        env.push((var.into(), exe.to_string_lossy().into_owned()));
+                    }
                 }
                 if let Some(need) = crate::templates::node_min(&spec.template) && let Some(have) = node_major(&path) && have < need {
                     return Err(format!("Node.js 版本太旧（v{have}）：这个 agent 需要 Node {need} 以上。升级 Node（如 `nvm install {need}` 或从 nodejs.org 安装）后完全退出并重新打开 Disco"));
@@ -478,6 +481,14 @@ fn login_path(from_shell: String) -> String {
     join_path(std::iter::once(from_shell).chain(["/opt/homebrew/bin".into(), "/usr/local/bin".into()]).chain(extra).chain(std::iter::once(base)))
 }
 
+/// The user's own `claude` / `codex` on `path` (not an ACP adapter of the same name).
+fn own_cli(name: &str, path: &str) -> Option<PathBuf> {
+    // Windows: only a real .exe; node can't spawn npm's .cmd shims without a shell.
+    let exe = if cfg!(windows) { which(&format!("{name}.exe"), path)? } else { which(name, path)? };
+    let real = std::fs::canonicalize(&exe).unwrap_or_else(|_| exe.clone());
+    (!real.to_string_lossy().contains("-acp")).then_some(exe)
+}
+
 /// Major version of the `node` on `path`.
 fn node_major(path: &str) -> Option<u32> {
     let node = which("node", path)?;
@@ -573,6 +584,23 @@ mod env_tests {
         let (path, vars) = super::login_env();
         assert!(!path.is_empty() && t.elapsed().as_secs() < 6, "{:?}", t.elapsed());
         assert!(vars.iter().all(|(k, _)| k != "PATH" && k != "PWD"));
+    }
+
+    #[test]
+    fn finds_own_cli_not_adapter() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = std::env::temp_dir().join(format!("disco-cli-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&d);
+        let real = d.join("claude-agent-acp");
+        std::fs::write(&real, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let _ = std::fs::remove_file(d.join("claude"));
+        std::os::unix::fs::symlink(&real, d.join("claude")).unwrap();
+        let p = d.to_string_lossy().into_owned();
+        assert!(super::own_cli("claude", &p).is_none(), "an adapter is not the user's CLI");
+        std::fs::remove_file(d.join("claude")).unwrap();
+        std::fs::copy(&real, d.join("claude")).unwrap();
+        assert_eq!(super::own_cli("claude", &p), Some(d.join("claude")));
     }
 
     #[test]
