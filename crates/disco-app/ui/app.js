@@ -7,7 +7,7 @@ const $ = (s, r = document) => r.querySelector(s);
 // typing: thread -> Set(agent); live: "thread|agent" -> streaming bubble
 // msgs: thread -> cached messages, so switching chats renders instantly.
 // status: "thread|agent" -> { st: "think" | "tool", tool }; "wait" comes from the inbox.
-const S = { tab: "chats", thread: null, ov: null, tpl: [], typing: {}, live: {}, inbox: [], team: {}, q: "", msgs: {}, found: null, status: {}, cmds: {} };
+const S = { tab: "chats", thread: null, ov: null, tpl: [], typing: {}, live: {}, inbox: [], team: {}, q: "", msgs: {}, found: null, status: {}, cmds: {}, unread: {} };
 const REDUCED = matchMedia("(prefers-reduced-motion: reduce)").matches;
 const COLORS = ["#5865f2", "#d97757", "#10a37f", "#7c5cff", "#e5484d", "#3b82f6", "#f59e0b", "#14b8a6"];
 
@@ -16,6 +16,7 @@ function h(tag, attrs = {}, ...kids) {
   const e = document.createElement(tag);
   for (const [k, v] of Object.entries(attrs)) {
     if (k === "class") e.className = v;
+    else if (k === "html") e.innerHTML = v;
     else if (k.startsWith("on")) e.addEventListener(k.slice(2), v);
     else if (v !== false && v != null) e.setAttribute(k, v === true ? "" : v);
   }
@@ -153,6 +154,7 @@ async function load() {
   S.ov = await invoke("overview");
   document.body.classList.toggle("paused", S.ov.paused);
   $("#paused-bar").hidden = !S.ov.paused;
+  drawKill();
   renderList();
 }
 const peerOf = (t) => S.ov.peers.find((p) => p.thread === t);
@@ -168,7 +170,9 @@ function renderList() {
 }
 function drawList() {
   const ul = $("#items"); ul.replaceChildren();
-  $("#list-add").hidden = !(S.tab === "groups" || S.tab === "agents");
+  // Same header on every tab: ＋ keeps its place (just goes quiet) so the search box never jumps.
+  const add = $("#list-add"); add.classList.toggle("off", S.tab === "inbox" || S.tab === "settings");
+  add.title = S.tab === "agents" ? `添加 agent（${MOD}N）` : `新建群聊（${MOD}N）`;
   const q = S.q.toLowerCase();
   const heads = Object.fromEntries(S.ov.heads.map((x) => [x.thread, x]));
   let rows = [];
@@ -194,7 +198,10 @@ function drawList() {
     rows = [h("li", { class: "on" }, avatar("Discord", { small: true }), h("div", { class: "meta" }, h("div", { class: "name" }, "Discord"), h("div", { class: "sub" }, S.ov.discord_status)))];
   }
   rows = rows.filter((li) => !q || li.textContent.toLowerCase().includes(q));
-  if (!rows.length) rows = [h("li", { class: "empty" }, S.tab === "agents" ? "还没有 agent，点 ＋ 添加" : S.tab === "groups" ? "还没有群聊，点 ＋ 新建" : S.tab === "inbox" ? "没有等你处理的事" : "没有会话")];
+  if (!rows.length) rows = [q ? h("li", { class: "empty" }, `没有和「${S.q}」相关的`)
+    : S.tab === "inbox" ? h("li", { class: "empty calm" }, h("span", { class: "okmark", html: '<svg viewBox="0 0 24 24"><path d="m6 12.5 4 4 8-9"/></svg>' }), h("b", {}, "没有等你处理的事"),
+        h("small", {}, "agent 想跑终端命令、改文件，或者需要你拍板时，请求会出现在这里，同时在 Discord 里也能点。"))
+    : h("li", { class: "empty" }, S.tab === "agents" ? "还没有 agent，点 ＋ 添加" : S.tab === "groups" ? "还没有群聊，点 ＋ 新建" : "没有会话")];
   ul.append(...rows);
 }
 function threadRow(t, head, fallback) {
@@ -202,12 +209,21 @@ function threadRow(t, head, fallback) {
   const typing = S.typing[t]?.size ? [...S.typing[t]].join("、") : "";
   const live = !isGroup && S.ov.agents.find((a) => `dm:${a.name}` === t)?.live;
   const waiting = S.inbox.filter((it) => it.thread === t).length;
-  return h("li", { class: S.thread === t ? "on" : "", onclick: () => openThread(t), onmouseenter: () => prefetch(t) },
-    avatar(name, { group: isGroup, live, status: isGroup ? null : statusOf(t, name) }),
+  // The last word was a system notice (a failed start, an MCP server needing attention): flag it.
+  const warn = !typing && head?.author === "system";
+  const unread = S.thread === t ? 0 : S.unread[t] ?? 0;
+  const peer = peerOf(t);
+  const title = peer ? h("span", { class: "name route" }, peer.guest, h("span", { class: "arrow", html: '<svg viewBox="0 0 24 24"><path d="M5 12h13M13 6.5 18.5 12 13 17.5"/></svg>' }), h("b", {}, peer.agent)) : h("span", { class: "name" }, name);
+  const av = peer ? avatar(peer.agent, { small: false }) : avatar(name, { group: isGroup, live: live && !warn, status: isGroup ? null : statusOf(t, name) });
+  if (warn) av.append(h("i", { class: "alert", title: "需要留意，点开看看" }, "!"));
+  return h("li", { class: `${S.thread === t ? "on" : ""}${unread ? " unread" : ""}`, onclick: () => openThread(t), onmouseenter: () => prefetch(t) },
+    av,
     waiting ? h("i", { class: "badge row-badge", title: `${waiting} 项等你处理` }, String(waiting)) : null,
     h("div", { class: "meta" },
-      h("div", { class: "row" }, h("span", { class: "name" }, name), h("span", { class: "time" }, when(head?.ts))),
-      h("div", { class: `sub${typing ? " typing" : ""}` }, typing ? `${typing} ${isGroup ? "正在回复" : ST_LABEL[S.status[`${t}|${name}`]?.st] ?? "正在输入"}…` : head ? `${isGroup && head.author !== "me" ? head.author + "：" : ""}${head.body}` : (fallback ?? "")),
+      h("div", { class: "row" }, title, h("span", { class: "time" }, when(head?.ts))),
+      h("div", { class: "row" },
+        h("div", { class: `sub${typing ? " typing" : ""}${warn ? " alert" : ""}` }, typing ? `${typing} ${isGroup ? "正在回复" : ST_LABEL[S.status[`${t}|${name}`]?.st] ?? "正在输入"}…` : head ? `${isGroup && head.author !== "me" && head.author !== "system" ? head.author + "：" : ""}${head.body}` : (fallback ?? "")),
+        unread ? h("i", { class: "unread-n" }, unread > 99 ? "99+" : String(unread)) : null),
     ));
 }
 
@@ -224,7 +240,7 @@ function prefetch(t) {
 }
 async function openThread(t) {
   if (S.thread === t && $("#log")) return;
-  S.thread = t; renderList();
+  S.thread = t; delete S.unread[t]; renderList();
   const isGroup = t.startsWith("group:"); const name = threadName(t);
   const peer = peerOf(t);
   const g = isGroup && S.ov.groups.find((g) => `group:${g.id}` === t);
@@ -233,7 +249,7 @@ async function openThread(t) {
   const sub = isGroup ? `${g.members.length} 个 agent${multi ? ` · ${g.people.length + 1} 人 · 多人群：@ 才回答` : ` · 组长 ${g.lead ?? "—"}`}${g.id.startsWith("local-") ? "" : " · Discord 同步"}` : peer ? `${peer.guest} 通过共享在用你的 ${peer.agent}` : a ? `${a.kind === "acp" ? "本机" : "A2A"} · ${a.detail}` : "";
   const pane = $("#pane");
   pane.replaceChildren(
-    h("div", { class: "head", "data-tauri-drag-region": true }, a ? Object.assign(avatar(name, { live: a.live }), { title: "更换形象", onclick: () => avatarDialog(name), className: `av pickable${a.live ? " live" : ""}` }) : avatar(name, { group: isGroup }),
+    h("div", { class: "head", "data-tauri-drag-region": true }, a ? Object.assign(avatar(name, { live: a.live }), { title: "更换形象", onclick: () => avatarDialog(name), className: `av pickable${a.live ? " live" : ""}` }) : avatar(peer ? peer.agent : name, { group: isGroup }),
       h("div", {}, h("h2", { title: a ? "双击重命名" : "", ondblclick: a ? (e) => inlineRename(e.currentTarget, a.name) : null }, name), h("small", {}, sub)), h("span", { class: "sp" }),
       isGroup ? h("div", { id: "members" }) : null,
       a && a.kind === "acp" ? h("div", { id: "cfgs" }) : null,
@@ -703,6 +719,7 @@ listen("message", ({ payload: m }) => {
   if (S.live[k]) { S.live[k].el.remove(); delete S.live[k]; }
   const head = S.ov.heads.find((x) => x.thread === m.thread);
   if (head) Object.assign(head, m); else S.ov.heads.unshift(m);
+  if (S.thread !== m.thread && m.author !== "me") S.unread[m.thread] = (S.unread[m.thread] ?? 0) + 1;
   if (Array.isArray(S.msgs[m.thread])) S.msgs[m.thread].push({ author: m.author, body: m.body, ts: m.ts });
   if (S.thread === m.thread) {
     const pending = m.author === "me" && [...document.querySelectorAll("#log .m.pending")].find((e) => e.dataset.body === m.body.trim());
@@ -773,15 +790,19 @@ async function renderGallery() {
   const [found, envs] = S.found;
   S.envs = envs;
   const have = found.filter((t) => t.found), miss = found.filter((t) => !t.found);
-  const list = h("div", { class: "alist" },
-    ...have.map((t) => agentRow({ ...t, kind: "acp" }, shortPath(t.found))),
-    agentRow({ id: "command", name: "其他本地 agent", kind: "command", color: "#8a8a8e", letter: "›" }, "任意支持 ACP 的程序"),
-    agentRow({ id: "invite", name: "朋友的邀请码", kind: "invite", color: "#10a37f", letter: "@" }, "接入别人通过 Disco 共享的 agent"),
-    agentRow({ id: "a2a", name: "远程 A2A agent", kind: "a2a", color: "#5865f2", letter: "A" }, "通过 URL 接入"));
+  const here = IS_WIN ? "这台电脑" : "这台 Mac";
+  const found2 = have.length ? [h("div", { class: "asec" }, `${here}上检测到`, h("i", {}, String(have.length))),
+    h("div", { class: "alist" }, ...have.map((t) => agentRow({ ...t, kind: "acp" }, t.found)))] : [];
+  const more = h("div", { class: "alist" },
+    agentRow({ id: "command", name: "其他本地 agent", kind: "command" }, "任意支持 ACP 的程序"),
+    agentRow({ id: "invite", name: "朋友的邀请码", kind: "invite" }, "接入别人通过 Disco 共享的 agent"),
+    agentRow({ id: "a2a", name: "远程 A2A agent", kind: "a2a" }, "通过 URL 接入"));
   page.replaceChildren(h("h1", {}, "添加 Agent"),
-    h("p", {}, have.length ? `在这台${IS_WIN ? "电脑" : " Mac "}上找到 ${have.length} 个。点「导入」一步完成，点整行可调目录和环境。` : `没在这台${IS_WIN ? "电脑" : " Mac "}上找到已安装的 agent，可以手动添加。`),
-    list,
-    miss.length ? h("p", { class: "muted" }, `装好后会自动出现：${miss.map((t) => t.name).join(" · ")}`) : "");
+    h("p", { class: "lead" }, have.length ? "点「导入」一步完成，直接沿用终端里的登录和模型；点整行可以调目录和环境。" : `没在${here}上找到已安装的 agent，可以手动添加。`),
+    ...found2, h("div", { class: "asec" }, "更多接入方式"), more,
+    miss.length ? h("div", { class: "callout" }, h("span", {}, "装好后会自动出现"),
+      h("div", { class: "pills" }, ...miss.map((t) => h("button", { class: "tpill", title: INSTALL[t.id] ? `复制安装命令：${INSTALL[t.id]}` : t.name,
+        onclick: () => INSTALL[t.id] && copy(INSTALL[t.id], `已复制：${INSTALL[t.id]}`) }, brandIcon(t.id, true), t.name)))) : "");
 }
 function agentRow(t, sub) {
   const row = h("div", { class: "arow" });
@@ -791,11 +812,35 @@ function agentRow(t, sub) {
     if (open && !row.querySelector(".aform")) row.append(agentForm(t));
     if (open) row.querySelector(".aform input")?.focus();
   } },
-    Object.assign(h("div", { class: "av" }, t.letter ?? t.name[0].toUpperCase()), { style: `background:${t.color}` }),
-    h("div", { class: "ameta" }, h("b", {}, t.name), h("small", {}, sub)),
-    h("span", { class: "aplus", onclick: t.kind === "acp" ? (e) => { e.stopPropagation(); quickImport(t, e.currentTarget); } : null }, t.kind === "acp" ? "导入" : "添加"));
+    brandIcon(t.kind === "acp" ? t.id : t.kind),
+    h("div", { class: "ameta" }, h("b", {}, t.name), t.kind === "acp" ? h("code", { class: "path", title: sub }, shortPath(sub)) : h("small", {}, sub)),
+    h("span", { class: `aplus${t.kind === "acp" ? " pri" : ""}`, onclick: t.kind === "acp" ? (e) => { e.stopPropagation(); quickImport(t, e.currentTarget); } : null }, t.kind === "acp" ? "导入" : "添加"));
   row.append(head);
   return row;
+}
+// Install commands for the pills under "更多": click copies one.
+const INSTALL = { gemini: "npm i -g @google/gemini-cli", qwen: "npm i -g @qwen-code/qwen-code", goose: "brew install block-goose-cli",
+  opencode: "npm i -g opencode-ai", "claude-code": "npm i -g @anthropic-ai/claude-code", codex: "npm i -g @openai/codex", pi: "npm i -g @earendil-works/pi-coding-agent" };
+function copy(text, msg) { navigator.clipboard?.writeText(text).then(() => toast(msg, 2000), () => toast(text)); }
+// Small drawn marks for known agents (our own glyphs in each tool's colour), line icons for the rest.
+const MARKS = {
+  "claude-code": ["#d97757", '<g stroke-width="2.2">' + [0, 30, 60, 90, 120, 150].map((d) => `<path d="M12 4.5v15" transform="rotate(${d} 12 12)"/>`).join("") + "</g>"],
+  codex: ["#111827", '<path d="m7 9 3 3-3 3M12.5 15.5h4.5"/><rect x="3.5" y="5" width="17" height="14" rx="3.5"/>'],
+  hermes: ["#7c5cff", '<path d="M12 19V8M12 8c-2.5-3-6-3.5-8-2.5 1.5 2 4 3.5 8 3.5M12 8c2.5-3 6-3.5 8-2.5-1.5 2-4 3.5-8 3.5"/><circle cx="12" cy="6" r="1.4"/>'],
+  pi: ["#0f766e", '<path d="M5.5 8h13M9.5 8v9M14.5 8v6.5c0 1.6.8 2.5 2.4 2.5"/>'],
+  gemini: ["#3b82f6", '<path d="M12 3c.8 4.8 4.2 8.2 9 9-4.8.8-8.2 4.2-9 9-.8-4.8-4.2-8.2-9-9 4.8-.8 8.2-4.2 9-9z"/>'],
+  qwen: ["#6d28d9", '<path d="M12 3.5 19.5 8v8L12 20.5 4.5 16V8z"/><path d="M12 12h4"/>'],
+  goose: ["#111827", '<path d="M8 19c0-4 1-6 4-8V6.5a2.5 2.5 0 0 1 5 0V8h2.5M12 11c3 1 5 3 5 8"/>'],
+  opencode: ["#334155", '<path d="m9 7-5 5 5 5M15 7l5 5-5 5"/>'],
+  dsh: ["#475569", '<path d="M5 8l4 4-4 4M11 17h8"/>'],
+  command: ["#64748b", '<path d="m6.5 8 4 4-4 4M12.5 16.5h5"/>'],
+  invite: ["#10a37f", '<circle cx="12" cy="12" r="3.6"/><path d="M15.6 12v1.4a2.5 2.5 0 0 0 5 0V12a8.6 8.6 0 1 0-3.4 6.9"/>'],
+  a2a: ["#5865f2", '<circle cx="6" cy="12" r="2.5"/><circle cx="18" cy="12" r="2.5"/><path d="M8.5 12h7M12 6.5c2 0 4 1 5.5 3.2M12 17.5c-2 0-4-1-5.5-3.2"/>'],
+};
+function brandIcon(id, small = false) {
+  const [c0, svg] = MARKS[id] ?? ["#8a8a8e", '<path d="M12 4v16M4 12h16"/>'];
+  const c = BRAND[id] ?? c0;
+  return h("span", { class: `brand${small ? " sm" : ""}`, style: `--b:${c}`, html: `<svg viewBox="0 0 24 24">${svg}</svg>` });
 }
 // One click: import a detected agent with default settings and open its chat.
 async function quickImport(t, btn) {
@@ -1140,7 +1185,7 @@ function blank() {
   const box = h("div", { class: "blank" }, h("div", { class: "logo" }, h("img", { src: "logo.png", alt: "" }), h("i"), h("i"), h("i")), h("b", {}, "Disco"),
     none ? h("p", {}, "正在找这台电脑上的 agent…") : h("p", {}, "选一个会话开始"),
     none ? null : h("div", { class: "keys" },
-      h("span", {}, h("kbd", {}, `${MOD}K`), " 搜索"), h("span", {}, h("kbd", {}, `${MOD}1–5`), " 切换"), h("span", {}, h("kbd", {}, `${MOD}N`), " 新建")));
+      h("span", {}, h("kbd", {}, `${MOD}K`), " 搜索"), h("span", {}, h("kbd", {}, `${MOD}1–4`), " 切换"), h("span", {}, h("kbd", {}, IS_WIN ? "Ctrl+," : "⌘,"), " 设置"), h("span", {}, h("kbd", {}, `${MOD}N`), " 新建")));
   $("#pane").replaceChildren(box);
   renderList();
   if (none) firstRun(box);
@@ -1165,10 +1210,21 @@ function setTab(tab) {
 }
 document.querySelectorAll(".tab").forEach((b) => b.addEventListener("click", () => setTab(b.dataset.tab)));
 $("#list-add").onclick = () => (S.tab === "agents" ? renderGallery() : groupDialog(null));
+$("#search-kbd").textContent = `${MOD}K`;
 $("#search").oninput = (e) => { S.q = e.target.value; renderList(); };
+// Emergency stop lives in a status pill and needs two clicks, so reaching for 设置 never stops everything.
+let killArm = 0;
+function drawKill() {
+  const k = $("#kill"), armed = !!killArm, paused = !!S.ov?.paused;
+  k.className = paused ? "paused" : armed ? "armed" : "";
+  k.querySelector("small").textContent = paused ? "已停止" : armed ? "再点停止" : "运行中";
+  k.title = paused ? "已全部停止，点一下恢复" : "运行中。点两下：全部停止所有 agent";
+}
 $("#kill").onclick = async () => {
-  if (S.ov.paused) { await invoke("resume"); await load(); toast("已恢复", 1500); return; }
-  const n = await invoke("stop_all"); await load();
+  if (S.ov.paused) { await invoke("resume"); await load(); drawKill(); toast("已恢复", 1500); return; }
+  if (!killArm) { killArm = setTimeout(() => { killArm = 0; drawKill(); }, 2500); drawKill(); return; }
+  clearTimeout(killArm); killArm = 0;
+  const n = await invoke("stop_all"); await load(); drawKill();
   toast(`已停止 ${n} 个 agent，新消息暂不转发`, 6000, ["恢复", async () => { await invoke("resume"); await load(); }]);
 };
 $("#resume").onclick = async () => { await invoke("resume"); await load(); };
@@ -1179,7 +1235,8 @@ addEventListener("keydown", (e) => {
   const mod = e.metaKey || e.ctrlKey;
   const typingInField = /^(INPUT|TEXTAREA|SELECT)$/.test(document.activeElement?.tagName) || document.activeElement?.isContentEditable;
   if (mod && e.key.toLowerCase() === "k") { e.preventDefault(); $("#search").focus(); $("#search").select(); return; }
-  if (mod && /^[1-5]$/.test(e.key)) { e.preventDefault(); setTab(["chats", "groups", "agents", "inbox", "settings"][e.key - 1]); return; }
+  if (mod && /^[1-4]$/.test(e.key)) { e.preventDefault(); setTab(["chats", "groups", "agents", "inbox"][e.key - 1]); return; }
+  if (mod && e.key === ",") { e.preventDefault(); setTab("settings"); return; }
   if (mod && e.key.toLowerCase() === "n") { e.preventDefault(); if (S.tab === "agents") renderGallery(); else groupDialog(null); return; }
   if (!mod && !e.altKey && !typingInField && e.key.length === 1 && $("#input") && !$("#dlg").open) $("#input").focus();
 });
