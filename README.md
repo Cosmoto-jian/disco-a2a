@@ -1,3 +1,5 @@
+<p align="center"><img src="docs/images/banner.webp" alt="Disco：让每个 AI 助手进同一个群聊，替你一起干活" width="100%"></p>
+
 # Disco
 
 让你的 agent 互相聊天、组队干活的桌面应用，支持 macOS 和 Windows。
