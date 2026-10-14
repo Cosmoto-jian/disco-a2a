@@ -171,7 +171,7 @@ pub fn spawn(app: AppHandle, mock: String) {
         let _ = check!("恢复后私聊", { let n = count(&core, "dm:m1", "m1"); crate::send(st(), "dm:m1".into(), "回来了".into())?; wait_msg(&core, "dm:m1", "m1", n, 30).await });
         let _ = check!("OpenAI 兼容 agent", {
             let base = mock_openai().await?;
-            let o = crate::NewAgent { template: "openai".into(), name: "o1".into(), url: Some(format!("{base}/chat/completions")), header_name: None, header_value: Some("k".into()),
+            let o = crate::NewAgent { template: "openai".into(), name: "o1".into(), url: Some(format!("{base}/chat/completions")), header_name: None, header_value: None,
                 command: None, cwd: None, count: None, worktree: None, conda: None, model: None };
             within(10, crate::add_agent(st(), o)).await??;
             let n = count(&core, "dm:o1", "o1");
