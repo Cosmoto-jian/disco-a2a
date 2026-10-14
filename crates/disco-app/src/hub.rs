@@ -416,16 +416,34 @@ fn login_path() -> String {
 fn login_env() -> (String, Vec<(String, String)>) {
     const MARK: &str = "__DISCO_ENV__";
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".into());
-    let (tx, rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        let out = std::process::Command::new(shell)
-            .args(["-ilc", &format!("printf '{MARK}'; env -0")])
-            .stdin(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .output();
-        let _ = tx.send(out.ok().map(|o| String::from_utf8_lossy(&o.stdout).into_owned()).unwrap_or_default());
-    });
-    let raw = rx.recv_timeout(std::time::Duration::from_secs(4)).unwrap_or_default();
+    use std::os::unix::process::CommandExt;
+    // Its own process group, so an interactive shell can never take over the terminal
+    // Disco was started from; killed as a group if it doesn't answer in time.
+    let child = std::process::Command::new(shell)
+        .args(["-ilc", &format!("printf '{MARK}'; env -0")])
+        .process_group(0)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn();
+    let raw = match child {
+        Ok(mut child) => {
+            let pid = child.id();
+            let mut stdout = child.stdout.take();
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let mut buf = Vec::new();
+                if let Some(o) = stdout.as_mut() { let _ = std::io::Read::read_to_end(o, &mut buf); }
+                let _ = tx.send(String::from_utf8_lossy(&buf).into_owned());
+            });
+            let raw = rx.recv_timeout(std::time::Duration::from_secs(4)).unwrap_or_default();
+            let _ = std::process::Command::new("kill").args(["-KILL", &format!("-{pid}")])
+                .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).status();
+            let _ = child.wait();
+            raw
+        }
+        Err(_) => String::new(),
+    };
     let vars = parse_env(raw.rsplit_once(MARK).map(|(_, e)| e).unwrap_or(""));
     let shell_path = vars.iter().find(|(k, _)| k == "PATH").map(|(_, v)| v.clone()).unwrap_or_default();
     let keep = vars.into_iter().filter(|(k, _)| k != "PATH" && !SHELL_ONLY.contains(&k.as_str()) && !k.starts_with("TERM")).collect();
@@ -544,6 +562,14 @@ mod env_tests {
     fn parses_env_dump() {
         let v = super::parse_env("A=1\0MULTI=x\ny\0BAD\0=skip\0B=a=b\0");
         assert_eq!(v, vec![("A".into(), "1".into()), ("MULTI".into(), "x\ny".into()), ("B".into(), "a=b".into())]);
+    }
+
+    #[test]
+    fn reads_login_shell_env_quickly() {
+        let t = std::time::Instant::now();
+        let (path, vars) = super::login_env();
+        assert!(!path.is_empty() && t.elapsed().as_secs() < 6, "{:?}", t.elapsed());
+        assert!(vars.iter().all(|(k, _)| k != "PATH" && k != "PWD"));
     }
 
     #[test]
