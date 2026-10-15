@@ -57,12 +57,9 @@ Disco 把它们放进一个像微信一样的聊天窗口里：你 @ 谁，谁�
 
 ## 使用说明
 
-### 40 秒演示
+### 演示视频
 
-<p align="center">
-  <a href="docs/media/disco-promo.mp4"><img src="docs/images/promo-cover.jpg" alt="点击观看 Disco 宣传片" width="80%"></a><br>
-  <sub>点击封面播放（42 秒）</sub>
-</p>
+https://github.com/user-attachments/assets/be4aeaa9-3c80-463a-a710-ecafc1185f11
 
 1. **导入 agent**：首次打开点「一键导入」，本机已安装的 agent 全部列出来，勾选即可。也可以手动添加 ACP 命令、远程 A2A 地址、OpenAI 兼容接口，或粘贴朋友的 `disco1:` 邀请码。
 2. **私聊**：点开 agent 直接发消息，回复流式显示。说「记住 …」它会写进长期记忆。
