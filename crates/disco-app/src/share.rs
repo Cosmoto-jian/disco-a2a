@@ -257,7 +257,11 @@ fn router(core: Arc<Core>) -> axum::Router {
         .layer(middleware::from_fn_with_state(core, guard))
 }
 
-fn deny(code: StatusCode, msg: &str) -> Response { (code, msg.to_owned()).into_response() }
+/// A refusal the guest's A2A client can read: a JSON-RPC error, not plain text.
+fn deny(code: StatusCode, msg: &str) -> Response {
+    let body = serde_json::json!({ "jsonrpc": "2.0", "id": null, "error": { "code": -32001, "message": msg } });
+    (code, [(header::CONTENT_TYPE, "application/json")], body.to_string()).into_response()
+}
 
 /// Tailnet/loopback only; the device must pass the access policy (when Tailscale
 /// can say who it is); per-share bearer token; only message methods.
@@ -281,11 +285,11 @@ async fn guard(State(core): State<Arc<Core>>, ConnectInfo(peer): ConnectInfo<Soc
     let Some(rest) = path.strip_prefix("/a/") else { return deny(StatusCode::NOT_FOUND, "not found") };
     let (id, tail) = rest.split_once('/').unwrap_or((rest, ""));
     let id = id.to_owned();
-    if core.share(&id).is_none() { return deny(StatusCode::NOT_FOUND, "no such share"); }
+    if core.share(&id).is_none() { return deny(StatusCode::NOT_FOUND, "对方已撤销这个共享"); }
     if tail == ".well-known/agent-card.json" { return next.run(req).await; }
     let token = req.headers().get(header::AUTHORIZATION).and_then(|v| v.to_str().ok()).and_then(|v| v.strip_prefix("Bearer ")).unwrap_or("");
     let ok = secret_get(&format!("share/{id}")).is_some_and(|t| eq_ct(t.as_bytes(), token.as_bytes()));
-    if !ok { return deny(StatusCode::UNAUTHORIZED, "bad token"); }
+    if !ok { return deny(StatusCode::UNAUTHORIZED, "邀请码已失效，请让对方重新发一个"); }
     let (mut parts, body) = req.into_parts();
     let Ok(bytes) = to_bytes(body, 1 << 20).await else { return deny(StatusCode::PAYLOAD_TOO_LARGE, "too large") };
     let method = serde_json::from_slice::<serde_json::Value>(&bytes).ok().and_then(|v| v["method"].as_str().map(str::to_owned)).unwrap_or_default();
@@ -298,7 +302,7 @@ async fn guard(State(core): State<Arc<Core>>, ConnectInfo(peer): ConnectInfo<Soc
 }
 
 async fn card(State(core): State<Arc<Core>>, axum::extract::Path(id): axum::extract::Path<String>, headers: axum::http::HeaderMap) -> Response {
-    let Some(s) = core.share(&id) else { return deny(StatusCode::NOT_FOUND, "no such share") };
+    let Some(s) = core.share(&id) else { return deny(StatusCode::NOT_FOUND, "对方已撤销这个共享") };
     let host = headers.get(header::HOST).and_then(|v| v.to_str().ok()).unwrap_or("127.0.0.1");
     let card = AgentCard {
         name: s.agent.clone(), description: format!("{} 通过 Disco 共享的 {}", owner_name(), s.agent), version: a2a::VERSION.into(), provider: None,

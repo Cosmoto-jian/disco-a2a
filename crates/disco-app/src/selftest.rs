@@ -203,7 +203,7 @@ pub fn spawn(app: AppHandle, mock: String) {
             let id = core.shares().into_iter().find(|(_, s)| s.agent == "m1").map(|(id, _)| id).ok_or("找不到共享")?;
             crate::share::revoke_share(st(), id);
             let n = count(&core, "dm:guest1", "system"); crate::send(st(), "dm:guest1".into(), "还在吗".into())?;
-            wait_msg(&core, "dm:guest1", "system", n, 30).await });
+            wait_msg(&core, "dm:guest1", "system", n, 30).await.and_then(|b| if b.contains("撤销") { Ok(b) } else { Err(b) }) });
         let _ = within(10, crate::remove_agent(st(), "guest1".into(), Some(true))).await;
         let _ = check!("发文件到共享空间", {
             let f = std::env::temp_dir().join("disco-selftest.txt"); std::fs::write(&f, "hello").map_err(|e| e.to_string())?;
