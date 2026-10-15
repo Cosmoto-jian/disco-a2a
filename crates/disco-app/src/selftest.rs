@@ -166,6 +166,8 @@ pub fn spawn(app: AppHandle, mock: String) {
         let _ = check!("agent_commands", within(5, crate::agent_commands(st(), "m1".into())).await.and_then(|r| r.map(|v| format!("{} 个", v.len()))));
         let _ = check!("rename", within(20, crate::rename_agent(st(), "m2".into(), "m3".into())).await.and_then(|r| r).map(|_| String::new()));
         let _ = check!("改名后群聊", { let n = count(&core, &gt, "m3"); crate::send(st(), gt.clone(), "@m3 改名了".into())?; wait_msg(&core, &gt, "m3", n, 30).await });
+        let _ = check!("重启 agent 后还能聊", { within(10, crate::restart_agent(st(), "m1".into())).await??;
+            let n = count(&core, "dm:m1", "m1"); crate::send(st(), "dm:m1".into(), "重启后".into())?; wait_msg(&core, "dm:m1", "m1", n, 30).await });
         let _ = check!("stop_all", within(10, crate::stop_all(st())).await.and_then(|r| r).map(|n| format!("{n}")));
         crate::resume(st());
         let _ = check!("恢复后私聊", { let n = count(&core, "dm:m1", "m1"); crate::send(st(), "dm:m1".into(), "回来了".into())?; wait_msg(&core, "dm:m1", "m1", n, 30).await });
@@ -191,6 +193,28 @@ pub fn spawn(app: AppHandle, mock: String) {
             if m.is_empty() { return Err("没连 Discord 却被当成可以说话".into()); }
             if core.peer_say("st", "hi").await.is_ok() { return Err("没确认就发出去了".into()); }
             Ok(m) });
+        // Sharing end to end over loopback: invite → the guest's remote agent → our m1 answers.
+        let _ = check!("共享 邀请码接入后能聊", {
+            let code = crate::share::create_share(st(), "m1".into(), "小王".into(), "chat".into(), 0)?;
+            let guest = within(20, crate::share::accept_invite(st(), code, Some("guest1".into()))).await??;
+            let n = count(&core, "dm:guest1", "guest1"); crate::send(st(), "dm:guest1".into(), "你好".into())?;
+            wait_msg(&core, "dm:guest1", "guest1", n, 40).await.and_then(|b| if b.contains("hello from mock") { Ok(guest) } else { Err(b) }) });
+        let _ = check!("共享 撤销后被拒", {
+            let id = core.shares().into_iter().find(|(_, s)| s.agent == "m1").map(|(id, _)| id).ok_or("找不到共享")?;
+            crate::share::revoke_share(st(), id);
+            let n = count(&core, "dm:guest1", "system"); crate::send(st(), "dm:guest1".into(), "还在吗".into())?;
+            wait_msg(&core, "dm:guest1", "system", n, 30).await });
+        let _ = within(10, crate::remove_agent(st(), "guest1".into(), Some(true))).await;
+        let _ = check!("发文件到共享空间", {
+            let f = std::env::temp_dir().join("disco-selftest.txt"); std::fs::write(&f, "hello").map_err(|e| e.to_string())?;
+            within(10, crate::send_file(st(), gt.clone(), f.display().to_string(), None)).await? });
+        let _ = check!("/team 分工到完成", {
+            let tid = within(10, crate::save_group(st(), None, None, "team".into(), vec!["m1".into(), "m3".into()], Some("m1".into()))).await??;
+            let tt = format!("group:{tid}"); crate::send(st(), tt.clone(), "/team 写一个加法函数".into())?;
+            within(120, async { loop {
+                if let Some(s) = core.team_state(&tt).filter(|s| s.stage == "done" || s.stage == "failed") { return s; }
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            } }).await.and_then(|s| if s.stage == "done" { Ok(format!("{} 人", s.roles.len())) } else { Err(s.stage.to_string()) }) });
         let bad = crate::NewAgent { command: Some("/nonexistent/agent --acp".into()), ..spec("bad") };
         let _ = check!("自检提示", { within(10, crate::add_agent(st(), bad)).await??; wait_msg(&core, "dm:bad", "system", 0, 10).await });
         let _ = check!("remove_agent", within(10, crate::remove_agent(st(), "bad".into(), Some(true))).await.and_then(|r| r).map(|_| String::new()));

@@ -129,8 +129,12 @@ impl Core {
             let s = self.server.lock().unwrap_or_else(|p| p.into_inner());
             s.port.ok_or_else(|| s.error.clone().unwrap_or_else(|| "共享服务未启动".into()))?
         };
-        let me = crate::tailnet::me().ok_or("没检测到 Tailscale：请先安装 Tailscale 并登录，再回来生成邀请")?;
-        Ok(format!("http://{}:{port}", me.node))
+        let host = match crate::tailnet::me() {
+            Some(me) => me.node,
+            None if crate::selftest_mode() => "127.0.0.1".into(),
+            None => return Err("没检测到 Tailscale：请先安装 Tailscale 并登录，再回来生成邀请".into()),
+        };
+        Ok(format!("http://{host}:{port}"))
     }
 
     /// Run one guest message as a turn of the shared agent. The owner sees it live

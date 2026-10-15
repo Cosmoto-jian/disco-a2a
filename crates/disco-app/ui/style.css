@@ -542,6 +542,8 @@ input[type=number].fld.t { width:64px; }
 #items li.card .name-row { display:flex; align-items:center; min-width:0; }
 .acts { display:flex; gap:2px; flex:none; opacity:0; transition:opacity .15s; }
 #items li.card:hover .acts, #items li.card.on .acts { opacity:1; }
+#items li.card .acts { width:0; overflow:hidden; } #items li.card:hover .acts, #items li.card.on .acts { width:auto; }
+#items li.card:hover .busy-tag, #items li.card.on .busy-tag { display:none; }
 .acts button { width:26px; height:26px; border:0; border-radius:7px; background:none; color:var(--mute); display:grid; place-items:center; padding:0; }
 .acts button:hover { background:var(--hover); color:var(--fg); }
 .acts svg { width:15px; height:15px; stroke-width:1.9; }

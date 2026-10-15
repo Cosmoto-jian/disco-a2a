@@ -202,8 +202,8 @@ function drawList() {
       h("div", { class: "meta" },
         h("div", { class: "name-row" }, h("span", { class: "name" }, a.name), a.kind === "acp" && OFFICIAL.has(a.template) ? h("span", { class: "tag" }, "官方") : null),
         h("div", { class: "sub" }, a.kind === "acp" ? shortPath(a.detail) : a.detail)),
-      busy.has(a.name) ? h("span", { class: "busy-tag" }, "回复中") : h("div", { class: "acts" },
-        act("更换形象", '<path d="M12 3.5l2.2 5.3 5.3 2.2-5.3 2.2L12 18.5l-2.2-5.3L4.5 11l5.3-2.2z"/>', () => avatarDialog(a.name)),
+      busy.has(a.name) ? h("span", { class: "busy-tag" }, "回复中") : null, h("div", { class: "acts" },
+        act("重启", '<path d="M19.5 12a7.5 7.5 0 1 1-2.2-5.3M19.5 4.5v4h-4"/>', () => restartAgent(a.name)),
         a.kind !== "a2a" ? act("共享给朋友", '<circle cx="6" cy="12" r="2.5"/><circle cx="18" cy="6" r="2.5"/><circle cx="18" cy="18" r="2.5"/><path d="m8.2 10.8 7.6-3.6M8.2 13.2l7.6 3.6"/>', () => shareDialog(a.name)) : null,
         act("更多", '<circle cx="5.5" cy="12" r=".9"/><circle cx="12" cy="12" r=".9"/><circle cx="18.5" cy="12" r=".9"/>', (el) => agentMenu(el, a.name)))));
   } else {
@@ -269,7 +269,7 @@ async function openThread(t) {
       !peer ? h("button", { class: "btn space-btn", title: "待办和群文档（agent 也能读写）", onclick: () => toggleSpace(t) }, "待办", h("span", { class: "count", id: "todo-count" })) : null,
       isGroup ? h("button", { class: "btn primary", onclick: () => groupDialog(g) }, "成员") : null,
       a ? h("button", { class: "icon-btn", title: "更多", onclick: (e) => agentMenu(e.currentTarget, a.name) }, "⋯") : null),
-    isGroup ? modeBar(t, g) : null,
+    ...(isGroup ? [modeBar(t, g)] : []),
     h("div", { id: "log" }),
     peer && !peer.talk ? h("div", { class: "peer-note" }, peer.group ? `对方在同步到 Discord 的群里用你的 agent。${peer.missing}` : "你现在只能旁观。想一起聊：对方建一个同步到 Discord 的群，拉你和你的 Bot 进去，再在群里 @ 一次你的 agent，这里就会变成聊天。") : h("div", { id: "composer" },
       peer ? null : h("button", { class: "attach", type: "button", title: "放一个文件到共享空间，agent 都能读到", onclick: () => attachFile(t) },
@@ -578,6 +578,17 @@ function popover(anchor, items) {
   const esc = (e) => { if (e.key === "Escape") close(); };
   addEventListener("mousedown", out, true); addEventListener("keydown", esc, true);
 }
+// Restart: a fresh process re-reads login, model and MCP setup; replies in flight end.
+async function restartAgent(name) {
+  try {
+    await invoke("restart_agent", { name });
+    for (const [t, set] of Object.entries(S.typing)) if (set.delete(name)) setStatus(t, name, null);
+    for (const k of Object.keys(S.live)) if (k.endsWith(`|${name}`)) { S.live[k].on = false; S.live[k].b.classList.remove("streaming"); if (!S.live[k].text) S.live[k].el.remove(); delete S.live[k]; }
+    if (S.thread) syncComposer();
+    drawKill(); toast(`${name} 正在重启`, 2000);
+    setTimeout(load, 1500);
+  } catch (e) { toast(e); }
+}
 function agentMenu(anchor, name) {
   const local = S.ov.agents.find((a) => a.name === name)?.kind !== "a2a";
   popover(anchor, [
@@ -587,6 +598,7 @@ function agentMenu(anchor, name) {
       if (S.thread !== `dm:${name}`) { setTab("chats"); await openThread(`dm:${name}`); }
       const h2 = $(".head h2"); if (h2) inlineRename(h2, name);
     } },
+    { label: "重启", run: () => restartAgent(name) },
     { label: "删除 Agent…", danger: true, run: () => removeAgent(name) },
   ]);
 }

@@ -72,15 +72,18 @@ fn keychain(account: &str) -> Option<keyring::Entry> {
     keyring::Entry::new(KEYCHAIN_SERVICE, account).ok()
 }
 
+/// Debug self test: secrets stay in memory and shares are served on loopback.
+pub(crate) fn selftest_mode() -> bool { cfg!(debug_assertions) && std::env::var_os("DISCO_SELFTEST").is_some() }
+
 fn with_vault<R>(f: impl FnOnce(&mut std::collections::HashMap<String, String>) -> R) -> R {
     let mut guard = VAULT.lock().unwrap_or_else(|p| p.into_inner());
     let map = guard.get_or_insert_with(|| {
-        let mut m: std::collections::HashMap<String, String> = vault_read()
+        let mut m: std::collections::HashMap<String, String> = (!selftest_mode()).then(vault_read).flatten()
             .and_then(|j| serde_json::from_str(&j).ok())
             .unwrap_or_default();
         // One-time move of the bot token from the per-item layout used before v0.4.1.
         if !m.contains_key("migrated") {
-            if let Some(t) = keychain(DISCORD_KEY).and_then(|e| e.get_password().ok()) { m.insert(DISCORD_KEY.into(), t); }
+            if let Some(t) = (!selftest_mode()).then(|| keychain(DISCORD_KEY)).flatten().and_then(|e| e.get_password().ok()) { m.insert(DISCORD_KEY.into(), t); }
             m.insert("migrated".into(), "1".into());
             let _ = persist_vault(&m);
         }
@@ -90,6 +93,7 @@ fn with_vault<R>(f: impl FnOnce(&mut std::collections::HashMap<String, String>) 
 }
 
 fn persist_vault(m: &std::collections::HashMap<String, String>) -> CmdResult<()> {
+    if selftest_mode() { return Ok(()); }
     vault_write(&serde_json::to_string(m).map_err(err)?)
 }
 
@@ -1095,6 +1099,18 @@ async fn remove_agent(core: St<'_>, name: String, purge: Option<bool>) -> CmdRes
     Ok(())
 }
 
+/// Restart an agent: stop its process (replies in flight end) and start a fresh one,
+/// which re-reads its login, model and MCP setup.
+#[tauri::command]
+async fn restart_agent(core: St<'_>, name: String) -> CmdResult<()> {
+    core.agent(&name)?;
+    core.hub.drop_agent(&name).await;
+    core.forget_sessions(Some(&name));
+    let _ = core.db().audit("user", Some(&name), "restart_agent", "ok");
+    core.inner().warm(Some(vec![name]));
+    Ok(())
+}
+
 /// Pick an agent's avatar (`<form>.<palette>`, both short ASCII words; "" = automatic).
 #[tauri::command]
 fn set_avatar(core: St<'_>, name: String, avatar: String) -> CmdResult<()> {
@@ -1604,7 +1620,7 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
-            overview, detect_agents, conda_envs, choose_path, memories, forget, add_agent, remove_agent, rename_agent, set_avatar, stop_reply, messages, send, inbox, inbox_answer, net_policy, net_policy_set, send_file, team_state, team_files, agent_configs, set_agent_config,
+            overview, detect_agents, conda_envs, choose_path, memories, forget, add_agent, remove_agent, rename_agent, restart_agent, set_avatar, stop_reply, messages, send, inbox, inbox_answer, net_policy, net_policy_set, send_file, team_state, team_files, agent_configs, set_agent_config,
             stop_all, resume, save_discord_token, discord_connect, discord_settings, discord_sync, diagnose, open_url, reveal_path, discord_channels, save_group, delete_group, restore_group, memory_restore, set_memory, agent_commands,
             check_update, install_update, space, todo_new, todo_set, todo_remove, doc_save, reveal_doc, share::share_status, share::peer_check, share::create_share, share::share_invite, share::revoke_share, share::accept_invite
         ])
