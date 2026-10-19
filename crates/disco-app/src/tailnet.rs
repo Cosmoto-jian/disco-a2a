@@ -174,6 +174,15 @@ pub fn nodes() -> Vec<Node> {
     v
 }
 
+/// This machine's own Tailscale addresses (v4 and v6), as Tailscale reports them
+/// while it is running. Never guessed from interfaces: 100.64/10 is also carrier NAT.
+pub fn my_ips() -> Vec<IpAddr> { status().map(|st| self_ips(&st)).unwrap_or_default() }
+
+fn self_ips(st: &Value) -> Vec<IpAddr> {
+    if st["BackendState"].as_str() != Some("Running") { return vec![]; }
+    st["Self"]["TailscaleIPs"].as_array().into_iter().flatten().filter_map(|v| v.as_str()?.parse().ok()).filter(is_tailnet).collect()
+}
+
 /// This Mac on the tailnet.
 pub fn me() -> Option<Node> {
     if let Some(n) = nodes().into_iter().find(|n| n.me) { return Some(n); }
@@ -247,6 +256,14 @@ mod tests {
         assert!(p.quiet_at(23 * 60 + 5) && p.quiet_at(60) && !p.quiet_at(12 * 60));
         assert!(!Policy::default().quiet_at(60));
         assert!(Policy { quiet_start: "25:00".into(), ..Default::default() }.cleaned().is_err());
+    }
+
+    #[test]
+    fn own_ips_only_while_running() {
+        let st = serde_json::json!({ "BackendState": "Running", "Self": { "TailscaleIPs": ["100.101.2.3", "fd7a:115c:a1e0::1", "8.8.8.8", "junk"] } });
+        assert_eq!(self_ips(&st), vec!["100.101.2.3".parse::<IpAddr>().unwrap(), "fd7a:115c:a1e0::1".parse().unwrap()]);
+        assert!(self_ips(&serde_json::json!({ "BackendState": "Stopped", "Self": st["Self"] })).is_empty());
+        assert!(self_ips(&serde_json::json!({})).is_empty());
     }
 
     #[test]

@@ -50,15 +50,16 @@ const FORMS = {
   tile: { label: "方块", svg: `<g class="spin slow">${PAD}<rect x="10" y="10" width="20" height="20" rx="4" opacity=".45"/></g><g class="spin rev">${PAD}<rect x="13.5" y="13.5" width="13" height="13" rx="3" transform="rotate(45 20 20)"/></g>` },
 };
 const FORM_KEYS = Object.keys(FORMS);
+const own = (o, k) => (Object.hasOwn(o, k) ? o[k] : undefined); // no inherited keys ("constructor")
 function avatarSpec(name) {
   const a = S.ov?.agents.find((a) => a.name === name);
   const [f, p] = (a?.avatar || "").split(".");
-  return { form: FORMS[f] ? f : FORM_KEYS[hash(name) % FORM_KEYS.length], palette: p in PALETTES ? p : "brand" };
+  return { form: own(FORMS, f) ? f : FORM_KEYS[hash(name) % FORM_KEYS.length], palette: Object.hasOwn(PALETTES, p ?? "") ? p : "brand" };
 }
 function paint(el, name, form, palette, base = colorOf(name)) {
-  const [c1, c2] = PALETTES[palette] ?? [`color-mix(in srgb, ${base} 70%, #fff)`, base];
+  const [c1, c2] = own(PALETTES, palette) ?? [`color-mix(in srgb, ${base} 70%, #fff)`, base];
   el.style.background = `linear-gradient(140deg, ${c1}, ${c2})`;
-  el.insertAdjacentHTML("afterbegin", `<svg viewBox="0 0 40 40" fill="#fff" aria-hidden="true">${(FORMS[form] ?? FORMS.orbit).svg}</svg>`);
+  el.insertAdjacentHTML("afterbegin", `<svg viewBox="0 0 40 40" fill="#fff" aria-hidden="true">${(own(FORMS, form) ?? FORMS.orbit).svg}</svg>`);
   el.dataset.form = form;
   return el;
 }
@@ -150,6 +151,7 @@ function ask(question, okText = "确定") {
       h("button", { class: "btn", type: "button", onclick: () => { d.close(); resolve(false); } }, "取消"),
       h("button", { class: "btn pri", type: "button", onclick: () => { d.close(); resolve(true); } }, okText)));
     form.onsubmit = (e) => e.preventDefault();
+    d.addEventListener("close", () => resolve(false), { once: true }); // Esc
     d.showModal();
   });
 }
@@ -254,10 +256,13 @@ function prefetch(t) {
 }
 async function openThread(t) {
   if (S.thread === t && $("#log")) return;
-  S.thread = t; delete S.unread[t]; renderList();
   const isGroup = t.startsWith("group:"); const name = threadName(t);
+  // Opened from a toast on 设置: leave settings so a status event can't repaint over the chat.
+  if (S.tab === "settings") { S.tab = isGroup ? "groups" : "chats"; document.querySelectorAll(".tab").forEach((b) => b.classList.toggle("on", b.dataset.tab === S.tab)); }
+  S.thread = t; delete S.unread[t]; renderList();
   const peer = peerOf(t);
   const g = isGroup && S.ov.groups.find((g) => `group:${g.id}` === t);
+  if (isGroup && !g) { blank(); renderList(); return; } // group was deleted
   const a = !isGroup && S.ov.agents.find((a) => a.name === name);
   const multi = isGroup && (g.people.length || g.guests.length);
   const sub = isGroup ? `${g.members.length} 个 agent${multi ? ` · ${g.people.length + 1} 人 · 多人群：@ 才回答` : ` · 组长 ${g.lead ?? "—"}`}` : peer ? `${peer.guest} 通过共享在用你的 ${peer.agent}` : a ? `${{ acp: "本机", openai: "模型 API" }[a.kind] ?? "A2A"} · ${a.detail}` : "";
@@ -387,6 +392,7 @@ function failed(el, e) {
   el.append(h("button", { class: "retry", type: "button", onclick: () => { el.remove(); resend(el.dataset.body); } }, "发送失败 · 重发"));
 }
 // "/" at the start (or after "@agent ") offers that agent's own commands; groups add their own.
+const CMD_MISS = {}; // agent → retry-after ms: don't re-ask an agent with no commands on every keystroke
 function slashPicker(ta, t) {
   let box = null, items = [], idx = 0, start = -1;
   const close = () => { box?.remove(); box = null; };
@@ -402,14 +408,18 @@ function slashPicker(ta, t) {
   }, h("span", { class: "mi" }, h("b", {}, `/${n}`), h("small", { class: "mute" }, d)))));
   ta.addEventListener("input", async () => {
     const before = ta.value.slice(0, ta.selectionStart);
-    const m = before.match(/^(?:@([\w-]+)\s+)?\/([\w-]*)$/);
+    const m = before.match(/^(?:@([\p{L}\p{N}_-]+)\s+)?\/([\p{L}\p{N}_-]*)$/u);
     if (!m) return close();
     const agent = m[1] ?? (group ? null : t.slice(3));
     start = ta.selectionStart - m[2].length - 1;
     let list = group && !agent ? GROUP_CMDS : [];
     if (agent && S.ov.agents.some((a) => a.name === agent && a.kind === "acp")) {
-      S.cmds[agent] ??= await invoke("agent_commands", { agent }).catch(() => []);
-      if (!S.cmds[agent].length) delete S.cmds[agent]; // not known yet: ask again next time
+      if (!S.cmds[agent] && !(CMD_MISS[agent] > Date.now())) {
+        const c = await invoke("agent_commands", { agent }).catch(() => []);
+        if (c.length) S.cmds[agent] = c; else CMD_MISS[agent] = Date.now() + 10000; // not known yet: ask again in 10s
+        // The user moved on while we waited (other chat, blur, more typing): don't pop a stale menu.
+        if (!ta.isConnected || document.activeElement !== ta || ta.value.slice(0, ta.selectionStart) !== before) return;
+      }
       list = S.cmds[agent] ?? [];
     }
     const q = m[2].toLowerCase();
@@ -493,7 +503,8 @@ async function loadSpace(t) {
   const add = h("input", { placeholder: "加一项待办，回车", class: "todo-in" });
   add.onkeydown = async (e) => {
     if (e.key !== "Enter" || composing(e) || !add.value.trim()) return;
-    try { await invoke("todo_new", { thread: t, text: add.value }); add.value = ""; } catch (er) { toast(er); }
+    const text = add.value; add.value = "";
+    try { await invoke("todo_new", { thread: t, text }); } catch (er) { if (!add.value) add.value = text; toast(er); }
   };
   const todos = h("ul", { class: "todos" }, ...sp.todos.map((x) => h("li", { class: x.done ? "done" : "" },
     h("input", { type: "checkbox", checked: x.done, onchange: (e) => invoke("todo_set", { thread: t, id: x.id, done: e.target.checked }).catch(toast) }),
@@ -517,7 +528,10 @@ async function loadSpace(t) {
       h("button", { class: "btn sm", title: sp.doc_path, onclick: () => invoke("reveal_doc", { thread: t }).catch(toast) }, IS_WIN ? "在资源管理器中显示" : "在访达中显示")),
     doc);
 }
-listen("space", ({ payload: t }) => { if (S.thread === t && !$("#space .doc-edit")) loadSpace(t); });
+listen("space", ({ payload: t }) => {
+  const ti = $("#space .todo-in"); // don't wipe a to-do being typed
+  if (S.thread === t && !$("#space .doc-edit") && !(ti && (ti.value || ti === document.activeElement))) loadSpace(t);
+});
 
 // Model picker: only the agent's own model list (ACP session config, category "model").
 async function loadConfigs(agent, t) {
@@ -656,7 +670,7 @@ function mentionPicker(ta, members) {
     class: `pop-item${i === idx ? " hl" : ""}`, onmousedown: (e) => { e.preventDefault(); pick(n); },
   }, h("span", { class: "mi" }, n === "all" ? h("span", { class: "mi-all" }, "@") : S.ov.agents.some((a) => a.name === n) ? avatar(n, { small: true }) : h("span", { class: "mi-all person" }, n[0].toUpperCase()), n === "all" ? "所有人" : n))));
   ta.addEventListener("input", () => {
-    const m = ta.value.slice(0, ta.selectionStart).match(/(^|\s)@([\w-]*)$/);
+    const m = ta.value.slice(0, ta.selectionStart).match(/(^|\s)@([\p{L}\p{N}_-]*)$/u);
     if (!m) return close();
     start = ta.selectionStart - m[2].length - 1;
     const q = m[2].toLowerCase();
@@ -837,7 +851,15 @@ listen("update-available", ({ payload: u }) => {
   if ($("#update-bar")) return;
   $("#items").before(h("div", { id: "update-bar" }, `新版本 ${u.version} 可用 `, h("button", { onclick: installUpdate }, "更新并重启")));
 });
-listen("discord-status", ({ payload }) => { if (S.ov) { S.ov.discord_status = payload; if (S.tab === "settings") renderSettings(); renderList(); } });
+listen("discord-status", ({ payload }) => {
+  if (!S.ov) return;
+  S.ov.discord_status = payload;
+  // Patch the status line in place: a full render would wipe half-typed inputs and rerun checks.
+  const el = $("#dc-status");
+  if (el) { el.className = `status${/^在线/.test(payload) ? " ok" : ""}`; el.replaceChildren(h("i"), payload); }
+  else if (S.tab === "settings") renderSettings();
+  renderList();
+});
 
 // ---------- agents page
 const shortPath = (p) => (p || "").replace(/^\/Users\/[^/]+/, "~");
@@ -1148,7 +1170,7 @@ function renderSettings() {
   $("#pane").replaceChildren(h("div", { class: "page" },
     h("h1", {}, "设置"), h("p", {}, IS_WIN ? "密钥只存在 Windows 凭据管理器里。" : "密钥只存在 macOS 钥匙串里。"),
     h("div", { class: "section" }, h("h3", {}, "Discord"),
-      h("div", { class: `status${ok ? " ok" : ""}` }, h("i"), S.ov.discord_status),
+      h("div", { id: "dc-status", class: `status${ok ? " ok" : ""}` }, h("i"), S.ov.discord_status),
       h("form", { style: "display:flex;gap:8px;margin-top:12px", onsubmit: async (e) => {
         e.preventDefault(); const tok = e.target.token.value; const b = e.target.querySelector("button");
         b.disabled = true; b.textContent = "验证中…";
@@ -1324,15 +1346,21 @@ $("#expand").onclick = () => setCollapsed(false);
 
 // Keyboard: ⌘K search, ⌘1–4 tabs, ⌘N new (group / agent), ↩ in search opens the first hit,
 // and typing anywhere in a chat goes to the composer.
+const IS_MAC = /Mac|iPhone|iPad/.test(navigator.platform || navigator.userAgent);
 addEventListener("keydown", (e) => {
-  const mod = e.metaKey || e.ctrlKey;
-  const typingInField = /^(INPUT|TEXTAREA|SELECT)$/.test(document.activeElement?.tagName) || document.activeElement?.isContentEditable;
-  if (mod && e.key.toLowerCase() === "k") { e.preventDefault(); $("#search").focus(); $("#search").select(); return; }
+  if ($("#dlg").open) return; // the modal owns the keyboard
+  // AltGr arrives as Ctrl+Alt on Windows (\ on German/French layouts); on macOS Ctrl is Emacs editing.
+  const altGr = e.altKey || e.getModifierState?.("AltGraph");
+  const mod = !altGr && (IS_MAC ? e.metaKey : e.metaKey || e.ctrlKey);
+  const key = e.key?.toLowerCase() ?? "";
+  if (mod && key === "k") { e.preventDefault(); $("#search").focus(); $("#search").select(); return; }
   if (mod && /^[1-4]$/.test(e.key)) { e.preventDefault(); setTab(["chats", "groups", "agents", "inbox"][e.key - 1]); return; }
   if (mod && e.key === "\\") { e.preventDefault(); setCollapsed(!document.body.classList.contains("collapsed")); return; }
   if (mod && e.key === ",") { e.preventDefault(); setTab("settings"); return; }
-  if (mod && e.key.toLowerCase() === "n") { e.preventDefault(); if (S.tab === "agents") renderGallery(); else groupDialog(null); return; }
-  if (!mod && !e.altKey && !typingInField && e.key.length === 1 && $("#input") && !$("#dlg").open) $("#input").focus();
+  if (mod && key === "n") { e.preventDefault(); if (S.tab === "agents") renderGallery(); else groupDialog(null); return; }
+  // Type anywhere → composer, unless a control has focus (Space presses buttons) or someone handled the key.
+  const busy = document.activeElement?.closest?.("button,input,select,textarea,[role],[tabindex],[contenteditable]");
+  if (!e.metaKey && !e.ctrlKey && !altGr && !e.defaultPrevented && !busy && e.key?.length === 1 && e.key !== " " && $("#input")) $("#input").focus();
 });
 // Text keeps one size: no page zoom from Ctrl/⌘ + wheel or + / − / 0.
 addEventListener("wheel", (e) => { if (e.ctrlKey || e.metaKey) e.preventDefault(); }, { passive: false });

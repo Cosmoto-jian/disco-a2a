@@ -3,11 +3,13 @@
 //! The owner's Disco serves each shared agent as an A2A endpoint at
 //! `http://<tailscale-host>:<port>/a/<share-id>`. Every share has its own random
 //! bearer token (kept in the vault) that the owner can revoke at any time. Only
-//! loopback and Tailscale peers may connect, only the two "send message" methods
-//! are accepted, and tool permissions are decided on the owner's machine.
+//! loopback and Tailscale peers may connect (the server listens only on
+//! 127.0.0.1 and this machine's own Tailscale addresses), only the two "send
+//! message" methods are accepted, and tool permissions are decided on the owner's machine.
 use std::collections::HashMap;
-use std::net::SocketAddr;
-use std::sync::Arc;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use a2a::event::StreamResponse;
 use a2a::*;
@@ -17,6 +19,7 @@ use axum::extract::{ConnectInfo, Request, State};
 use axum::http::{HeaderValue, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
+use disco_store::Store;
 use disco_types::{AgentEvent, PermissionDecision};
 use tauri::Manager;
 use futures::stream::{self, BoxStream};
@@ -30,6 +33,8 @@ const PORTS: std::ops::RangeInclusive<u16> = 7480..=7489;
 const SHARE_HEADER: &str = "x-disco-share";
 const PEER_HEADER: &str = "x-disco-peer";
 const INVITE_PREFIX: &str = "disco1:";
+/// One answer for a bad token, an unknown share and a revoked one: nobody learns which ids exist.
+const GONE: &str = "邀请码无效或共享已被撤销，请让对方重新发一个";
 
 /// What a share allows. Stored as JSON in settings under `share/<id>`.
 #[derive(Serialize, Deserialize, Clone)]
@@ -54,16 +59,67 @@ pub struct ShareStatus {
     shares: Vec<ShareView>,
 }
 
-/// The running server: bound port, or the reason it could not start.
+/// The running server: bound port, the Tailscale addresses it listens on
+/// (besides 127.0.0.1), or the reason it could not start / listen.
 #[derive(Default)]
-pub struct Server { port: Option<u16>, error: Option<String> }
+pub struct Server { port: Option<u16>, ips: Vec<IpAddr>, error: Option<String> }
 
 #[derive(Serialize, Deserialize)]
 struct Invite { url: String, token: String, agent: String, owner: String }
 
+/// Today in local time, like quiet hours: the daily limit resets at the owner's midnight.
 fn today() -> String {
-    let d = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() / 86_400).unwrap_or(0);
-    d.to_string()
+    chrono::Local::now().format("%Y-%m-%d").to_string()
+}
+
+fn used_key(id: &str) -> String { format!("share_used/{id}/{}", today()) }
+
+/// Count one message under `key` unless `limit` (0 = none) is reached. Read and write
+/// happen under the one `&Store` borrow (one db lock), so two turns can't both pass.
+fn take_quota(db: &Store, key: &str, limit: u32) -> bool {
+    let used: u32 = db.setting(key).and_then(|v| v.parse().ok()).unwrap_or(0);
+    if limit > 0 && used >= limit { return false; }
+    db.set_setting(key, &(used + 1).to_string()).is_ok()
+}
+
+/// Give back a message that never reached the agent.
+fn refund_quota(db: &Store, key: &str) {
+    let used: u32 = db.setting(key).and_then(|v| v.parse().ok()).unwrap_or(0);
+    let left = used.saturating_sub(1);
+    let _ = db.set_setting(key, &if left == 0 { String::new() } else { left.to_string() });
+}
+
+/// Peer turns in flight: (ticket, share id, context). Revoking a share takes its
+/// entries out, which both cancels those turns and tells them they were revoked.
+static RUNNING: Mutex<Vec<(u64, String, String)>> = Mutex::new(Vec::new());
+
+/// A registered peer turn; unregisters on drop.
+struct Ticket(u64);
+
+impl Ticket {
+    fn new(id: &str, context: &str) -> Self {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let t = NEXT.fetch_add(1, Ordering::Relaxed);
+        RUNNING.lock().unwrap_or_else(|p| p.into_inner()).push((t, id.to_owned(), context.to_owned()));
+        Self(t)
+    }
+}
+
+/// Still registered, i.e. its share was not revoked meanwhile.
+fn live(ticket: u64) -> bool {
+    RUNNING.lock().unwrap_or_else(|p| p.into_inner()).iter().any(|e| e.0 == ticket)
+}
+
+impl Drop for Ticket {
+    fn drop(&mut self) { RUNNING.lock().unwrap_or_else(|p| p.into_inner()).retain(|e| e.0 != self.0); }
+}
+
+/// Unregister every running turn of share `id`; returns their contexts.
+fn take_running(id: &str) -> Vec<String> {
+    let mut r = RUNNING.lock().unwrap_or_else(|p| p.into_inner());
+    let (gone, keep): (Vec<_>, Vec<_>) = r.drain(..).partition(|e| e.1 == id);
+    *r = keep;
+    gone.into_iter().map(|e| e.2).collect()
 }
 
 impl Core {
@@ -77,7 +133,7 @@ impl Core {
     }
 
     fn used_today(&self, id: &str) -> u32 {
-        self.db().setting(&format!("share_used/{id}/{}", today())).and_then(|v| v.parse().ok()).unwrap_or(0)
+        self.db().setting(&used_key(id)).and_then(|v| v.parse().ok()).unwrap_or(0)
     }
 
     /// Keep shares pointing at a renamed agent; drop them when it is removed.
@@ -95,44 +151,57 @@ impl Core {
         secret_del(&format!("share/{id}"));
     }
 
-    /// Start the share server once (idempotent). Binds all interfaces; the guard
-    /// below refuses everyone who is not loopback or on the tailnet.
+    /// Start the share server (idempotent): 127.0.0.1 first, then each of this
+    /// machine's Tailscale addresses (v4 and v6) on the same port, never 0.0.0.0, which
+    /// would also expose it on a carrier's 100.64/10 network. Calling it again
+    /// adds addresses Tailscale has gained since (e.g. it was logged in later).
     pub(crate) fn serve_shares(self: &Arc<Self>) {
+        let want = tailnet::my_ips();
         let mut srv = self.server.lock().unwrap_or_else(|p| p.into_inner());
-        if srv.port.is_some() { return; }
-        let mut last = String::new();
-        for port in PORTS {
-            match std::net::TcpListener::bind(("0.0.0.0", port)) {
-                Ok(l) => {
-                    let _ = l.set_nonblocking(true);
-                    let core = self.clone();
-                    tauri::async_runtime::spawn(async move {
-                        let Ok(listener) = tokio::net::TcpListener::from_std(l) else { return };
-                        let app = router(core).into_make_service_with_connect_info::<SocketAddr>();
-                        let _ = axum::serve(listener, app).await;
-                    });
-                    *srv = Server { port: Some(port), error: None };
-                    return;
+        if srv.port.is_none() {
+            let mut last = String::new();
+            for port in PORTS {
+                match std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, port)) {
+                    Ok(l) => { self.listen(l); *srv = Server { port: Some(port), ..Server::default() }; break; }
+                    Err(e) => last = e.to_string(),
                 }
-                Err(e) => last = e.to_string(),
+            }
+            if srv.port.is_none() { srv.error = Some(format!("端口 7480–7489 都被占用：{last}")); return; }
+        }
+        let Some(port) = srv.port else { return };
+        let new: Vec<IpAddr> = want.into_iter().filter(|ip| !srv.ips.contains(ip)).collect();
+        for ip in new {
+            match std::net::TcpListener::bind((ip, port)) {
+                Ok(l) => { self.listen(l); srv.ips.push(ip); srv.error = None; }
+                Err(e) => srv.error = Some(format!("无法在 Tailscale 地址 {ip} 的端口 {port} 上监听：{e}")),
             }
         }
-        srv.error = Some(format!("端口 7480–7489 都被占用：{last}"));
+    }
+
+    fn listen(self: &Arc<Self>, l: std::net::TcpListener) {
+        let _ = l.set_nonblocking(true);
+        let core = self.clone();
+        tauri::async_runtime::spawn(async move {
+            let Ok(listener) = tokio::net::TcpListener::from_std(l) else { return };
+            let app = router(core).into_make_service_with_connect_info::<SocketAddr>();
+            let _ = axum::serve(listener, app).await;
+        });
     }
 
     pub(crate) fn net_policy(&self) -> tailnet::Policy {
         self.db().setting(tailnet::POLICY).and_then(|j| serde_json::from_str(&j).ok()).unwrap_or_default()
     }
 
-    fn share_base(&self) -> Result<String, String> {
-        let port = {
+    pub(crate) fn share_base(&self) -> Result<String, String> {
+        let (port, ip, error) = {
             let s = self.server.lock().unwrap_or_else(|p| p.into_inner());
-            s.port.ok_or_else(|| s.error.clone().unwrap_or_else(|| "共享服务未启动".into()))?
+            (s.port, s.ips.first().copied(), s.error.clone())
         };
-        let host = match crate::tailnet::me() {
-            Some(me) => me.node,
+        let port = port.ok_or_else(|| error.clone().unwrap_or_else(|| "共享服务未启动".into()))?;
+        let host = match ip {
+            Some(ip) => crate::tailnet::me().map(|me| me.node).unwrap_or_else(|| match ip { IpAddr::V6(v) => format!("[{v}]"), v4 => v4.to_string() }),
             None if crate::selftest_mode() => "127.0.0.1".into(),
-            None => return Err("没检测到 Tailscale：请先安装 Tailscale 并登录，再回来生成邀请".into()),
+            None => return Err(error.unwrap_or_else(|| "没检测到 Tailscale：共享服务目前只在本机监听。请先安装 Tailscale 并登录，再回来生成邀请".into())),
         };
         Ok(format!("http://{host}:{port}"))
     }
@@ -140,13 +209,14 @@ impl Core {
     /// Run one guest message as a turn of the shared agent. The owner sees it live
     /// in the `peer:<id>` thread, where permission prompts also appear.
     async fn peer_turn(&self, id: &str, device: &str, guest_ctx: &str, text: &str, out: mpsc::UnboundedSender<AgentEvent>) -> Result<String, String> {
+        let context = format!("peer:{id}|{guest_ctx}");
+        // Register before reading the share: a revoke either comes first (no share) or finds the ticket.
+        let ticket = Ticket::new(id, &context);
         let share = self.share(id).ok_or("这个共享已被撤销")?;
         if self.net_policy().quiet_now() { return Err("对方设置了免打扰，现在不处理消息，请稍后再试".into()); }
-        let used = self.used_today(id);
-        if share.limit > 0 && used >= share.limit {
-            return Err(format!("今天的 {} 次额度已用完", share.limit));
-        }
-        let _ = self.db().set_setting(&format!("share_used/{id}/{}", today()), &(used + 1).to_string());
+        let key = used_key(id);
+        let counted = take_quota(&self.db(), &key, share.limit);
+        if !counted { return Err(format!("今天的 {} 次额度已用完", share.limit)); }
         let thread = format!("peer:{id}");
         // The guest's Discord-synced group the agent was last used in lets the owner talk back.
         // Only a group is remembered: a later DM or delegated `ask:` turn must not erase it.
@@ -157,12 +227,24 @@ impl Core {
             let _ = self.db().set_setting(&format!("{PEER_CTX}{id}"), guest_ctx);
         }
         self.post_message(&thread, &share.guest, text);
-        let context = format!("peer:{id}|{guest_ctx}");
         let deny = share.mode != "ask";
         let core = self.app.state::<Arc<Core>>().inner().clone();
         let agent = share.agent.clone();
+        let (tk, ctx) = (ticket.0, context.clone());
+        // `started`: the agent produced something, so the message counts. `stopping`: revoked mid-turn.
+        let (started, stopping) = (Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)));
+        let seen = started.clone();
         // Returns false for events the owner's UI should not see (refused permission prompts).
         let res = self.turn_with(&thread, &share.agent, &context, text, move |ev| {
+            seen.store(true, Ordering::Relaxed);
+            if !live(tk) {
+                // Revoked after the turn began: revoke's own cancel may have come too early.
+                if !stopping.swap(true, Ordering::Relaxed) {
+                    let (core, agent, ctx) = (core.clone(), agent.clone(), ctx.clone());
+                    tauri::async_runtime::spawn(async move { core.hub.cancel(&agent, &ctx).await; });
+                }
+                return false;
+            }
             if let AgentEvent::PermissionAsked { request_id, .. } = ev {
                 if deny {
                     let (core, agent, rid) = (core.clone(), agent.clone(), request_id.clone());
@@ -176,6 +258,9 @@ impl Core {
             let _ = out.send(ev.clone());
             true
         }).await;
+        let res = if live(ticket.0) { res } else { Err("这个共享已被撤销".into()) };
+        drop(ticket);
+        if res.is_err() && !started.load(Ordering::Relaxed) { refund_quota(&self.db(), &key); }
         let _ = self.db().audit(&format!("peer:{}@{device}", share.guest), Some(&share.agent), "peer_prompt", if res.is_ok() { "ok" } else { "error" });
         match &res {
             Ok(a) => self.post_message(&thread, &share.agent, a.trim()),
@@ -266,11 +351,22 @@ fn deny(code: StatusCode, msg: &str) -> Response {
     (code, [(header::CONTENT_TYPE, "application/json")], body.to_string()).into_response()
 }
 
-/// Tailnet/loopback only; the device must pass the access policy (when Tailscale
-/// can say who it is); per-share bearer token; only message methods.
+/// Tailnet/loopback only; per-share bearer token (checked before anything else
+/// looks at the share or asks Tailscale); then the device must pass the access
+/// policy (when Tailscale can say who it is); only message methods. The agent card
+/// is public (A2A clients fetch it without credentials) and names only the agent.
 async fn guard(State(core): State<Arc<Core>>, ConnectInfo(peer): ConnectInfo<SocketAddr>, req: Request, next: Next) -> Response {
     let ip = peer.ip().to_canonical();
     if !(ip.is_loopback() || tailnet::is_tailnet(&ip)) { return deny(StatusCode::FORBIDDEN, "tailnet only"); }
+    let path = req.uri().path().to_owned();
+    let Some(rest) = path.strip_prefix("/a/") else { return deny(StatusCode::NOT_FOUND, "not found") };
+    let (id, tail) = rest.split_once('/').unwrap_or((rest, ""));
+    let id = id.to_owned();
+    if tail == ".well-known/agent-card.json" { return next.run(req).await; }
+    let token = req.headers().get(header::AUTHORIZATION).and_then(|v| v.to_str().ok()).and_then(|v| v.strip_prefix("Bearer ")).unwrap_or("");
+    let secret = secret_get(&format!("share/{id}"));
+    let ok = !token.is_empty() && secret.is_some_and(|t| eq_ct(t.as_bytes(), token.as_bytes()));
+    if !ok || core.share(&id).is_none() { return deny(StatusCode::UNAUTHORIZED, GONE); }
     let mut who = String::from("local");
     if !ip.is_loopback() {
         let policy = core.net_policy();
@@ -284,15 +380,6 @@ async fn guard(State(core): State<Arc<Core>>, ConnectInfo(peer): ConnectInfo<Soc
             None => who = ip.to_string(),
         }
     }
-    let path = req.uri().path().to_owned();
-    let Some(rest) = path.strip_prefix("/a/") else { return deny(StatusCode::NOT_FOUND, "not found") };
-    let (id, tail) = rest.split_once('/').unwrap_or((rest, ""));
-    let id = id.to_owned();
-    if core.share(&id).is_none() { return deny(StatusCode::NOT_FOUND, "对方已撤销这个共享"); }
-    if tail == ".well-known/agent-card.json" { return next.run(req).await; }
-    let token = req.headers().get(header::AUTHORIZATION).and_then(|v| v.to_str().ok()).and_then(|v| v.strip_prefix("Bearer ")).unwrap_or("");
-    let ok = secret_get(&format!("share/{id}")).is_some_and(|t| eq_ct(t.as_bytes(), token.as_bytes()));
-    if !ok { return deny(StatusCode::UNAUTHORIZED, "邀请码已失效，请让对方重新发一个"); }
     let (mut parts, body) = req.into_parts();
     let Ok(bytes) = to_bytes(body, 1 << 20).await else { return deny(StatusCode::PAYLOAD_TOO_LARGE, "too large") };
     let method = serde_json::from_slice::<serde_json::Value>(&bytes).ok().and_then(|v| v["method"].as_str().map(str::to_owned)).unwrap_or_default();
@@ -305,10 +392,10 @@ async fn guard(State(core): State<Arc<Core>>, ConnectInfo(peer): ConnectInfo<Soc
 }
 
 async fn card(State(core): State<Arc<Core>>, axum::extract::Path(id): axum::extract::Path<String>, headers: axum::http::HeaderMap) -> Response {
-    let Some(s) = core.share(&id) else { return deny(StatusCode::NOT_FOUND, "对方已撤销这个共享") };
+    let Some(s) = core.share(&id) else { return deny(StatusCode::NOT_FOUND, GONE) };
     let host = headers.get(header::HOST).and_then(|v| v.to_str().ok()).unwrap_or("127.0.0.1");
     let card = AgentCard {
-        name: s.agent.clone(), description: format!("{} 通过 Disco 共享的 {}", owner_name(), s.agent), version: a2a::VERSION.into(), provider: None,
+        name: s.agent.clone(), description: format!("通过 Disco 共享的 {}", s.agent), version: a2a::VERSION.into(), provider: None,
         capabilities: AgentCapabilities { streaming: Some(true), push_notifications: Some(false), extensions: None, extended_agent_card: None },
         skills: vec![], default_input_modes: vec!["text/plain".into()], default_output_modes: vec!["text/plain".into()],
         supported_interfaces: vec![AgentInterface::new(format!("http://{host}/a/{id}/jsonrpc"), TRANSPORT_PROTOCOL_JSONRPC)],
@@ -386,6 +473,8 @@ pub async fn peer_check(core: St<'_>, id: String) -> CmdResult<Option<String>> {
 
 #[tauri::command]
 pub fn share_status(core: St<'_>) -> ShareStatus {
+    // Picks up Tailscale addresses that appeared since the server started.
+    if !core.shares().is_empty() { core.inner().serve_shares(); }
     let (base, problem) = match core.share_base() { Ok(b) => (Some(b), None), Err(e) => (None, Some(e)) };
     let shares = core.shares().into_iter().map(|(id, s)| ShareView { used_today: core.used_today(&id), id, agent: s.agent, guest: s.guest, mode: s.mode, limit: s.limit }).collect();
     ShareStatus { base, problem, shares }
@@ -418,7 +507,16 @@ pub fn share_invite(core: St<'_>, id: String) -> CmdResult<String> {
 
 #[tauri::command]
 pub fn revoke_share(core: St<'_>, id: String) {
+    let agent = core.share(&id).map(|s| s.agent);
     core.drop_share(&id);
+    // Stop the guest's turns that are already running (a turn starting later finds no share).
+    let running = take_running(&id);
+    if let Some(agent) = agent && !running.is_empty() {
+        let core = core.inner().clone();
+        tauri::async_runtime::spawn(async move {
+            for ctx in running { core.hub.cancel(&agent, &ctx).await; }
+        });
+    }
     let _ = core.db().audit("user", None, "revoke_share", &id);
 }
 
@@ -470,6 +568,31 @@ fn unb64(s: &str) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn quota_is_counted_once_and_refunded() {
+        let db = Store::open_in_memory().unwrap();
+        assert!(take_quota(&db, "k", 2) && take_quota(&db, "k", 2) && !take_quota(&db, "k", 2));
+        refund_quota(&db, "k");
+        assert!(take_quota(&db, "k", 2) && !take_quota(&db, "k", 2));
+        refund_quota(&db, "k"); refund_quota(&db, "k"); refund_quota(&db, "k");
+        assert_eq!(db.setting("k"), None);
+        assert!((0..5).all(|_| take_quota(&db, "u", 0)));
+        let d = today();
+        assert!(d.len() == 10 && chrono::NaiveDate::parse_from_str(&d, "%Y-%m-%d").is_ok(), "{d}");
+    }
+
+    #[test]
+    fn revoke_takes_only_that_shares_turns() {
+        let (a, b) = (Ticket::new("rv-a", "peer:rv-a|x"), Ticket::new("rv-b", "peer:rv-b|y"));
+        assert!(live(a.0) && live(b.0));
+        assert_eq!(take_running("rv-a"), vec!["peer:rv-a|x".to_owned()]);
+        assert!(!live(a.0) && live(b.0));
+        let bt = b.0;
+        drop(b);
+        assert!(!live(bt) && take_running("rv-b").is_empty());
+        drop(a);
+    }
 
     #[test]
     fn b64_roundtrip() {

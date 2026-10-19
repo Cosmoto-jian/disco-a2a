@@ -88,6 +88,19 @@ async fn dead_agent_is_not_alive() {
     assert!(!agent.is_alive());
 }
 
+/// An agent that never answers `initialize` fails fast with a reason instead of wedging the bridge.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn initialize_times_out() {
+    let launch = Launch { command: "sleep".into(), args: vec!["30".into()], prompt_timeout: Duration::from_secs(1), ..launch() };
+    let agent = AcpAgent::spawn(launch).await.unwrap();
+    let t = std::time::Instant::now();
+    let r = tokio::time::timeout(Duration::from_secs(5), agent.configs("dm")).await.expect("configs hung");
+    assert!(matches!(&r, Err(disco_acp::AcpError::Protocol(why)) if why.contains("超时")), "{r:?}");
+    assert!(t.elapsed() < Duration::from_secs(3), "took {:?}", t.elapsed());
+    assert!(!agent.is_alive() || agent.prompt("dm", "go").await.is_err());
+}
+
 /// Probe a real agent: `DISCO_REAL="npx -y @agentclientprotocol/claude-agent-acp" cargo test -p disco-acp --test bridge real_agent -- --ignored --nocapture`
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]

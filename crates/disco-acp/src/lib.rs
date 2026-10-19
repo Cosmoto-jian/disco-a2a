@@ -56,6 +56,11 @@ pub struct Launch {
 
 /// How long a turn that timed out may take to wind down after it is cancelled.
 const CANCEL_GRACE: Duration = Duration::from_secs(5);
+/// Max wait for `initialize`, `session/new` and a setting change (capped by the prompt timeout).
+const START_TIMEOUT: Duration = Duration::from_secs(60);
+/// How long the agent's process group gets to exit after SIGTERM before SIGKILL.
+#[cfg(unix)]
+const KILL_GRACE: Duration = Duration::from_secs(1);
 
 /// A stdio MCP server the agent should launch for its sessions.
 #[derive(Debug, Clone)]
@@ -219,8 +224,9 @@ impl AcpAgent {
             .current_dir(&launch.cwd)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true);
+            .stderr(Stdio::piped());
+        // No kill_on_drop: `Drop` kills the whole group gracefully, and an instant SIGKILL
+        // of the leader would cut that grace short.
         #[cfg(unix)]
         c.process_group(0);
         #[cfg(windows)]
@@ -322,21 +328,32 @@ impl AcpAgent {
         lock(&self.pending).remove(request_id).is_some_and(|tx| tx.send(decision).is_ok())
     }
 
-    /// Kill the agent and every process it started (it leads its own process group).
+    /// Kill the agent and every process it started (it leads its own process group):
+    /// SIGTERM, then SIGKILL after [`KILL_GRACE`]. Never blocks; the waiting runs on its own thread.
     pub fn kill(&self) {
         let mut child = lock(&self.child);
+        let Some(pid) = child.id() else { return };
         #[cfg(unix)]
-        if let Some(pid) = child.id() {
-            let _ = std::process::Command::new("kill").args(["-KILL", &format!("-{pid}")])
-                .stdout(Stdio::null()).stderr(Stdio::null()).status();
+        {
+            let signal = move |sig: &str| std::process::Command::new("kill").args([sig, &format!("-{pid}")])
+                .stdout(Stdio::null()).stderr(Stdio::null()).status().is_ok_and(|s| s.success());
+            let spawned = std::thread::Builder::new().name("acp-kill".into()).spawn(move || {
+                // A failed SIGTERM means the group is already gone.
+                if signal("-TERM") { std::thread::sleep(KILL_GRACE); signal("-KILL"); }
+            });
+            if spawned.is_err() { let _ = child.start_kill(); }
         }
         #[cfg(windows)]
-        if let Some(pid) = child.id() {
+        {
             use std::os::windows::process::CommandExt;
-            let _ = std::process::Command::new("taskkill").args(["/T", "/F", "/PID", &pid.to_string()]).creation_flags(0x0800_0000)
-                .stdout(Stdio::null()).stderr(Stdio::null()).status();
+            let _ = std::thread::Builder::new().name("acp-kill".into()).spawn(move || {
+                let _ = std::process::Command::new("taskkill").args(["/T", "/F", "/PID", &pid.to_string()]).creation_flags(0x0800_0000)
+                    .stdout(Stdio::null()).stderr(Stdio::null()).status();
+            });
+            let _ = child.start_kill();
         }
-        let _ = child.start_kill();
+        #[cfg(not(any(unix, windows)))]
+        { let _ = (pid, child.start_kill()); }
     }
 }
 
@@ -392,9 +409,34 @@ fn map_update(u: SessionUpdate) -> Option<AgentEvent> {
 /// `session/new`, read raw so fields this protocol version no longer types
 /// (the legacy `models` / `modes`) are not lost.
 async fn open_session(conn: &ConnectionTo<Agent>, launch: &Launch, key: &str) -> agent_client_protocol::Result<(NewSessionResponse, serde_json::Value)> {
-    let raw = conn.send_request(UntypedMessage::new("session/new", new_session(launch, key))?).block_task().await?;
+    let req = conn.send_request(UntypedMessage::new("session/new", new_session(launch, key))?).block_task();
+    let raw = tokio::time::timeout(start_timeout(launch), req).await
+        .map_err(|_| agent_client_protocol::Error::internal_error().data("session/new 超时"))??;
     let typed = serde_json::from_value(raw.clone()).map_err(|e| agent_client_protocol::Error::internal_error().data(e.to_string()))?;
     Ok((typed, raw))
+}
+
+fn start_timeout(launch: &Launch) -> Duration { START_TIMEOUT.min(launch.prompt_timeout) }
+
+/// Config ids served through the legacy `session/set_model` / `set_mode` calls.
+type Legacy = Arc<Mutex<HashSet<String>>>;
+
+/// Apply one setting to one session; keeps `configs` in sync with the agent.
+async fn apply(conn: &ConnectionTo<Agent>, legacy: &Legacy, configs: &Configs, wait: Duration, sid: &SessionId, id: &str, value: &str) -> Result<(), String> {
+    let work = async {
+        if lock(legacy).contains(id) {
+            let (method, field) = if id == "model" { ("session/set_model", "modelId") } else { ("session/set_mode", "modeId") };
+            let msg = UntypedMessage::new(method, serde_json::json!({ "sessionId": sid.to_string(), field: value })).map_err(|e| e.to_string())?;
+            conn.send_request(msg).block_task().await.map_err(|e| e.to_string())?;
+            for c in lock(configs).iter_mut().filter(|c| c.id == id) { c.current = value.to_owned(); }
+            return Ok(());
+        }
+        let r = conn.send_request(SetSessionConfigOptionRequest::new(sid.clone(), id.to_owned(), value))
+            .block_task().await.map_err(|e| e.to_string())?;
+        *lock(configs) = choices(&r.config_options);
+        Ok(())
+    };
+    tokio::time::timeout(wait, work).await.unwrap_or_else(|_| Err(format!("设置 {id} 超时")))
 }
 
 fn new_session(launch: &Launch, key: &str) -> NewSessionRequest {
@@ -483,31 +525,23 @@ async fn run_connection<W, R>(
         .connect_with(transport, async move |conn: ConnectionTo<Agent>| {
             // Advertise terminal sign-in so agents list their login commands (claude-agent-acp only does then).
             let caps = ClientCapabilities::new().auth(AuthCapabilities::new().terminal(true));
-            let init = conn.send_request(InitializeRequest::new(ProtocolVersion::V1).client_capabilities(caps)).block_task().await;
-            let init = match init {
-                Ok(r) => r,
-                Err(e) => { lock(&health_c).error = Some(format!("初始化失败：{e}")); return Err(e); }
+            let init = conn.send_request(InitializeRequest::new(ProtocolVersion::V1).client_capabilities(caps)).block_task();
+            let wait = start_timeout(&launch);
+            let init = match tokio::time::timeout(wait, init).await {
+                Ok(Ok(r)) => r,
+                Ok(Err(e)) => { lock(&health_c).error = Some(format!("初始化失败：{e}")); return Err(e); }
+                Err(_) => {
+                    lock(&health_c).error = Some(format!("初始化超时（{} 秒没有响应）", wait.as_secs()));
+                    return Err(agent_client_protocol::Error::internal_error().data("initialize timed out"));
+                }
             };
             lock(&health_c).logins = init.auth_methods.iter().map(login_of).collect();
-            // Config ids served through the legacy `session/set_model` / `set_mode` calls.
-            let legacy: Mutex<HashSet<String>> = Mutex::default();
+            let legacy: Legacy = Arc::default();
             // Disco context key -> (ACP session, per-session turn lock).
             let mut sessions: HashMap<String, (SessionId, Arc<tokio::sync::Mutex<()>>)> = HashMap::new();
             let mut prefs: Vec<(String, String)> = launch.config.clone();
-            // Apply one setting to one session; keeps `configs` in sync with the agent.
-            let set = async |sid: &SessionId, id: &str, value: &str| -> Result<(), String> {
-                if lock(&legacy).contains(id) {
-                    let (method, field) = if id == "model" { ("session/set_model", "modelId") } else { ("session/set_mode", "modeId") };
-                    let msg = UntypedMessage::new(method, serde_json::json!({ "sessionId": sid.to_string(), field: value })).map_err(|e| e.to_string())?;
-                    conn.send_request(msg).block_task().await.map_err(|e| e.to_string())?;
-                    for c in lock(&configs).iter_mut().filter(|c| c.id == id) { c.current = value.to_owned(); }
-                    return Ok(());
-                }
-                let r = conn.send_request(SetSessionConfigOptionRequest::new(sid.clone(), id.to_owned(), value))
-                    .block_task().await.map_err(|e| e.to_string())?;
-                *lock(&configs) = choices(&r.config_options);
-                Ok(())
-            };
+            // Setting changes run off this loop (so Cancel never queues behind them), one at a time.
+            let setting: Arc<tokio::sync::Mutex<()>> = Arc::default();
             while let Some(cmd) = cmd_rx.recv().await {
                 let (key, job, ready) = match cmd {
                     Cmd::Prompt { key, text, events } => (key, Some((text, events)), None),
@@ -517,23 +551,32 @@ async fn run_connection<W, R>(
                         continue;
                     }
                     Cmd::Login { id, done } => {
-                        let r = conn.send_request(AuthenticateRequest::new(id)).block_task().await.map(|_| ()).map_err(|e| e.to_string());
-                        if r.is_ok() { let mut h = lock(&health_c); h.error = None; h.needs_login = false; }
-                        let _ = done.send(r);
+                        // Sign-in may wait on a browser; it runs off the loop.
+                        let (conn, health) = (conn.clone(), health_c.clone());
+                        tokio::spawn(async move {
+                            let r = conn.send_request(AuthenticateRequest::new(id)).block_task().await.map(|_| ()).map_err(|e| e.to_string());
+                            if r.is_ok() { let mut h = lock(&health); h.error = None; h.needs_login = false; }
+                            let _ = done.send(r);
+                        });
                         continue;
                     }
                     Cmd::Set { id, value, done } => {
                         prefs.retain(|(k, _)| *k != id);
                         prefs.push((id.clone(), value.clone()));
-                        let mut res = Ok(());
-                        for (sid, _) in sessions.values() {
-                            if let Err(e) = set(sid, &id, &value).await { res = Err(e); }
-                        }
                         if sessions.is_empty() {
                             // No session yet: just remember it; the next session picks it up.
                             for c in lock(&configs).iter_mut().filter(|c| c.id == id) { c.current = value.clone(); }
                         }
-                        let _ = done.send(res);
+                        let sids: Vec<SessionId> = sessions.values().map(|(sid, _)| sid.clone()).collect();
+                        let (conn, legacy, configs, setting) = (conn.clone(), legacy.clone(), configs.clone(), setting.clone());
+                        tokio::spawn(async move {
+                            let _one = setting.lock().await;
+                            let mut res = Ok(());
+                            for sid in &sids {
+                                if let Err(e) = apply(&conn, &legacy, &configs, wait, sid, &id, &value).await { res = Err(e); }
+                            }
+                            let _ = done.send(res);
+                        });
                         continue;
                     }
                 };
@@ -552,7 +595,7 @@ async fn run_connection<W, R>(
                             offered.extend(old);
                             for (id, value) in &prefs {
                                 if offered.iter().any(|c| c.id == *id && c.current != *value && c.options.iter().any(|(v, _)| v == value))
-                                    && let Err(e) = set(&r.session_id, id, value).await
+                                    && let Err(e) = apply(&conn, &legacy, &configs, wait, &r.session_id, id, value).await
                                 {
                                     tracing::warn!("set {id}={value}: {e}");
                                 }

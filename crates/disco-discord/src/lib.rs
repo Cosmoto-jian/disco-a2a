@@ -177,28 +177,40 @@ struct RawChannel {
 pub struct Rest {
     http: reqwest::Client,
     auth: String,
+    /// Set by a global 429: no request goes out before this instant.
+    paused: std::sync::Arc<std::sync::Mutex<Option<tokio::time::Instant>>>,
 }
 
 impl Rest {
     pub fn new(token: String) -> Self {
-        let mut b = reqwest::Client::builder().timeout(Duration::from_secs(20)).user_agent("DiscordBot (https://github.com/Cosmoto-jian/disco-a2a, 0.4)");
+        let base = || reqwest::Client::builder().timeout(Duration::from_secs(20)).user_agent("DiscordBot (https://github.com/Cosmoto-jian/disco-a2a, 0.4)");
+        let mut b = base();
         if let Some(p) = proxy_url() && let Ok(px) = reqwest::Proxy::all(&p) {
             b = b.proxy(px);
         }
-        Self { http: b.build().unwrap_or_default(), auth: format!("Bot {}", token.trim()) }
+        // A bad proxy setting must not cost us the timeout.
+        let http = b.build().or_else(|_| base().build()).unwrap_or_default();
+        Self { http, auth: format!("Bot {}", token.trim()), paused: Default::default() }
     }
 
     async fn call(&self, method: reqwest::Method, path: &str, body: Option<Value>) -> Result<Value, String> {
         for _ in 0..3 {
+            let until = *self.paused.lock().unwrap_or_else(|p| p.into_inner());
+            if let Some(t) = until { tokio::time::sleep_until(t).await; }
             let mut req = self.http.request(method.clone(), format!("{API}{path}"));
             if !path.starts_with("/webhooks/") { req = req.header("Authorization", &self.auth); }
             if let Some(b) = &body { req = req.json(b); }
-            let res = req.send().await.map_err(|e| format!("无法连接 Discord：{e}"))?;
+            // Webhook and interaction URLs carry tokens: never put the URL in an error.
+            let res = req.send().await.map_err(|e| format!("无法连接 Discord：{}", e.without_url()))?;
             let status = res.status();
+            let header = res.headers().get("retry-after").and_then(|h| h.to_str().ok()?.parse::<f64>().ok());
             let v: Value = res.json().await.unwrap_or(Value::Null);
             if status.as_u16() == 429 {
-                let wait = v["retry_after"].as_f64().unwrap_or(1.0).min(10.0);
-                tokio::time::sleep(Duration::from_secs_f64(wait)).await;
+                let wait = v["retry_after"].as_f64().or(header).unwrap_or(1.0).max(0.0);
+                if wait > 60.0 { return Err(format!("Discord 限流，请 {} 秒后再试", wait.ceil())); }
+                let until = tokio::time::Instant::now() + Duration::from_secs_f64(wait);
+                if v["global"].as_bool() == Some(true) { *self.paused.lock().unwrap_or_else(|p| p.into_inner()) = Some(until); }
+                tokio::time::sleep_until(until).await;
                 continue;
             }
             if status.is_success() { return Ok(v); }
@@ -355,13 +367,21 @@ impl Rest {
         self.call(reqwest::Method::PATCH, &format!("/channels/{channel}/messages/{message}"), Some(json!({"content": content, "components": []}))).await.map(|_| ())
     }
 
-    /// Answer a button press: `update` rewrites the pressed message (and drops its
-    /// buttons); otherwise only the presser sees `text`.
-    pub async fn interaction_reply(&self, id: &str, token: &str, update: bool, text: &str) -> Result<(), String> {
+    /// Acknowledge a button press at once (DEFERRED_UPDATE_MESSAGE); Discord allows only 3 s.
+    async fn ack_press(&self, id: &str, token: &str) -> Result<(), String> {
+        self.post_json(&format!("/interactions/{id}/{token}/callback"), json!({"type": 6})).await.map(|_| ())
+    }
+
+    /// Answer an already acknowledged button press through its followup webhook
+    /// (`app_id`/`token` from [`Incoming::press`]): `update` rewrites the pressed message
+    /// (and drops its buttons); otherwise only the presser sees `text`.
+    pub async fn interaction_reply(&self, app_id: &str, token: &str, update: bool, text: &str) -> Result<(), String> {
         let content: String = text.chars().take(1900).collect();
-        let body = if update { json!({"type": 7, "data": {"content": content, "components": []}}) }
-            else { json!({"type": 4, "data": {"content": content, "flags": 64}}) };
-        self.post_json(&format!("/interactions/{id}/{token}/callback"), body).await.map(|_| ())
+        if update {
+            self.call(reqwest::Method::PATCH, &format!("/webhooks/{app_id}/{token}/messages/@original"), Some(json!({"content": content, "components": []}))).await.map(|_| ())
+        } else {
+            self.post_json(&format!("/webhooks/{app_id}/{token}"), json!({"content": content, "flags": 64})).await.map(|_| ())
+        }
     }
 
     /// Post as the bot itself (used for messages typed in the app). Pings only users
@@ -406,23 +426,49 @@ fn persona_name(name: &str) -> String {
     if n.trim().is_empty() { "agent".into() } else { n }
 }
 
-/// Split at line boundaries into Discord-sized (≤ 2000 chars) messages.
+/// Split at line boundaries into Discord-sized messages. Counts UTF-16 units (what
+/// Discord counts) with a margin under 2000, and keeps ``` code blocks intact: a block
+/// cut by a chunk boundary is closed there and reopened, same language, in the next.
 pub fn chunk(text: &str) -> Vec<String> {
-    const MAX: usize = 1900;
+    const MAX: usize = 1900; // the margin holds a closing "\n```"
+    let units = |s: &str| s.encode_utf16().count();
     let mut out = Vec::new();
     let mut cur = String::new();
-    for line in text.split_inclusive('\n') {
-        if cur.chars().count() + line.chars().count() > MAX && !cur.is_empty() {
-            out.push(std::mem::take(&mut cur));
+    let mut head = 0; // bytes of `cur` that are only a reopened fence
+    let mut fence: Option<String> = None; // the ``` opener `cur` sits inside
+    let mut flush = |cur: &mut String, head: &mut usize, fence: &Option<String>| {
+        let mut s = std::mem::take(cur);
+        if s[*head..].trim().is_empty() { s.truncate(*head); *cur = s; return; } // whitespace only: drop it
+        *head = 0;
+        if let Some(f) = fence {
+            if !s.ends_with('\n') { s.push('\n'); }
+            s.push_str("```");
+            *cur = format!("{f}\n");
+            *head = cur.len();
         }
-        if line.chars().count() > MAX {
-            let chars: Vec<char> = line.chars().collect();
-            for piece in chars.chunks(MAX) { out.push(piece.iter().collect()); }
-        } else {
-            cur.push_str(line);
+        out.push(s);
+    };
+    for line in text.split_inclusive('\n') {
+        let mut rest = line;
+        while !rest.is_empty() {
+            let room = MAX.saturating_sub(units(&cur));
+            if units(rest) <= room { cur.push_str(rest); break; }
+            if !cur[head..].trim().is_empty() { flush(&mut cur, &mut head, &fence); continue; }
+            // One line longer than a whole message: hard-split it.
+            let mut n = 0;
+            let cut = rest.char_indices().find(|(_, c)| { n += c.len_utf16(); n > room }).map_or(rest.len(), |(i, _)| i).max(rest.chars().next().map_or(0, char::len_utf8));
+            cur.push_str(&rest[..cut]);
+            rest = &rest[cut..];
+            flush(&mut cur, &mut head, &fence);
+        }
+        if let Some(tag) = line.trim_start().strip_prefix("```") {
+            fence = match fence {
+                Some(_) => None,
+                None => Some(format!("```{}", tag.split_whitespace().next().unwrap_or("").chars().take(20).collect::<String>())),
+            };
         }
     }
-    if !cur.trim().is_empty() { out.push(cur); }
+    if !cur[head..].trim().is_empty() { out.push(cur); }
     out
 }
 
@@ -442,7 +488,8 @@ pub struct Incoming {
     pub webhook_id: Option<String>,
     /// Posted by a bot account (another Disco relaying its owner's words).
     pub bot: bool,
-    /// A button press on one of our messages: (interaction id, token, custom_id).
+    /// A button press on one of our messages, already acknowledged:
+    /// (application id, interaction token, custom_id), for [`Rest::interaction_reply`].
     pub press: Option<(String, String, String)>,
 }
 
@@ -454,35 +501,92 @@ pub struct GatewayReport {
 }
 
 enum End {
-    /// Fatal: wrong token or missing intent. Don't retry.
+    /// Fatal: wrong token, missing intent, bad shard/version. Don't retry.
     Fatal(String),
     Retry(String),
     Stopped,
 }
 
+/// What lets the next connection RESUME the last session instead of starting over,
+/// so events sent while we were away are replayed rather than lost.
+#[derive(Debug, Default)]
+struct Resume {
+    session_id: Option<String>,
+    url: Option<String>,
+    seq: Option<u64>,
+}
+
+impl Resume {
+    /// The gateway host to dial: the session's resume host while resumable.
+    fn host(&self) -> String {
+        match (&self.session_id, &self.url) {
+            (Some(_), Some(u)) => u.trim_start_matches("wss://").split(['/', ':', '?']).next().filter(|h| !h.is_empty()).unwrap_or(GATEWAY_HOST).to_owned(),
+            _ => GATEWAY_HOST.to_owned(),
+        }
+    }
+
+    /// The reply to HELLO: op 6 RESUME when we can, else op 2 IDENTIFY.
+    fn hello_reply(&self, token: &str) -> Value {
+        match (&self.session_id, self.seq) {
+            (Some(id), Some(seq)) => json!({"op": 6, "d": {"token": token, "session_id": id, "seq": seq}}),
+            _ => json!({"op": 2, "d": {"token": token, "intents": INTENTS,
+                "properties": {"os": std::env::consts::OS, "browser": "disco", "device": "disco"}}}),
+        }
+    }
+}
+
+/// How a gateway close code shapes the next connection.
+#[derive(Debug, PartialEq)]
+enum Close {
+    Resume,
+    Identify,
+    Fatal(&'static str),
+}
+
+fn close_kind(code: u16) -> Close {
+    match code {
+        4004 => Close::Fatal("Bot token 无效（4004）"),
+        4010 | 4011 => Close::Fatal("Gateway 分片配置无效（4010/4011）"),
+        4012 => Close::Fatal("Gateway API 版本无效（4012）"),
+        4013 => Close::Fatal("Gateway intents 无效（4013）"),
+        4014 => Close::Fatal("缺少特权 intent：请在 Discord 开发者后台打开 Message Content Intent（4014）"),
+        // Invalid seq, session timed out, or a clean close: that session is gone.
+        4007 | 4009 | 1000 | 1001 => Close::Identify,
+        _ => Close::Resume,
+    }
+}
+
 type Ws = tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<TcpStream>>;
 
-async fn open_ws() -> Result<Ws, String> {
+async fn open_ws(host: &str) -> Result<Ws, String> {
     let proxy = proxy_url();
-    let tcp = tunnel(GATEWAY_HOST, proxy.as_deref()).await?;
-    let url = format!("wss://{GATEWAY_HOST}/?v=10&encoding=json");
-    let (ws, _) = tokio::time::timeout(Duration::from_secs(20), tokio_tungstenite::client_async_tls_with_config(url, tcp, None, None))
-        .await
-        .map_err(|_| "Gateway 握手超时".to_owned())?
-        .map_err(|e| format!("Gateway 握手失败：{e}"))?;
+    let tcp = tunnel(host, proxy.as_deref()).await?;
+    let url = format!("wss://{host}/?v=10&encoding=json");
+    let (ws, _) = tokio_tungstenite::client_async_tls_with_config(url, tcp, None, None).await.map_err(|e| format!("Gateway 握手失败：{e}"))?;
     Ok(ws)
 }
 
-/// One gateway session: HELLO → IDENTIFY → events, with heartbeats.
+/// One gateway session: HELLO → RESUME or IDENTIFY → events, with heartbeats.
+/// `on_ready` gets READY's data, or None when a session was resumed.
 async fn session(
     token: &str,
     stop: &mut watch::Receiver<bool>,
-    mut on_ready: impl FnMut(&Value),
+    resume: &mut Resume,
+    mut on_ready: impl FnMut(Option<&Value>),
     mut on_message: impl FnMut(&Value) -> bool,
 ) -> End {
-    let mut ws = match open_ws().await { Ok(w) => w, Err(e) => return End::Retry(e) };
-    let mut seq: Option<u64> = None;
-    let mut beat = tokio::time::interval(Duration::from_secs(3600));
+    // Connecting (TCP, proxy, TLS, WebSocket) as a whole is bounded and stoppable.
+    let host = resume.host();
+    let mut ws = tokio::select! {
+        _ = stop.changed() => return End::Stopped,
+        r = tokio::time::timeout(Duration::from_secs(20), open_ws(&host)) => match r {
+            Ok(Ok(w)) => w,
+            Ok(Err(e)) => return End::Retry(e),
+            Err(_) => return End::Retry("连接 Gateway 超时".into()),
+        },
+    };
+    // No heartbeat until HELLO says how often.
+    let mut beat = tokio::time::interval_at(tokio::time::Instant::now() + Duration::from_secs(3600), Duration::from_secs(3600));
     let mut acked = true;
     loop {
         tokio::select! {
@@ -490,17 +594,17 @@ async fn session(
             _ = beat.tick() => {
                 if !acked { return End::Retry("心跳无响应".into()); }
                 acked = false;
-                if ws.send(Message::text(json!({"op": 1, "d": seq}).to_string())).await.is_err() { return End::Retry("发送心跳失败".into()); }
+                if ws.send(Message::text(json!({"op": 1, "d": resume.seq}).to_string())).await.is_err() { return End::Retry("发送心跳失败".into()); }
             }
             msg = ws.next() => {
                 let text = match msg {
                     Some(Ok(Message::Text(t))) => t.to_string(),
                     Some(Ok(Message::Close(f))) => {
                         let (code, reason) = f.map(|f| (u16::from(f.code), f.reason.to_string())).unwrap_or((0, String::new()));
-                        return match code {
-                            4004 => End::Fatal("Bot token 无效（4004）".into()),
-                            4013 | 4014 => End::Fatal("缺少特权 intent：请在 Discord 开发者后台打开 Message Content Intent（4014）".into()),
-                            _ => End::Retry(format!("Gateway 关闭 {code} {reason}")),
+                        return match close_kind(code) {
+                            Close::Fatal(e) => End::Fatal(e.into()),
+                            Close::Identify => { *resume = Resume::default(); End::Retry(format!("Gateway 关闭 {code} {reason}")) }
+                            Close::Resume => End::Retry(format!("Gateway 关闭 {code} {reason}")),
                         };
                     }
                     Some(Ok(_)) => continue,
@@ -508,21 +612,29 @@ async fn session(
                     None => return End::Retry("Gateway 连接结束".into()),
                 };
                 let Ok(v) = serde_json::from_str::<Value>(&text) else { continue };
-                if let Some(s) = v["s"].as_u64() { seq = Some(s); }
+                if let Some(s) = v["s"].as_u64() { resume.seq = Some(s); }
                 match v["op"].as_u64() {
                     Some(10) => {
-                        let ms = v["d"]["heartbeat_interval"].as_u64().unwrap_or(41_250);
-                        beat = tokio::time::interval_at(tokio::time::Instant::now() + Duration::from_millis(ms / 2), Duration::from_millis(ms));
-                        let identify = json!({"op": 2, "d": {"token": token, "intents": INTENTS,
-                            "properties": {"os": std::env::consts::OS, "browser": "disco", "device": "disco"}}});
-                        if ws.send(Message::text(identify.to_string())).await.is_err() { return End::Retry("IDENTIFY 发送失败".into()); }
+                        let ms = v["d"]["heartbeat_interval"].as_u64().unwrap_or(41_250).max(1000);
+                        // First beat after interval × jitter, as Discord asks.
+                        let jitter = u64::from(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().subsec_millis());
+                        beat = tokio::time::interval_at(tokio::time::Instant::now() + Duration::from_millis(ms * jitter / 1000), Duration::from_millis(ms));
+                        if ws.send(Message::text(resume.hello_reply(token).to_string())).await.is_err() { return End::Retry("IDENTIFY 发送失败".into()); }
                     }
                     Some(11) => acked = true,
-                    Some(1) => { let _ = ws.send(Message::text(json!({"op": 1, "d": seq}).to_string())).await; }
+                    Some(1) => { let _ = ws.send(Message::text(json!({"op": 1, "d": resume.seq}).to_string())).await; }
                     Some(7) => return End::Retry("Discord 要求重连".into()),
-                    Some(9) => return End::Retry("会话失效".into()),
+                    Some(9) => {
+                        if v["d"].as_bool() != Some(true) { *resume = Resume::default(); }
+                        return End::Retry("会话失效".into());
+                    }
                     Some(0) => match v["t"].as_str() {
-                        Some("READY") => on_ready(&v["d"]),
+                        Some("READY") => {
+                            resume.session_id = v["d"]["session_id"].as_str().map(str::to_owned);
+                            resume.url = v["d"]["resume_gateway_url"].as_str().map(str::to_owned);
+                            on_ready(Some(&v["d"]));
+                        }
+                        Some("RESUMED") => on_ready(None),
                         Some("MESSAGE_CREATE") if !on_message(&v["d"]) => return End::Stopped,
                         Some("INTERACTION_CREATE") if v["d"]["type"].as_u64() == Some(3) => {
                             let mut d = v["d"].clone();
@@ -543,7 +655,8 @@ pub async fn gateway_check(token: String, timeout: Duration) -> Result<GatewayRe
     let t0 = Instant::now();
     let (stop_tx, mut stop_rx) = watch::channel(false);
     let mut report = None;
-    let end = tokio::time::timeout(timeout, session(&token, &mut stop_rx, |d| {
+    let end = tokio::time::timeout(timeout, session(&token, &mut stop_rx, &mut Resume::default(), |d| {
+        let Some(d) = d else { return };
         report = Some(GatewayReport {
             bot_name: d["user"]["username"].as_str().unwrap_or_default().into(),
             guilds: d["guilds"].as_array().map_or(0, Vec::len),
@@ -560,24 +673,31 @@ pub async fn gateway_check(token: String, timeout: Duration) -> Result<GatewayRe
 }
 
 /// Long-running gateway: forwards human guild messages to `tx`, reports status,
-/// reconnects with backoff until `stop` flips.
+/// reconnects (resuming the session when Discord allows) with backoff until `stop` flips.
 pub async fn run_gateway(token: String, tx: mpsc::Sender<Incoming>, mut stop: watch::Receiver<bool>, on_status: impl Fn(String) + Send + 'static) {
+    let rest = Rest::new(token.clone());
     let mut backoff = 2u64;
+    let mut resume = Resume::default();
+    // Our own bot id (from READY): its messages are never echoed back. Kept across resumes.
+    let me = std::sync::Mutex::new(String::new());
+    let mut online = String::new();
     loop {
         let via = proxy_url().map(|p| format!("（经代理 {p}）")).unwrap_or_default();
         on_status(format!("连接中{via}…"));
         let mut was_ready = false;
-        // Our own bot id (from READY): its messages are never echoed back.
-        let me = std::sync::Mutex::new(String::new());
-        let end = session(&token, &mut stop, |d| {
+        let end = session(&token, &mut stop, &mut resume, |d| {
             was_ready = true;
-            *me.lock().unwrap_or_else(|p| p.into_inner()) = d["user"]["id"].as_str().unwrap_or_default().to_owned();
-            let guilds = d["guilds"].as_array().map_or(0, Vec::len);
-            on_status(format!("在线 · {} · {guilds} 个服务器", d["user"]["username"].as_str().unwrap_or("bot")));
+            if let Some(d) = d {
+                *me.lock().unwrap_or_else(|p| p.into_inner()) = d["user"]["id"].as_str().unwrap_or_default().to_owned();
+                let guilds = d["guilds"].as_array().map_or(0, Vec::len);
+                online = format!("在线 · {} · {guilds} 个服务器", d["user"]["username"].as_str().unwrap_or("bot"));
+            }
+            on_status(online.clone());
         }, |m| {
             if m["__press"].as_bool() == Some(true) {
                 // Component interaction: the presser is `member.user` in guilds, `user` in DMs.
                 let u = if m["member"]["user"].is_object() { &m["member"]["user"] } else { &m["user"] };
+                let (id, token) = (m["id"].as_str().unwrap_or_default().to_owned(), m["token"].as_str().unwrap_or_default().to_owned());
                 let msg = Incoming {
                     guild_id: m["guild_id"].as_str().unwrap_or_default().into(),
                     channel_id: m["channel_id"].as_str().unwrap_or_default().into(),
@@ -586,10 +706,16 @@ pub async fn run_gateway(token: String, tx: mpsc::Sender<Incoming>, mut stop: wa
                     content: String::new(),
                     webhook_id: None,
                     bot: false,
-                    press: Some((m["id"].as_str().unwrap_or_default().into(), m["token"].as_str().unwrap_or_default().into(),
+                    press: Some((m["application_id"].as_str().unwrap_or_default().into(), token.clone(),
                         m["data"]["custom_id"].as_str().unwrap_or_default().into())),
                 };
-                return tx.try_send(msg).is_ok() || !tx.is_closed();
+                // Ack within Discord's 3 s before any work; the app answers via the followup webhook.
+                let (rest, sender) = (rest.clone(), tx.clone());
+                tokio::spawn(async move {
+                    let _ = rest.ack_press(&id, &token).await;
+                    let _ = sender.send(msg).await;
+                });
+                return !tx.is_closed();
             }
             let a = &m["author"];
             if a["id"].as_str() == Some(me.lock().unwrap_or_else(|p| p.into_inner()).as_str()) { return true; }
@@ -635,6 +761,53 @@ mod tests {
         assert!(parts.iter().all(|p| p.chars().count() <= 2000));
         assert_eq!(parts.concat(), long);
         assert_eq!(chunk("a\nb"), ["a\nb"]);
+    }
+
+    #[test]
+    fn chunks_keep_code_fences() {
+        let body: String = (0..400).map(|i| format!("let x{i} = {i};\n")).collect();
+        let text = format!("intro\n```rust\n{body}```\nouter\n");
+        let parts = chunk(&text);
+        assert!(parts.len() > 1);
+        for p in &parts {
+            assert!(p.encode_utf16().count() <= 2000);
+            assert_eq!(p.matches("```").count() % 2, 0, "unbalanced fence in {p:?}");
+        }
+        assert!(parts[1].starts_with("```rust\n"));
+        assert!(parts[0].ends_with("\n```"));
+        assert!(parts.last().unwrap().ends_with("outer\n"));
+        // Same lines, in order, once the added fences are taken out.
+        let lines = |s: &str| s.lines().filter(|l| !l.starts_with("```")).map(str::to_owned).collect::<Vec<_>>();
+        assert_eq!(parts.iter().flat_map(|p| lines(p)).collect::<Vec<_>>(), lines(&text));
+    }
+
+    #[test]
+    fn chunks_count_utf16_and_skip_blank() {
+        let emoji = "😀".repeat(1500); // 3000 UTF-16 units in one line
+        let parts = chunk(&emoji);
+        assert!(parts.iter().all(|p| p.encode_utf16().count() <= 1900));
+        assert_eq!(parts.concat(), emoji);
+        assert!(chunk("   \n\n  ").is_empty());
+        let spaced = format!("{}\n{}\nend", "a".repeat(1890), " ".repeat(1890));
+        assert!(chunk(&spaced).iter().all(|p| !p.trim().is_empty()));
+    }
+
+    #[test]
+    fn resume_decisions() {
+        assert_eq!(close_kind(4004), Close::Fatal("Bot token 无效（4004）"));
+        for c in [4010, 4011, 4012, 4013, 4014] { assert!(matches!(close_kind(c), Close::Fatal(_)), "{c}"); }
+        for c in [4007, 4009, 1000] { assert_eq!(close_kind(c), Close::Identify, "{c}"); }
+        for c in [0, 1006, 4000, 4001, 4008] { assert_eq!(close_kind(c), Close::Resume, "{c}"); }
+
+        let mut r = Resume::default();
+        assert_eq!(r.hello_reply("t")["op"], 2);
+        assert_eq!(r.host(), GATEWAY_HOST);
+        r = Resume { session_id: Some("s1".into()), url: Some("wss://gateway-us-east1-b.discord.gg".into()), seq: Some(42) };
+        let v = r.hello_reply("t");
+        assert_eq!((v["op"].as_u64(), v["d"]["session_id"].as_str(), v["d"]["seq"].as_u64()), (Some(6), Some("s1"), Some(42)));
+        assert_eq!(r.host(), "gateway-us-east1-b.discord.gg");
+        r.seq = None; // READY never sequenced: nothing to resume from
+        assert_eq!(r.hello_reply("t")["op"], 2);
     }
 
     #[test]

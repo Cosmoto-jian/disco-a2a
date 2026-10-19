@@ -239,7 +239,10 @@ impl Core {
         if self.hub.reap(agent).await { self.forget_sessions(Some(agent)); }
         // Memory goes only to agents running on this Mac, never to a remote one,
         // and never into a guest's (`peer:`) session.
-        let first = row.transport != "a2a" && !context.starts_with("peer:") && self.memory_on(context) && self.primed.lock().unwrap_or_else(|p| p.into_inner()).insert(format!("{agent}|{context}"));
+        // Primed only once the turn went through, so a failed first turn tries again.
+        let key = format!("{agent}|{context}");
+        let primed = self.primed.lock().unwrap_or_else(|p| p.into_inner()).contains(&key);
+        let first = !primed && row.transport != "a2a" && !context.starts_with("peer:") && self.memory_on(context);
         let with_mem;
         let prompt = if first { with_mem = format!("{}{prompt}", self.memory_preamble(agent, context)); with_mem.as_str() } else { prompt };
         // Team members work behind the scenes: no bubbles, only the activity strip
@@ -264,7 +267,9 @@ impl Core {
                 let _ = app.emit("stream", StreamEvt { thread: t.clone(), agent: a.clone(), event: ev.clone() });
             })
             .await;
-        self.inbox_expire(&asked.into_inner().unwrap_or_else(|p| p.into_inner()));
+        let asked = asked.into_inner().unwrap_or_else(|p| p.into_inner());
+        self.inbox_expire(&asked).await;
+        if first && res.is_ok() { self.primed.lock().unwrap_or_else(|p| p.into_inner()).insert(key); }
         if !hidden { let _ = self.app.emit("typing", TypingEvt { thread: thread.into(), agent: agent.into(), on: false }); }
         if matches!(&res, Err(e) if e.contains("进程已退出")) { self.forget_sessions(Some(agent)); }
         let _ = self.db().audit("disco", Some(agent), "prompt", if res.is_ok() { "ok" } else { "error" });
@@ -275,21 +280,21 @@ impl Core {
     fn remember_from(&self, agent: &str, thread: &str, answer: &str) {
         if !self.memory_on(thread) { return; }
         for l in answer.lines().filter_map(|l| l.trim().strip_prefix(MEM_TAG)) {
-            self.remember(agent, l);
+            if let Err(e) = self.remember(agent, l) { self.post_message(thread, "system", &e); }
         }
     }
 
     /// `记住 …` / `/remember …` from the user: save it, no agent turn. Returns true if handled.
     fn user_remember(&self, thread: &str, scope: &str, text: &str) -> bool {
-        let t = text.trim();
-        let Some(rest) = ["记住：", "记住:", "记住", "/remember ", "/记住 "].iter().find_map(|p| t.strip_prefix(p)) else { return false };
-        let rest = rest.trim();
-        if rest.is_empty() { return false; }
+        let Some(rest) = remember_cmd(text) else { return false };
         if !self.memory_on(thread) {
             self.post_message(thread, "system", "这个对话的记忆已关闭，没有保存。打开顶部的「记忆」开关后再说一次。");
             return true;
         }
-        self.remember(scope, rest);
+        if let Err(e) = self.remember(scope, rest) {
+            self.post_message(thread, "system", &e);
+            return true;
+        }
         self.post_message(thread, "system", &format!("已记住{}：{rest}", if scope == "all" { "（所有 agent）" } else if scope.starts_with("group-") { "（本群）" } else { "" }));
         true
     }
@@ -335,7 +340,7 @@ impl Core {
             let Some(logins) = core.hub.wants_login(&agent).await else { return };
             if core.inbox.list().iter().any(|i| i.agent == agent && i.title.starts_with(LOGIN_TITLE)) { return; }
             let label = |l: &disco_acp::Login| if l.terminal.is_some() { format!("在终端登录：{}", l.name) } else { l.name.clone() };
-            let rx = core.inbox_question(&thread, &agent, &format!("{LOGIN_TITLE}，选一种方式"), logins.iter().map(label).collect(), false);
+            let (_, rx) = core.inbox_question(&thread, &agent, &format!("{LOGIN_TITLE}，选一种方式"), logins.iter().map(label).collect(), false);
             let Ok(pick) = rx.await else { return };
             let Some(l) = logins.iter().find(|l| label(l) == pick) else { return };
             let line = core.hub.login(&agent, &l.id).await.unwrap_or_else(|e| format!("{agent} 登录失败：{e}"));
@@ -544,9 +549,11 @@ impl Core {
                         self.post_message(thread, "system", &format!("{cmd} 会改变 {agent} 的状态，只有它的主人能用。"));
                         return Vec::new();
                     }
-                    let prompt = slash.unwrap_or_else(|| self.group_prompt(g, thread, agent, by, roster));
+                    let (prompt, seen) = match slash { Some(s) => (s, None), None => self.group_prompt(g, thread, agent, by, roster) };
                     match self.turn(thread, agent, thread, &prompt).await {
                         Ok(answer) => {
+                            // The session holds the transcript only once its turn went through.
+                            if let Some(id) = seen { self.seen.lock().unwrap_or_else(|p| p.into_inner()).entry(format!("{agent}|{thread}")).and_modify(|v| *v = (*v).max(id)).or_insert(id); }
                             let answer = answer.trim();
                             if answer.is_empty() { return Vec::new(); }
                             let answer = if multi { lead_mention(answer, &display(by)) } else { answer.to_owned() };
@@ -634,13 +641,11 @@ impl Core {
         out
     }
 
-    fn group_prompt(&self, g: &GroupRow, thread: &str, me: &str, by: &str, roster: &Roster) -> String {
+    /// The prompt, and the newest message id it covers (to mark seen once the turn succeeds).
+    fn group_prompt(&self, g: &GroupRow, thread: &str, me: &str, by: &str, roster: &Roster) -> (String, Option<i64>) {
         let history = self.db().messages(thread, TRANSCRIPT).unwrap_or_default();
         let key = format!("{me}|{thread}");
         let last = self.seen.lock().unwrap_or_else(|p| p.into_inner()).get(&key).copied();
-        if let Some(newest) = history.last() {
-            self.seen.lock().unwrap_or_else(|p| p.into_inner()).insert(key, newest.id);
-        }
         let owner = share::owner_name();
         let mut p = match last {
             None => {
@@ -663,7 +668,7 @@ impl Core {
             p.push_str(&format!("[{who}] {}\n", m.body));
         }
         p.push_str(&format!("\n（这次是 {} 叫你，回复以 @{} 开头。）\n", display(by), display(by)));
-        p
+        (p, history.last().map(|m| m.id))
     }
 
     /// The agent's sessions are gone (stopped or crashed): forget what they had seen.
@@ -676,6 +681,15 @@ impl Core {
     fn discord_rest(&self) -> Option<Rest> {
         self.discord.lock().unwrap_or_else(|p| p.into_inner()).as_ref().map(|d| d.rest.clone())
     }
+}
+
+/// The note in `记住：…` / `/remember …`. The command must be followed by a
+/// separator, so `记住了吗？` is just a message.
+fn remember_cmd(text: &str) -> Option<&str> {
+    let t = text.trim();
+    let rest = ["记住", "/记住", "/remember"].iter().find_map(|p| t.strip_prefix(p))?;
+    let rest = rest.strip_prefix(['：', ':']).or_else(|| rest.starts_with(char::is_whitespace).then_some(rest))?.trim();
+    (!rest.is_empty()).then_some(rest)
 }
 
 /// Members named as `@name` in `text` (case-insensitive, whole names only, so
@@ -1519,8 +1533,7 @@ fn restore_group(core: St<'_>, id: String, guild_id: String, name: String, membe
 fn memory_restore(core: St<'_>, key: String) -> CmdResult<()> {
     let mut parts = key.splitn(3, '/');
     let (Some(scope), Some(topic), Some(text)) = (parts.next(), parts.next(), parts.next()) else { return Err("bad key".into()) };
-    core.remember_topic(scope, Some(topic), text);
-    Ok(())
+    core.remember_topic(scope, Some(topic), text)
 }
 
 /// The chat's memory switch: off = its sessions neither read nor write memory.
@@ -1664,6 +1677,20 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::mentions;
+
+    #[test]
+    fn remember_needs_a_separator() {
+        use super::remember_cmd;
+        assert_eq!(remember_cmd("记住：用 tab 缩进"), Some("用 tab 缩进"));
+        assert_eq!(remember_cmd("  记住: x "), Some("x"));
+        assert_eq!(remember_cmd("记住 我喜欢咖啡"), Some("我喜欢咖啡"));
+        assert_eq!(remember_cmd("/remember dark mode"), Some("dark mode"));
+        assert_eq!(remember_cmd("/记住 a"), Some("a"));
+        assert_eq!(remember_cmd("记住了吗？"), None);
+        assert_eq!(remember_cmd("/remembering x"), None);
+        assert_eq!(remember_cmd("记住："), None);
+        assert_eq!(remember_cmd("记住"), None);
+    }
 
     #[test]
     fn split_args_quotes() {

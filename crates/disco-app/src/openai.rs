@@ -21,6 +21,8 @@ pub struct OpenAi {
     http: reqwest::Client,
     history: Mutex<HashMap<String, Vec<Value>>>,
     stop: Mutex<HashMap<String, Arc<AtomicBool>>>,
+    /// One turn at a time per conversation, held for the whole turn.
+    turns: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     /// Loopback Disco MCP for tool calls: (port, tokens, this agent's name).
     mcp: Option<(u16, crate::hub::McpTokens, String)>,
 }
@@ -74,7 +76,7 @@ pub async fn models(http: &reqwest::Client, base: &str, key: Option<&str>) -> Re
 
 impl OpenAi {
     pub fn new(base: &str, key: Option<String>, model: String, http: reqwest::Client, mcp: Option<(u16, crate::hub::McpTokens, String)>) -> Self {
-        Self { base: normalize(base), key, model: Mutex::new(model), http, history: Mutex::default(), stop: Mutex::default(), mcp }
+        Self { base: normalize(base), key, model: Mutex::new(model), http, history: Mutex::default(), stop: Mutex::default(), turns: Mutex::default(), mcp }
     }
 
     pub async fn models(&self) -> Result<Vec<String>, String> { models(&self.http, &self.base, self.key.as_deref()).await }
@@ -112,6 +114,8 @@ impl OpenAi {
 
     /// One user turn in `context`: stream text, run tool calls, repeat until the model answers.
     pub async fn prompt(&self, context: &str, text: &str, on_event: &mut impl FnMut(AgentEvent)) -> Result<(), String> {
+        let turn = self.turns.lock().unwrap_or_else(|p| p.into_inner()).entry(context.to_owned()).or_default().clone();
+        let _turn = turn.lock().await;
         let flag = Arc::new(AtomicBool::new(false));
         self.stop.lock().unwrap_or_else(|p| p.into_inner()).insert(context.to_owned(), flag.clone());
         let mut msgs = self.history.lock().unwrap_or_else(|p| p.into_inner()).get(context).cloned().unwrap_or_default();
@@ -119,7 +123,7 @@ impl OpenAi {
         let tools = self.tools(context).await;
         let model = self.model.lock().unwrap_or_else(|p| p.into_inner()).clone();
         let mut result = Ok(());
-        for round in 0.. {
+        for round in 0..=MAX_ROUNDS {
             let offer = !tools.is_empty() && round < MAX_ROUNDS;
             let mut body = json!({ "model": model, "messages": msgs, "stream": true });
             if offer { body["tools"] = Value::Array(tools.clone()); }
@@ -132,7 +136,9 @@ impl OpenAi {
                 }
                 Err(e) => { result = Err(e); break; }
             };
-            if calls.is_empty() {
+            // The last round answers even if the server keeps asking for tools.
+            if calls.is_empty() || round == MAX_ROUNDS {
+                if reply.is_empty() && !calls.is_empty() { result = Err("工具调用轮数过多，已停止".into()); break; }
                 msgs.push(json!({ "role": "assistant", "content": reply }));
                 break;
             }
@@ -146,11 +152,16 @@ impl OpenAi {
             }
             if flag.load(Ordering::Relaxed) { result = Err("已停止".into()); break; }
         }
-        self.stop.lock().unwrap_or_else(|p| p.into_inner()).remove(context);
+        {
+            let mut stop = self.stop.lock().unwrap_or_else(|p| p.into_inner());
+            if stop.get(context).is_some_and(|f| Arc::ptr_eq(f, &flag)) { stop.remove(context); }
+        }
         if result.is_ok() {
-            // Keep the tail, starting at a user message so no tool reply loses its call.
+            // Keep the tail, starting at a user message so no tool reply loses its call; when the
+            // window holds none (one long tool turn), start at the last user message before it.
             let cut = msgs.len().saturating_sub(KEEP);
-            let start = msgs[cut..].iter().position(|m| m["role"] == "user").map_or(msgs.len(), |i| cut + i);
+            let is_user = |m: &Value| m["role"] == "user";
+            let start = msgs[cut..].iter().position(is_user).map(|i| cut + i).or_else(|| msgs[..cut].iter().rposition(is_user)).unwrap_or(0);
             self.history.lock().unwrap_or_else(|p| p.into_inner()).insert(context.to_owned(), msgs.split_off(start));
         }
         on_event(AgentEvent::Done { phase: if result.is_ok() { TaskPhase::Completed } else { TaskPhase::Failed }, stop_reason: result.as_ref().err().cloned() });
@@ -163,15 +174,13 @@ impl OpenAi {
         let mut r = req.send().await.map_err(|e| format!("连不上模型服务：{e}"))?;
         let status = r.status();
         if !status.is_success() { return Err(http_err(status, &r.text().await.unwrap_or_default())); }
-        let (mut text, mut calls, mut buf) = (String::new(), Vec::<Value>::new(), String::new());
+        let (mut text, mut calls, mut buf) = (String::new(), Vec::<Value>::new(), Vec::<u8>::new());
         let mut whole = String::new();
         loop {
             if flag.load(Ordering::Relaxed) { return Err("已停止".into()); }
             let Some(chunk) = r.chunk().await.map_err(|e| format!("连接中断：{e}"))? else { break };
-            buf.push_str(&String::from_utf8_lossy(&chunk));
-            while let Some(i) = buf.find('\n') {
-                let line = buf[..i].trim().to_owned();
-                buf.drain(..=i);
+            buf.extend_from_slice(&chunk);
+            for line in take_lines(&mut buf) {
                 let Some(data) = line.strip_prefix("data:").map(str::trim) else { whole.push_str(&line); continue };
                 if data == "[DONE]" { continue; }
                 let Ok(v) = serde_json::from_str::<Value>(data) else { continue };
@@ -184,22 +193,11 @@ impl OpenAi {
                     text.push_str(t);
                     on_event(AgentEvent::TextChunk { text: t.into() });
                 }
-                for tc in d.get("tool_calls").and_then(Value::as_array).into_iter().flatten() {
-                    let i = tc.get("index").and_then(Value::as_u64).map_or(calls.len(), |i| i as usize);
-                    while calls.len() <= i { calls.push(json!({ "id": "", "type": "function", "function": { "name": "", "arguments": "" } })); }
-                    let c = &mut calls[i];
-                    if let Some(id) = tc.get("id").and_then(Value::as_str) { c["id"] = id.into(); }
-                    for k in ["name", "arguments"] {
-                        if let Some(s) = tc["function"].get(k).and_then(Value::as_str) {
-                            let cur = c["function"][k].as_str().unwrap_or("").to_owned();
-                            c["function"][k] = Value::String(cur + s);
-                        }
-                    }
-                }
+                for tc in d.get("tool_calls").and_then(Value::as_array).into_iter().flatten() { merge_call(&mut calls, tc); }
             }
         }
         // A server that ignored `stream` answers with one plain JSON body.
-        whole.push_str(buf.trim());
+        whole.push_str(String::from_utf8_lossy(&buf).trim());
         if text.is_empty() && calls.is_empty() && let Ok(v) = serde_json::from_str::<Value>(&whole) {
             let m = &v["choices"][0]["message"];
             if let Some(t) = m.get("content").and_then(Value::as_str) { text = t.to_owned(); on_event(AgentEvent::TextChunk { text: text.clone() }); }
@@ -207,13 +205,87 @@ impl OpenAi {
         }
         for (n, c) in calls.iter_mut().enumerate() {
             if c["id"].as_str().is_none_or(str::is_empty) { c["id"] = format!("call_{n}").into(); }
+            // Servers expect `arguments` back as a JSON string.
+            let args = &mut c["function"]["arguments"];
+            if !args.is_string() { *args = Value::String(if args.is_null() { "{}".into() } else { args.to_string() }); }
         }
         Ok((text, calls))
     }
 }
 
+/// The complete lines in `buf`, decoded only once whole so a UTF-8 character split
+/// across network chunks survives; the unfinished tail stays in `buf`.
+fn take_lines(buf: &mut Vec<u8>) -> Vec<String> {
+    let Some(end) = buf.iter().rposition(|&b| b == b'\n') else { return Vec::new() };
+    let done: Vec<u8> = buf.drain(..=end).collect();
+    done[..end].split(|&b| b == b'\n').map(|l| String::from_utf8_lossy(l).trim().to_owned()).collect()
+}
+
+/// Fold one streamed tool-call delta into `calls`. Without an `index`, a delta continues the
+/// last call unless it brings a new id; `arguments` may come as an object; the name is set once.
+fn merge_call(calls: &mut Vec<Value>, tc: &Value) {
+    let id = tc.get("id").and_then(Value::as_str).filter(|s| !s.is_empty());
+    let i = match tc.get("index").and_then(Value::as_u64) {
+        Some(i) => i as usize,
+        None => match calls.last().and_then(|c| c["id"].as_str()) {
+            Some(last) if id.is_none_or(|id| last.is_empty() || last == id) => calls.len() - 1,
+            _ => calls.len(),
+        },
+    };
+    while calls.len() <= i { calls.push(json!({ "id": "", "type": "function", "function": { "name": "", "arguments": "" } })); }
+    let c = &mut calls[i];
+    if let Some(id) = id && c["id"].as_str().is_none_or(str::is_empty) { c["id"] = id.into(); }
+    let f = &tc["function"];
+    if let Some(name) = f.get("name").and_then(Value::as_str) && c["function"]["name"].as_str().is_none_or(str::is_empty) {
+        c["function"]["name"] = name.into();
+    }
+    let more = match f.get("arguments") {
+        Some(Value::String(s)) => s.clone(),
+        Some(v) if !v.is_null() => v.to_string(),
+        _ => return,
+    };
+    let cur = c["function"]["arguments"].as_str().unwrap_or("").to_owned();
+    c["function"]["arguments"] = Value::String(cur + &more);
+}
+
 #[cfg(test)]
 mod tests {
+    use serde_json::json;
+
+    #[test]
+    fn sse_lines_keep_split_utf8() {
+        let bytes = "data: {\"t\":\"你好\"}\ndata: 世界\n".as_bytes();
+        let mut buf = Vec::new();
+        let mut got = Vec::new();
+        // Feed one byte at a time, so every multi-byte character is split.
+        for b in bytes { buf.push(*b); got.extend(super::take_lines(&mut buf)); }
+        assert_eq!(got, ["data: {\"t\":\"你好\"}", "data: 世界"]);
+        assert!(buf.is_empty());
+        buf.extend_from_slice("data: 半".as_bytes());
+        assert!(super::take_lines(&mut buf).is_empty());
+        assert_eq!(buf, "data: 半".as_bytes());
+    }
+
+    #[test]
+    fn tool_calls_merge_without_index() {
+        let mut calls = Vec::new();
+        for tc in [
+            json!({ "id": "a", "function": { "name": "todo_add", "arguments": "{\"text\":" } }),
+            json!({ "function": { "arguments": "\"x\"}" } }),
+            json!({ "id": "a", "function": { "name": "todo_add" } }),
+            json!({ "id": "b", "function": { "name": "doc_read", "arguments": { "group": 1 } } }),
+        ] { super::merge_call(&mut calls, &tc); }
+        assert_eq!(calls.len(), 2, "{calls:?}");
+        assert_eq!((calls[0]["id"].as_str(), calls[0]["function"]["name"].as_str(), calls[0]["function"]["arguments"].as_str()), (Some("a"), Some("todo_add"), Some("{\"text\":\"x\"}")));
+        assert_eq!((calls[1]["id"].as_str(), calls[1]["function"]["arguments"].as_str()), (Some("b"), Some("{\"group\":1}")));
+        // With an index, deltas land where they say.
+        let mut calls = Vec::new();
+        for tc in [json!({ "index": 1, "id": "y", "function": { "name": "n", "arguments": "{" } }), json!({ "index": 1, "function": { "arguments": "}" } })] {
+            super::merge_call(&mut calls, &tc);
+        }
+        assert_eq!((calls.len(), calls[1]["function"]["arguments"].as_str()), (2, Some("{}")));
+    }
+
     #[test]
     fn base_url_forms() {
         for b in ["https://x.ai/v1", "https://x.ai/v1/", "https://x.ai/v1/chat/completions", " https://x.ai/v1/chat/completions/ "] {

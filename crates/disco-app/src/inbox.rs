@@ -99,21 +99,30 @@ impl Core {
         self.inbox_add(item, Reply::Permission { request_id: request_id.into() });
     }
 
-    /// An agent's question for the user; resolves with the answer (or None if
+    /// An agent's question for the user: its item id, and the answer (an error if
     /// it is withdrawn, e.g. the user stopped everything).
-    pub(crate) fn inbox_question(&self, thread: &str, agent: &str, question: &str, options: Vec<String>, text: bool) -> oneshot::Receiver<String> {
+    pub(crate) fn inbox_question(&self, thread: &str, agent: &str, question: &str, options: Vec<String>, text: bool) -> (String, oneshot::Receiver<String>) {
         let (tx, rx) = oneshot::channel();
         let item = Item {
             id: uuid::Uuid::new_v4().simple().to_string(), kind: "question", thread: thread.into(), agent: agent.into(), title: question.into(),
             options: options.into_iter().enumerate().map(|(i, l)| Opt { id: i.to_string(), label: l, allow: false, always: false }).collect(),
             text, ts: crate::now(),
         };
+        let id = item.id.clone();
         self.inbox_add(item, Reply::Question(tx));
-        rx
+        (id, rx)
     }
 
-    /// Drop the permission prompts a finished turn left open (the agent no longer waits on them).
-    pub(crate) fn inbox_expire(&self, request_ids: &[String]) {
+    /// Take one item back (nobody waits on it any more, e.g. `ask_user` timed out).
+    pub(crate) fn inbox_withdraw(&self, id: &str, why: &str) {
+        let Some(e) = lock(&self.inbox.items).remove(id) else { return };
+        self.inbox_changed();
+        self.settle_discord(vec![e], why);
+    }
+
+    /// Drop the permission prompts a finished turn left open, and cancel them on
+    /// the agent's side so nothing keeps waiting on them.
+    pub(crate) async fn inbox_expire(&self, request_ids: &[String]) {
         if request_ids.is_empty() { return; }
         let gone: Vec<Entry> = {
             let mut items = lock(&self.inbox.items);
@@ -124,6 +133,9 @@ impl Core {
         };
         if gone.is_empty() { return; }
         self.inbox_changed();
+        for e in &gone {
+            if let Reply::Permission { request_id } = &e.reply { self.hub.decide(&e.item.agent, request_id, PermissionDecision::Cancel).await; }
+        }
         self.settle_discord(gone, "（已失效：这一轮已结束）");
     }
 
@@ -136,13 +148,13 @@ impl Core {
     }
 
     fn settle_discord(&self, gone: Vec<Entry>, why: &str) {
-        let Some(rest) = self.discord_rest() else { return };
-        for e in gone {
-            if let Some((ch, msg)) = e.discord {
-                let (rest, text) = (rest.clone(), format!("~~{}~~ {why}", e.item.title));
-                tauri::async_runtime::spawn(async move { let _ = rest.settle_message(&ch, &msg, &text).await; });
-            }
-        }
+        for e in gone { self.settle_card(e.discord, format!("~~{}~~ {why}", e.item.title)); }
+    }
+
+    /// Replace a Discord card's buttons with `text`.
+    fn settle_card(&self, discord: Option<(String, String)>, text: String) {
+        let (Some((ch, msg)), Some(rest)) = (discord, self.discord_rest()) else { return };
+        tauri::async_runtime::spawn(async move { let _ = rest.settle_message(&ch, &msg, &text).await; });
     }
 
     /// Answer an item. `via` names the surface for the record ("Disco" / "Discord").
@@ -157,26 +169,30 @@ impl Core {
             items.remove(id)
         }) else { return Err("这一项已经处理过或已失效".into()) };
         self.inbox_changed();
-        let label = ans.option.as_ref().and_then(|o| e.item.options.iter().find(|x| x.id == *o)).map(|o| o.label.clone());
-        let line = match e.reply {
+        let Entry { item, reply, discord } = e;
+        let label = ans.option.as_ref().and_then(|o| item.options.iter().find(|x| x.id == *o)).map(|o| o.label.clone());
+        let line = match reply {
             Reply::Permission { request_id } => {
                 let d = match &ans.option { Some(o) if label.is_some() => PermissionDecision::Select { option_id: o.clone() }, _ => PermissionDecision::Cancel };
-                let ok = self.hub.decide(&e.item.agent, &request_id, d).await;
-                if !ok { return Err("agent 已结束这一轮，这个请求失效了".into()); }
-                format!("{}：{}", label.as_deref().unwrap_or("已拒绝"), e.item.title)
+                if !self.hub.decide(&item.agent, &request_id, d).await {
+                    self.settle_card(discord, format!("~~{}~~ （已失效：这一轮已结束）", item.title));
+                    return Err("agent 已结束这一轮，这个请求失效了".into());
+                }
+                format!("{}：{}", label.as_deref().unwrap_or("已拒绝"), item.title)
             }
             Reply::Question(tx) => {
-                let answer = label.clone().or(ans.text.map(|t| t.trim().to_owned())).filter(|t| !t.is_empty()).ok_or("回答不能为空")?;
-                self.post_message(&e.item.thread, "me", &format!("回答 {}：{answer}", e.item.agent));
-                let _ = tx.send(answer.clone());
+                // Validated above: a question only gets here with a real answer.
+                let answer = label.clone().or(ans.text.map(|t| t.trim().to_owned())).filter(|t| !t.is_empty()).unwrap_or_default();
+                if tx.send(answer.clone()).is_err() {
+                    self.settle_card(discord, format!("~~{}~~ （已失效：agent 不再等待）", item.title));
+                    return Err("agent 已不再等待这个回答".into());
+                }
+                self.post_message(&item.thread, "me", &format!("回答 {}：{answer}", item.agent));
                 answer
             }
         };
-        let _ = self.db().audit(via, Some(&e.item.agent), &format!("inbox.{}", e.item.kind), &line);
-        if let Some((ch, msg)) = e.discord && via != "Discord" && let Some(rest) = self.discord_rest() {
-            let text = format!("~~{}~~ → {line}（在 {via} 中处理）", e.item.title);
-            tauri::async_runtime::spawn(async move { let _ = rest.settle_message(&ch, &msg, &text).await; });
-        }
+        let _ = self.db().audit(via, Some(&item.agent), &format!("inbox.{}", item.kind), &line);
+        if via != "Discord" { self.settle_card(discord, format!("~~{}~~ → {line}（在 {via} 中处理）", item.title)); }
         Ok(line)
     }
 

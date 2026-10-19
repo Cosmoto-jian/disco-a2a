@@ -214,6 +214,22 @@ pub fn spawn(app: AppHandle, mock: String) {
             crate::share::revoke_share(st(), id);
             let n = count(&core, "dm:guest1", "system"); crate::send(st(), "dm:guest1".into(), "还在吗".into())?;
             wait_msg(&core, "dm:guest1", "system", n, 30).await.and_then(|b| if b.contains("撤销") { Ok(b) } else { Err(b) }) });
+        // v1.5.13 share
+        let _ = check!("共享 不泄露存在与用户名", {
+            crate::share::create_share(st(), "m1".into(), "小李".into(), "chat".into(), 0)?;
+            let id = core.shares().into_iter().find(|(_, s)| s.guest == "小李").map(|(id, _)| id).ok_or("找不到共享")?;
+            let (base, http) = (core.share_base()?, crate::openai::client(&[]));
+            let body = serde_json::json!({ "jsonrpc": "2.0", "id": 1, "method": "SendMessage", "params": {} });
+            let mut seen = Vec::new();
+            for a in [id.as_str(), "000000000000"] {
+                let r = within(10, http.post(format!("{base}/a/{a}/jsonrpc")).bearer_auth("wrong").json(&body).send()).await?.map_err(|e| e.to_string())?;
+                seen.push((r.status(), r.text().await.map_err(|e| e.to_string())?));
+            }
+            let card = within(10, http.get(format!("{base}/a/{id}/.well-known/agent-card.json")).send()).await?.map_err(|e| e.to_string())?.text().await.map_err(|e| e.to_string())?;
+            crate::share::revoke_share(st(), id);
+            if seen[0] != seen[1] { return Err(format!("真假共享的拒绝不一样：{seen:?}")); }
+            if card.contains(&format!("{} 通过", crate::share::owner_name())) { return Err(format!("名片带了用户名：{card}")); }
+            Ok(seen[0].0.to_string()) });
         let _ = within(10, crate::remove_agent(st(), "guest1".into(), Some(true))).await;
         let _ = check!("发文件到共享空间", {
             let f = std::env::temp_dir().join("disco-selftest.txt"); std::fs::write(&f, "hello").map_err(|e| e.to_string())?;
@@ -262,6 +278,32 @@ pub fn spawn(app: AppHandle, mock: String) {
             drop(held);
             let (t, err) = text(&r??);
             if err || !t.contains("hello from mock") { Err(t) } else { Ok(t) } });
+        // v1.5.13 core
+        let _ = check!("ask_user 超时后撤回，迟到的回答报错", {
+            let (id, rx) = core.inbox_question("dm:m1", "m1", "超时的问题", vec!["好".into()], false);
+            core.inbox_withdraw(&id, "（已超时）");
+            if core.inbox.list().iter().any(|i| i.id == id) { return Err("还在收件箱".into()); }
+            if rx.await.is_ok() { return Err("撤回后还收到了回答".into()); }
+            let (id, rx) = core.inbox_question("dm:m1", "m1", "没人等的问题", vec!["好".into()], false);
+            drop(rx);
+            match core.inbox_answer(&id, inbox::Answer { option: Some("0".into()), text: None }, "selftest").await {
+                Ok(l) => Err(format!("没人等也报成功：{l}")),
+                Err(_) => Ok(String::new()),
+            } });
+        let _ = check!("记住了吗？ 不当成记住", {
+            let before = core.memory_list().len();
+            let n = count(&core, "dm:m1", "m1"); crate::send(st(), "dm:m1".into(), "记住了吗？".into())?; wait_msg(&core, "dm:m1", "m1", n, 30).await?;
+            if core.memory_list().len() == before { Ok(String::new()) } else { Err("被存进了记忆".into()) } });
+        // end v1.5.13 core
+        // v1.5.13 runtime
+        let _ = check!("OpenAI 同一会话两轮排队", {
+            let base = mock_openai().await?;
+            let o = crate::openai::OpenAi::new(&base, None, "mock-model".into(), crate::openai::client(&[]), None);
+            let turn = |t: &'static str| { let o = &o; async move { o.prompt("dm:st", t, &mut |_| {}).await } };
+            let (a, b) = within(20, async { tokio::join!(turn("一"), turn("二")) }).await?;
+            a?; b?;
+            Ok(String::new()) });
+        // end v1.5.13 runtime
         println!("SELFTEST {}", if fails == 0 { "OK".to_string() } else { format!("{fails} FAILED") });
         std::process::exit(if fails == 0 { 0 } else { 1 });
     });

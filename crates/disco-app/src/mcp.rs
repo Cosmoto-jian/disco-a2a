@@ -249,7 +249,7 @@ impl Call<'_> {
             "remember" => {
                 let text = s(args, "text").ok_or("text 不能为空")?;
                 let (scope, label) = self.mem_scope(args)?;
-                self.core.remember_topic(&scope, s(args, "topic"), text);
+                self.core.remember_topic(&scope, s(args, "topic"), text)?;
                 Ok(format!("已记住（{label}）"))
             }
             "send_file" => {
@@ -347,13 +347,17 @@ impl Call<'_> {
         let text = args.get("allow_text").and_then(Value::as_bool).unwrap_or(options.is_empty());
         let thread = match self.place() { Place::Group(g) => format!("group:{}", g.id), _ => format!("dm:{}", self.agent) };
         self.core.post_message(&thread, self.agent, &format!("❓ {question}"));
-        let rx = self.core.inbox_question(&thread, self.agent, question, options, text);
+        let (id, rx) = self.core.inbox_question(&thread, self.agent, question, options, text);
         // Waiting on a person isn't work: free this turn's slot for others meanwhile.
         self.core.hub.yield_slot(self.agent, self.context);
         match tokio::time::timeout(ASK_USER_WAIT, rx).await {
             Ok(Ok(answer)) => Ok(format!("用户回答：{answer}")),
             Ok(Err(_)) => Err("用户撤回了这个问题（已全部停止）".into()),
-            Err(_) => Err(format!("{} 分钟内用户没有回答，请按最稳妥的方式继续或稍后再问", ASK_USER_WAIT.as_secs() / 60)),
+            Err(_) => {
+                let mins = ASK_USER_WAIT.as_secs() / 60;
+                self.core.inbox_withdraw(&id, &format!("（已超时：{mins} 分钟内没有回答）"));
+                Err(format!("{mins} 分钟内用户没有回答，请按最稳妥的方式继续或稍后再问"))
+            }
         }
     }
 
@@ -395,12 +399,14 @@ impl Call<'_> {
         let (thread, label) = self.space(args)?;
         let path = doc_path(self.core, &thread);
         let replace = s(args, "mode") == Some("replace");
+        let _guard = crate::memory::fs_lock();
         let mut doc = if replace { String::new() } else { std::fs::read_to_string(&path).unwrap_or_default() };
         if !doc.is_empty() && !doc.ends_with('\n') { doc.push('\n'); }
         doc.push_str(content);
         if !doc.ends_with('\n') { doc.push('\n'); }
         if doc.len() > DOC_MAX { return Err(format!("文档会超过 {} KB，请精简后用 replace 重写", DOC_MAX / 1000)); }
         write_doc(&path, &doc)?;
+        drop(_guard);
         self.core.post_message(&thread, "system", &format!("📝 {} {}了群文档", self.agent, if replace { "重写" } else { "更新" }));
         let _ = self.core.app.emit_space(&thread);
         Ok(format!("已写入「{label}」的群文档（{}）", path.display()))
@@ -480,9 +486,20 @@ pub fn doc_path(core: &Core, thread: &str) -> PathBuf {
 pub fn write_doc(path: &std::path::Path, doc: &str) -> Result<(), String> {
     if let Some(d) = path.parent() { std::fs::create_dir_all(d).map_err(|e| e.to_string())?; }
     // Write then rename, so a reader never sees half a file.
-    let tmp = path.with_extension("md.tmp");
-    std::fs::write(&tmp, doc).map_err(|e| e.to_string())?;
-    std::fs::rename(&tmp, path).map_err(|e| e.to_string())
+    let tmp = tmp_path(path);
+    std::fs::write(&tmp, doc).and_then(|()| std::fs::rename(&tmp, path)).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        e.to_string()
+    })
+}
+
+/// A scratch name beside `path`, unique per process and call, so concurrent
+/// writers never share one (hidden, and not `.md`, so no listing picks it up).
+fn tmp_path(path: &std::path::Path) -> PathBuf {
+    static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let name = path.file_name().map(|f| f.to_string_lossy().into_owned()).unwrap_or_default();
+    path.with_file_name(format!(".{name}.{}-{n}.tmp", std::process::id()))
 }
 
 /// Tell the UI a thread's to-dos or doc changed.
@@ -496,6 +513,16 @@ impl EmitSpace for tauri::AppHandle {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn tmp_names_are_unique() {
+        let p = std::path::Path::new("/x/y/group.md");
+        let (a, b) = (super::tmp_path(p), super::tmp_path(p));
+        assert_ne!(a, b);
+        assert_eq!(a.parent(), p.parent());
+        let name = a.file_name().unwrap().to_string_lossy().into_owned();
+        assert!(name.starts_with(".group.md.") && name.ends_with(".tmp"), "{name}");
+    }
+
     #[test]
     fn offline_is_an_empty_server() {
         let init = super::offline_reply(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26"}}"#);

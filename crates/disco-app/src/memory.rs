@@ -30,6 +30,13 @@ pub fn slug(s: &str) -> String {
     if out.is_empty() { DEFAULT_TOPIC.into() } else { out }
 }
 
+/// Serialises read-modify-write of note and doc files across the process. Held
+/// only around synchronous file operations, never across an `.await`.
+pub(crate) fn fs_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(|p| p.into_inner())
+}
+
 fn items(doc: &str) -> impl Iterator<Item = &str> { doc.lines().filter_map(|l| l.strip_prefix("- ")) }
 
 fn topics(dir: &std::path::Path) -> Vec<(String, String)> {
@@ -62,20 +69,27 @@ impl Core {
     }
 
     /// Save a note under `topic` (default `general`); exact duplicates are skipped.
-    pub(crate) fn remember_topic(&self, scope: &str, topic: Option<&str>, text: &str) {
+    pub(crate) fn remember_topic(&self, scope: &str, topic: Option<&str>, text: &str) -> Result<(), String> {
         let text = text.trim().replace('\n', " ");
-        if text.is_empty() { return; }
+        if text.is_empty() { return Ok(()); }
         let dir = self.memory_dir(scope);
         let topic = slug(topic.unwrap_or(DEFAULT_TOPIC));
         let path = dir.join(format!("{topic}.md"));
-        let mut doc = std::fs::read_to_string(&path).unwrap_or_else(|_| format!("# {topic}\n\n"));
-        if items(&doc).any(|l| l == text) { return; }
+        let _guard = fs_lock();
+        let mut doc = match std::fs::read_to_string(&path) {
+            Ok(d) => d,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => format!("# {topic}\n\n"),
+            Err(e) => return Err(format!("读取记忆失败：{e}")),
+        };
+        if items(&doc).any(|l| l == text) { return Ok(()); }
         if !doc.ends_with('\n') { doc.push('\n'); }
         doc.push_str(&format!("- {text}\n"));
-        if crate::mcp::write_doc(&path, &doc).is_ok() { reindex(&dir); }
+        crate::mcp::write_doc(&path, &doc).map_err(|e| format!("保存记忆失败：{e}"))?;
+        reindex(&dir);
+        Ok(())
     }
 
-    pub(crate) fn remember(&self, scope: &str, text: &str) { self.remember_topic(scope, None, text) }
+    pub(crate) fn remember(&self, scope: &str, text: &str) -> Result<(), String> { self.remember_topic(scope, None, text) }
 
     /// One topic's file (or the scope's index when `topic` is None).
     pub(crate) fn memory_read(&self, scope: &str, topic: Option<&str>) -> String {
@@ -141,6 +155,7 @@ impl Core {
         let (Some(scope), Some(topic), Some(text)) = (parts.next(), parts.next(), parts.next()) else { return Err("bad key".into()) };
         let dir = self.memory_dir(scope);
         let path = dir.join(format!("{}.md", slug(topic)));
+        let _guard = fs_lock();
         let doc = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
         let kept: String = doc.lines().filter(|l| l.strip_prefix("- ") != Some(text)).map(|l| format!("{l}\n")).collect();
         if items(&kept).count() == 0 { let _ = std::fs::remove_file(&path); } else { crate::mcp::write_doc(&path, &kept)?; }
@@ -157,7 +172,7 @@ impl Core {
     pub(crate) fn memory_migrate(&self) {
         let old = self.db().settings_with_prefix(crate::MEM).unwrap_or_default();
         for (k, text) in old {
-            if !text.is_empty() { self.remember(k.split('/').next().unwrap_or("all"), &text); }
+            if !text.is_empty() { let _ = self.remember(k.split('/').next().unwrap_or("all"), &text); }
             let _ = self.db().set_setting(&format!("{}{k}", crate::MEM), "");
         }
     }
