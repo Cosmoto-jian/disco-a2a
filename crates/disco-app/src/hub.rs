@@ -3,10 +3,11 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use disco_a2a::{Credential, RemoteAgent};
-use disco_acp::{AcpAgent, Launch, Login, McpStdio};
+use disco_acp::{AcpAgent, Launch, Login, McpStdio, SessionEnv};
 use disco_store::AgentRow;
 use disco_types::{AgentEvent, PermissionDecision, TaskPhase};
 use futures::StreamExt;
@@ -56,11 +57,46 @@ enum Runtime {
 
 type Cell = Arc<tokio::sync::OnceCell<Runtime>>;
 
+fn lock<T>(m: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|p| p.into_inner())
+}
+
+/// MCP token -> (agent, context). A token is minted per conversation, so a tool call
+/// acts only as that agent and only where that session lives, whatever the caller
+/// claims. Context "" is the agent-wide token for agents that read MCP servers from
+/// their own config (pi); its calls act where the agent was last asked something.
+#[derive(Clone, Default)]
+pub struct McpTokens(Arc<std::sync::Mutex<HashMap<String, (String, String)>>>);
+
+impl McpTokens {
+    /// The token for `agent` in `context` (the same one each time until revoked).
+    pub fn mint(&self, agent: &str, context: &str) -> String {
+        let mut t = lock(&self.0);
+        if let Some(tok) = t.iter().find(|(_, (a, c))| a == agent && c == context).map(|(k, _)| k.clone()) { return tok; }
+        let tok = uuid::Uuid::new_v4().simple().to_string();
+        t.insert(tok.clone(), (agent.to_owned(), context.to_owned()));
+        tok
+    }
+    pub fn lookup(&self, token: &str) -> Option<(String, String)> { lock(&self.0).get(token).cloned() }
+    pub fn revoke(&self, agent: &str) { lock(&self.0).retain(|_, (a, _)| a != agent); }
+}
+
+type Slot = Option<tokio::sync::OwnedSemaphorePermit>;
+
+/// A turn in flight; its slot (if it still holds one) is freed when it ends.
+struct Turn<'a>(&'a Hub, u64);
+impl Drop for Turn<'_> {
+    fn drop(&mut self) { lock(&self.0.turns).remove(&self.1); }
+}
+
 pub struct Hub {
     /// One cell per agent so concurrent first uses (warm-up + a prompt) start it once.
     live: Mutex<HashMap<String, Cell>>,
     /// Caps simultaneous agent turns across the whole app.
-    slots: Arc<tokio::sync::Semaphore>,
+    pub(crate) slots: Arc<tokio::sync::Semaphore>,
+    /// Turns in flight: id -> (agent, context, its slot).
+    turns: std::sync::Mutex<HashMap<u64, (String, String, Slot)>>,
+    next_turn: AtomicU64,
     /// The user's login-shell PATH: GUI apps start with a bare one, so npx and
     /// Homebrew tools would otherwise be invisible.
     pub user_path: String,
@@ -72,9 +108,7 @@ pub struct Hub {
     launches: std::sync::Mutex<HashMap<String, Launch>>,
     /// Port of the loopback Disco MCP endpoint (see mcp.rs), once it listens.
     pub mcp_port: std::sync::OnceLock<u16>,
-    /// MCP token -> agent name. Each ACP agent gets its own token, so a tool call
-    /// can only ever act as the agent it was handed to.
-    pub mcp_tokens: std::sync::Mutex<HashMap<String, String>>,
+    pub mcp_tokens: McpTokens,
     /// Agent -> the conversation of its latest turn. Agents that can't take MCP servers
     /// per session (pi reads them from its own mcp.json) call Disco without a session
     /// key; their tools act where the agent was last asked something.
@@ -88,10 +122,24 @@ pub type CredLookup = dyn Fn(&str) -> Option<String> + Send + Sync;
 impl Hub {
     pub fn new() -> Self {
         let (user_path, user_env) = login_env();
-        Self { live: Mutex::default(), slots: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT)), user_path, user_env, launches: Default::default(), mcp_port: Default::default(), mcp_tokens: Default::default(), last_context: Default::default() }
+        Self { live: Mutex::default(), slots: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT)), turns: Default::default(), next_turn: AtomicU64::new(0),
+            user_path, user_env, launches: Default::default(), mcp_port: Default::default(), mcp_tokens: Default::default(), last_context: Default::default() }
+    }
+
+    /// Forget `agent` if its process has died (its sessions died with it), so the next
+    /// use starts it again. True if it was dead.
+    pub async fn reap(&self, agent: &str) -> bool {
+        let mut live = self.live.lock().await;
+        let dead = matches!(live.get(agent).and_then(|c| c.get()), Some(Runtime::Acp(a)) if !a.is_alive());
+        if dead {
+            live.remove(agent);
+            self.mcp_tokens.revoke(agent);
+        }
+        dead
     }
 
     async fn runtime(&self, row: &AgentRow, secret: &CredLookup) -> Result<Runtime, String> {
+        self.reap(&row.name).await;
         let cell = self.live.lock().await.entry(row.name.clone()).or_default().clone();
         let res = cell.get_or_try_init(|| self.start(row, secret)).await.cloned();
         if res.is_err() { self.forget(&row.name, &cell).await; }
@@ -194,10 +242,12 @@ impl Hub {
                     (PathBuf::from("powershell"), a)
                 } else { (command, args) };
                 let mcp = self.mcp_for(&row.name);
-                // The port and token also go in the agent's own environment, for agents that
-                // load MCP servers from their config instead of from ACP (pi).
-                if let Some(m) = &mcp { env.extend(m.env.iter().cloned()); }
-                if spec.template == "pi" && let Some(m) = &mcp { register_pi_mcp(&env, &m.command); }
+                // pi loads MCP servers from its own config, not from ACP: it gets the
+                // agent-wide token in its environment. Other agents never see a token there.
+                if spec.template == "pi" && let Some(m) = &mcp && let Some(port) = self.mcp_port.get() {
+                    env.extend([("DISCO_MCP_PORT".into(), port.to_string()), ("DISCO_MCP_TOKEN".into(), self.mcp_tokens.mint(&row.name, ""))]);
+                    register_pi_mcp(&env, &m.command);
+                }
                 let launch = Launch {
                     command: command.to_string_lossy().into_owned(),
                     args,
@@ -214,10 +264,7 @@ impl Hub {
                 let spec: LocalSpec = row.card_json.as_deref().and_then(|j| serde_json::from_str(j).ok()).unwrap_or_default();
                 let model = spec.config.get("model").cloned().ok_or("还没选模型")?;
                 let key = row.credential_ref.as_deref().and_then(secret);
-                let mcp = self.mcp_for(&row.name).and_then(|m| {
-                    let get = |k: &str| m.env.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone());
-                    Some((get("DISCO_MCP_PORT")?.parse().ok()?, get("DISCO_MCP_TOKEN")?))
-                });
+                let mcp = self.mcp_for(&row.name).and_then(|_| Some((*self.mcp_port.get()?, self.mcp_tokens.clone(), row.name.clone())));
                 Runtime::Openai(Arc::new(crate::openai::OpenAi::new(&row.endpoint, key, model, crate::openai::client(&self.user_env), mcp)))
             }
             t => return Err(format!("暂不支持的类型 {t}")),
@@ -226,19 +273,30 @@ impl Hub {
     }
 
     /// The Disco MCP server for `agent`'s sessions: this same executable in `--mcp` mode.
+    /// Each session gets a token bound to its own context; a friend's (`peer:`) session
+    /// gets none, so it sees an empty server.
     fn mcp_for(&self, agent: &str) -> Option<McpStdio> {
         let port = *self.mcp_port.get()?;
         let exe = std::env::current_exe().ok()?;
-        let token = uuid::Uuid::new_v4().simple().to_string();
-        let mut tokens = self.mcp_tokens.lock().unwrap_or_else(|p| p.into_inner());
-        tokens.retain(|_, a| a != agent);
-        tokens.insert(token.clone(), agent.to_owned());
-        Some(McpStdio {
-            name: "disco".into(),
-            command: exe,
-            args: vec!["--mcp".into()],
-            env: vec![("DISCO_MCP_PORT".into(), port.to_string()), ("DISCO_MCP_TOKEN".into(), token)],
-        })
+        self.mcp_tokens.revoke(agent);
+        let (tokens, agent) = (self.mcp_tokens.clone(), agent.to_owned());
+        let session_env = SessionEnv(Arc::new(move |ctx: &str| {
+            if ctx.starts_with("peer:") { return vec![("DISCO_MCP_PORT".into(), "0".into())]; }
+            vec![("DISCO_MCP_PORT".into(), port.to_string()), ("DISCO_MCP_TOKEN".into(), tokens.mint(&agent, ctx))]
+        }));
+        Some(McpStdio { name: "disco".into(), command: exe, args: vec!["--mcp".into()], env: Vec::new(), session_env: Some(session_env) })
+    }
+
+    /// A friend is talking to `agent` right now (its agent-wide token must not act then).
+    pub fn peer_busy(&self, agent: &str) -> bool {
+        lock(&self.turns).values().any(|(a, c, _)| a == agent && c.starts_with("peer:"))
+    }
+
+    /// The turn of `agent` in `context` is waiting on a person: give its slot back so
+    /// other turns aren't held up for as long as the human takes. It finishes unslotted.
+    pub fn yield_slot(&self, agent: &str, context: &str) {
+        let freed: Vec<_> = lock(&self.turns).values_mut().filter(|(a, c, _)| a == agent && c == context).filter_map(|(_, _, p)| p.take()).collect();
+        drop(freed);
     }
 
     /// Run one prompt; every event goes to `on_event`; returns the answer text.
@@ -250,7 +308,12 @@ impl Hub {
         text: &str,
         on_event: impl Fn(&AgentEvent),
     ) -> Result<String, String> {
-        let _slot = self.slots.acquire().await.map_err(|e| e.to_string())?;
+        // A delegated `ask:` turn runs while its caller holds a slot (and can't ask further),
+        // so it takes none: waiting for one could deadlock a full house.
+        let slot = if context.starts_with("ask:") { None } else { Some(self.slots.clone().acquire_owned().await.map_err(|e| e.to_string())?) };
+        let id = self.next_turn.fetch_add(1, Ordering::Relaxed);
+        lock(&self.turns).insert(id, (row.name.clone(), context.to_owned(), slot));
+        let _turn = Turn(self, id);
         let rt = self.runtime(row, secret).await?;
         let mut answer = String::new();
         let mut finish = |ev: AgentEvent| -> Option<Result<(), String>> {
@@ -272,8 +335,15 @@ impl Hub {
                 out.unwrap_or(Ok(()))
             }
             Runtime::Acp(a) => {
-                self.last_context.lock().unwrap_or_else(|p| p.into_inner()).insert(row.name.clone(), context.to_owned());
-                let mut rx = a.prompt(context, text).await.map_err(|e| e.to_string())?;
+                lock(&self.last_context).insert(row.name.clone(), context.to_owned());
+                let mut rx = match a.prompt(context, text).await {
+                    Ok(rx) => rx,
+                    // It died since we looked: start it again, once (`runtime` drops the dead one).
+                    Err(_) => {
+                        let Runtime::Acp(a) = self.runtime(row, secret).await? else { return Err("agent 进程已退出".into()) };
+                        a.prompt(context, text).await.map_err(|e| e.to_string())?
+                    }
+                };
                 let mut out = None;
                 while let Some(ev) = rx.recv().await {
                     if let Some(r) = finish(ev) { out = Some(r); break; }
@@ -374,6 +444,7 @@ impl Hub {
     }
 
     pub async fn drop_agent(&self, agent: &str) {
+        self.mcp_tokens.revoke(agent);
         let cell = self.live.lock().await.remove(agent);
         if let Some(Runtime::Acp(a)) = cell.as_ref().and_then(|c| c.get()) {
             a.kill();
@@ -383,7 +454,8 @@ impl Hub {
     /// Kill switch: stop every running agent process and forget every client.
     pub async fn stop_all(&self) -> usize {
         let all: Vec<_> = self.live.lock().await.drain().collect();
-        for (_, c) in &all {
+        for (name, c) in &all {
+            self.mcp_tokens.revoke(name);
             if let Some(Runtime::Acp(a)) = c.get() { a.kill(); }
         }
         all.len()

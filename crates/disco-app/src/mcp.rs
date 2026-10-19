@@ -3,9 +3,9 @@
 //! to-dos and shared doc, save long-term notes.
 //!
 //! Every ACP session is handed this same executable in `--mcp` mode (a tiny stdio
-//! proxy) with a per-agent token and its session key. The proxy forwards each
-//! JSON-RPC line to a loopback HTTP endpoint inside the app, where the token says
-//! *who* is calling and the session key says *where* they are.
+//! proxy) with a token minted for that session. The proxy forwards each JSON-RPC
+//! line to a loopback HTTP endpoint inside the app, where the token alone says *who*
+//! is calling and *where* they are; nothing the caller sends can change either.
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -31,7 +31,6 @@ pub fn stdio_proxy() {
     use std::io::{BufRead, Write};
     let port: u16 = std::env::var("DISCO_MCP_PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(0);
     let token = std::env::var("DISCO_MCP_TOKEN").unwrap_or_default();
-    let context = std::env::var("DISCO_CONTEXT").unwrap_or_default();
     // Started outside Disco (e.g. pi in a terminal reading its mcp.json): no tools, no noise.
     let offline = port == 0;
     let out = Arc::new(std::sync::Mutex::new(std::io::stdout()));
@@ -39,9 +38,9 @@ pub fn stdio_proxy() {
     for line in std::io::stdin().lock().lines() {
         let Ok(line) = line else { break };
         if line.trim().is_empty() { continue; }
-        let (out, token, context) = (out.clone(), token.clone(), context.clone());
+        let (out, token) = (out.clone(), token.clone());
         jobs.push(std::thread::spawn(move || {
-            let reply = match if offline { Ok(offline_reply(&line)) } else { forward(port, &token, &context, &line) } {
+            let reply = match if offline { Ok(offline_reply(&line)) } else { forward(port, &token, &line) } {
                 Ok(body) => body,
                 Err(e) => match serde_json::from_str::<Value>(&line).ok().and_then(|v| v.get("id").cloned()) {
                     Some(id) => json!({"jsonrpc": "2.0", "id": id, "error": {"code": -32000, "message": format!("Disco 没有响应：{e}")}}).to_string(),
@@ -75,9 +74,9 @@ fn offline_reply(line: &str) -> String {
     json!({ "jsonrpc": "2.0", "id": id, "result": result }).to_string()
 }
 
-fn forward(port: u16, token: &str, context: &str, line: &str) -> std::io::Result<String> {
+fn forward(port: u16, token: &str, line: &str) -> std::io::Result<String> {
     use std::io::{Read, Write};
-    let body = format!("{{\"context\":{},\"msg\":{line}}}", Value::String(context.into()));
+    let body = format!("{{\"msg\":{line}}}");
     let mut s = std::net::TcpStream::connect(("127.0.0.1", port))?;
     write!(s, "POST /mcp HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer {token}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len())?;
     let mut resp = String::new();
@@ -102,16 +101,22 @@ pub fn start(core: Arc<Core>) {
     });
 }
 
+/// Any `context` a caller adds is ignored: the token decides.
 #[derive(serde::Deserialize)]
-struct Envelope { context: String, msg: Value }
+struct Envelope { msg: Value }
+
+/// What a friend's session counts as: no tools.
+const PEER: &str = "peer:";
 
 async fn handle(State(core): State<Arc<Core>>, headers: HeaderMap, body: String) -> Response {
     let token = headers.get("authorization").and_then(|v| v.to_str().ok()).and_then(|v| v.strip_prefix("Bearer ")).unwrap_or("");
-    let agent = core.hub.mcp_tokens.lock().unwrap_or_else(|p| p.into_inner()).get(token).cloned();
-    let Some(agent) = agent else { return StatusCode::UNAUTHORIZED.into_response() };
-    let Ok(Envelope { mut context, msg }) = serde_json::from_str(&body) else { return StatusCode::BAD_REQUEST.into_response() };
+    let Some((agent, mut context)) = core.hub.mcp_tokens.lookup(token) else { return StatusCode::UNAUTHORIZED.into_response() };
+    let Ok(Envelope { msg }) = serde_json::from_str(&body) else { return StatusCode::BAD_REQUEST.into_response() };
     if context.is_empty() {
-        context = core.hub.last_context.lock().unwrap_or_else(|p| p.into_inner()).get(&agent).cloned().unwrap_or_else(|| format!("dm:{agent}"));
+        // The agent-wide token (pi): it acts where the agent was last asked, but never while a
+        // friend is driving the agent, since that friend's session holds the same token.
+        let last = core.hub.last_context.lock().unwrap_or_else(|p| p.into_inner()).get(&agent).cloned();
+        context = if core.hub.peer_busy(&agent) { PEER.into() } else { last.unwrap_or_else(|| format!("dm:{agent}")) };
     }
     // Notifications (no id) need no answer.
     let Some(id) = msg.get("id").cloned() else { return StatusCode::ACCEPTED.into_response() };
@@ -124,6 +129,7 @@ async fn handle(State(core): State<Arc<Core>>, headers: HeaderMap, body: String)
             "instructions": "Disco 是你所在的多 agent 协作应用。用这些工具在群里发言、请教其他 agent、维护待办和群文档、保存长期记忆。不确定自己在哪时先调用 overview。",
         })),
         "ping" => Ok(json!({})),
+        "tools/list" if context.starts_with(PEER) => Ok(json!({ "tools": [] })),
         "tools/list" => Ok(json!({ "tools": tools() })),
         "tools/call" => {
             let name = params.get("name").and_then(Value::as_str).unwrap_or("").to_owned();
@@ -223,7 +229,7 @@ impl Call<'_> {
 
     async fn run(&self, name: &str, args: &Value) -> Result<String, String> {
         // A friend's session on a shared agent must never reach the owner's groups or notes.
-        if self.context.starts_with("peer:") {
+        if self.context.starts_with(PEER) {
             return Err("这是朋友通过共享访问的会话，Disco 工具在这里不可用".into());
         }
         if name != "overview" && self.core.paused.load(std::sync::atomic::Ordering::Relaxed) {
@@ -342,6 +348,8 @@ impl Call<'_> {
         let thread = match self.place() { Place::Group(g) => format!("group:{}", g.id), _ => format!("dm:{}", self.agent) };
         self.core.post_message(&thread, self.agent, &format!("❓ {question}"));
         let rx = self.core.inbox_question(&thread, self.agent, question, options, text);
+        // Waiting on a person isn't work: free this turn's slot for others meanwhile.
+        self.core.hub.yield_slot(self.agent, self.context);
         match tokio::time::timeout(ASK_USER_WAIT, rx).await {
             Ok(Ok(answer)) => Ok(format!("用户回答：{answer}")),
             Ok(Err(_)) => Err("用户撤回了这个问题（已全部停止）".into()),

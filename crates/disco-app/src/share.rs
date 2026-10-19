@@ -150,7 +150,10 @@ impl Core {
         let thread = format!("peer:{id}");
         // The guest's Discord-synced group the agent was last used in lets the owner talk back.
         // Only a group is remembered: a later DM or delegated `ask:` turn must not erase it.
-        if discord_group(guest_ctx).is_some() {
+        // The guest names it, so it must also be a Discord group the owner has synced here:
+        // otherwise a guest could make the owner's words land in any channel.
+        let known = discord_group(guest_ctx).and_then(|ch| self.db().list_groups().ok()?.into_iter().find(|g| g.id == ch));
+        if known.is_some() {
             let _ = self.db().set_setting(&format!("{PEER_CTX}{id}"), guest_ctx);
         }
         self.post_message(&thread, &share.guest, text);

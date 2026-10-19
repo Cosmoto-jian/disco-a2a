@@ -63,6 +63,31 @@ async fn kill_ends_the_turn() {
     assert!(!matches!(last, Some(AgentEvent::Done { phase: TaskPhase::Completed, .. })));
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn timeout_cancels_the_turn() {
+    let agent = AcpAgent::spawn(Launch { prompt_timeout: Duration::from_secs(1), ..launch() }).await.unwrap();
+    let t = std::time::Instant::now();
+    let mut rx = agent.prompt("dm", "__hang__").await.unwrap();
+    let mut last = None;
+    while let Some(ev) = rx.recv().await { if matches!(ev, AgentEvent::Done { .. }) { last = Some(ev); break; } }
+    assert!(matches!(&last, Some(AgentEvent::Done { phase: TaskPhase::Failed, stop_reason: Some(r) }) if r == "timeout"), "{last:?}");
+    // The mock only ends a hung turn when cancelled; without the cancel this waits out the 5 s grace.
+    assert!(t.elapsed() < Duration::from_secs(3), "took {:?}", t.elapsed());
+    // Nothing of the old turn ("late") leaks into the next one.
+    assert_eq!(drive(&agent, "dm", "allow").await, "hello from mock env=inherited ran");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn dead_agent_is_not_alive() {
+    let agent = AcpAgent::spawn(launch()).await.unwrap();
+    assert!(agent.is_alive());
+    let mut rx = agent.prompt("dm", "__die__").await.unwrap();
+    while rx.recv().await.is_some() {}
+    let t = std::time::Instant::now();
+    while agent.is_alive() && t.elapsed() < Duration::from_secs(5) { tokio::time::sleep(Duration::from_millis(50)).await; }
+    assert!(!agent.is_alive());
+}
+
 /// Probe a real agent: `DISCO_REAL="npx -y @agentclientprotocol/claude-agent-acp" cargo test -p disco-acp --test bridge real_agent -- --ignored --nocapture`
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]

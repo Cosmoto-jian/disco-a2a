@@ -331,7 +331,7 @@ impl Rest {
     pub async fn post_as(&self, webhook: &str, username: &str, avatar: Option<&str>, text: &str) -> Result<(), String> {
         let (wid, token) = webhook.split_once('\n').ok_or("bad webhook ref")?;
         for part in chunk(text) {
-            let mut body = json!({"content": part, "username": persona_name(username), "allowed_mentions": pings(&part)});
+            let mut body = json!({"content": part, "username": persona_name(username), "allowed_mentions": {"parse": []}});
             if let Some(a) = avatar { body["avatar_url"] = json!(a); }
             self.post_json(&format!("/webhooks/{wid}/{token}"), body).await?;
         }

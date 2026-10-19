@@ -235,8 +235,11 @@ impl Core {
             return Err("已全部停止".into());
         }
         let row = self.agent(agent)?;
-        // Memory goes only to agents running on this Mac, never to a remote one.
-        let first = row.transport != "a2a" && self.memory_on(context) && self.primed.lock().unwrap_or_else(|p| p.into_inner()).insert(format!("{agent}|{context}"));
+        // A crashed agent restarts with fresh sessions: they need the memory preamble again.
+        if self.hub.reap(agent).await { self.forget_sessions(Some(agent)); }
+        // Memory goes only to agents running on this Mac, never to a remote one,
+        // and never into a guest's (`peer:`) session.
+        let first = row.transport != "a2a" && !context.starts_with("peer:") && self.memory_on(context) && self.primed.lock().unwrap_or_else(|p| p.into_inner()).insert(format!("{agent}|{context}"));
         let with_mem;
         let prompt = if first { with_mem = format!("{}{prompt}", self.memory_preamble(agent, context)); with_mem.as_str() } else { prompt };
         // Team members work behind the scenes: no bubbles, only the activity strip
@@ -393,7 +396,8 @@ impl Core {
     /// - A group channel is the group: anyone who can post there takes part (Discord's
     ///   channel permissions decide who), and approvals still only reach this Disco's owner.
     /// - An agent's own channel stays limited to the owner and the allow list.
-    /// - Webhooks are other Discos' agents (ours are skipped); a bot account is another
+    /// - Webhooks are other Discos' agents (ours are skipped), stored as `Name (Disco)`;
+    ///   a bot account is another
     ///   Disco relaying its owner's words as `**Name**：text`.
     fn speaker(&self, m: &Incoming, group: Option<&GroupRow>, agent_channel: bool) -> Option<(String, String)> {
         if let Some(hook) = &m.webhook_id {
@@ -402,7 +406,8 @@ impl Core {
             if g.members.contains(&m.author) && self.warned.lock().unwrap_or_else(|p| p.into_inner()).insert(format!("{}|{}", g.id, m.author)) {
                 self.post_message(&format!("group:{}", g.id), "system", &format!("频道里另一个 Disco 也有叫 {} 的 agent，@{} 会同时叫到两边。建议其中一方改名。", m.author, m.author));
             }
-            return Some((m.author.clone(), m.content.clone()));
+            // Tagged, so a webhook named `me` or like one of our agents is neither.
+            return Some((format!("{}{FOREIGN_TAG}", m.author), m.content.clone()));
         }
         if m.bot {
             // Only another Disco's relay format counts; other bots in the channel are ignored.
@@ -553,7 +558,8 @@ impl Core {
                             {
                                 self.post_message(thread, "system", &format!("Discord 发送失败：{e}"));
                             }
-                            mentions(&answer, &g.members, Some(agent)).into_iter().map(|m| (m, agent.clone())).collect()
+                            // The opening `@caller` is the reply's address, not a hand-off back.
+                            mentions(after_address(&answer, &display(by)), &g.members, Some(agent)).into_iter().map(|m| (m, agent.clone())).collect()
                         }
                         Err(e) => {
                             self.report_failure(thread, agent, &e);
@@ -678,9 +684,8 @@ impl Core {
 fn mentions(text: &str, members: &[String], me: Option<&str>) -> Vec<String> {
     let lower = text.to_lowercase();
     let others = members.iter().filter(|m| Some(m.as_str()) != me);
-    let is_name_char = |c: char| c.is_alphanumeric() || c == '-' || c == '_';
     // `@all` as a word (so a member called `alloy` is not everyone).
-    let all = lower.match_indices("@all").any(|(i, _)| !lower[i + 4..].chars().next().is_some_and(is_name_char)) && !members.iter().any(|m| m.eq_ignore_ascii_case("all"));
+    let all = lower.match_indices("@all").any(|(i, _)| !lower[i + 4..].chars().next().is_some_and(|c| continues("all", c))) && !members.iter().any(|m| m.eq_ignore_ascii_case("all"));
     if all || text.contains("@所有人") {
         return others.cloned().collect();
     }
@@ -688,7 +693,7 @@ fn mentions(text: &str, members: &[String], me: Option<&str>) -> Vec<String> {
         .filter_map(|m| {
             let needle = format!("@{}", m.to_lowercase());
             lower.match_indices(&needle).map(|(i, _)| i).find(|&i| {
-                !lower[i + needle.len()..].chars().next().is_some_and(is_name_char)
+                !lower[i + needle.len()..].chars().next().is_some_and(|c| continues(m, c))
             }).map(|i| (i, m))
         })
         .collect();
@@ -696,9 +701,18 @@ fn mentions(text: &str, members: &[String], me: Option<&str>) -> Vec<String> {
     hits.into_iter().map(|(_, m)| m.clone()).collect()
 }
 
+/// Whether `c` right after `@name` makes it a longer name. Only ASCII continues an ASCII
+/// name, so `@claude帮我看看` still reaches `claude`.
+fn continues(name: &str, c: char) -> bool {
+    c.is_ascii_alphanumeric() || c == '-' || c == '_' || (!name.is_ascii() && c.is_alphanumeric())
+}
+
 /// People who write from Discord are stored as `Name (Discord)`, so a display name
 /// can never pass for the owner (`me`) or an agent.
 pub(crate) const HUMAN_TAG: &str = " (Discord)";
+/// Other Discos' agents (their webhooks) are stored as `Name (Disco)`, so they never pass
+/// for the owner or one of our agents and always count as foreign hand-offs.
+pub(crate) const FOREIGN_TAG: &str = " (Disco)";
 /// Hand-offs from other Discos' agents allowed per channel per 10 minutes.
 const FOREIGN_TURNS: usize = 6;
 /// Agent commands that change its state: only the agent's owner may run them from a group.
@@ -706,9 +720,10 @@ const RESTRICTED: &[&str] = &["clear", "compact", "model", "config", "login", "l
 
 fn is_human(author: &str) -> bool { author == "me" || author.ends_with(HUMAN_TAG) }
 
-/// The name people see: `me` is the owner, `Name (Discord)` is `Name`.
+/// The name people see: `me` is the owner, `Name (Discord)` / `Name (Disco)` is `Name`.
 fn display(author: &str) -> String {
-    if author == "me" { share::owner_name() } else { author.strip_suffix(HUMAN_TAG).unwrap_or(author).to_owned() }
+    if author == "me" { return share::owner_name(); }
+    author.strip_suffix(HUMAN_TAG).or_else(|| author.strip_suffix(FOREIGN_TAG)).unwrap_or(author).to_owned()
 }
 
 /// Other people and other Discos' agents seen in a group.
@@ -745,16 +760,24 @@ fn lead_mention(answer: &str, to: &str) -> String {
     if answer.starts_with('@') { answer.to_owned() } else { format!("@{to} {answer}") }
 }
 
+/// `answer` without its opening `@to` (when it opens with it).
+fn after_address<'a>(answer: &'a str, to: &str) -> &'a str {
+    let Some(body) = answer.strip_prefix('@') else { return answer };
+    match (body.get(..to.len()), body.get(to.len()..)) {
+        (Some(name), Some(rest)) if name.to_lowercase() == to.to_lowercase() && !rest.chars().next().is_some_and(|c| continues(to, c)) => rest,
+        _ => answer,
+    }
+}
+
 /// Replace whole-word `@name` (case-insensitive) with `with`.
 fn replace_mention(text: &str, name: &str, with: &str) -> String {
-    let needle = format!("@{}", name.to_lowercase());
-    let lower = text.to_lowercase();
-    if lower.len() != text.len() || name.is_empty() { return text.to_owned(); }
-    let is_name_char = |c: char| c.is_alphanumeric() || c == '-' || c == '_';
+    if name.is_empty() { return text.to_owned(); }
     let (mut out, mut last) = (String::new(), 0);
-    for (i, _) in lower.match_indices(&needle) {
-        let end = i + needle.len();
-        if i < last || text[end..].chars().next().is_some_and(is_name_char) { continue; }
+    for (i, _) in text.match_indices('@') {
+        let end = i + 1 + name.len();
+        // Compared on the original text, so lower-casing can never shift an offset.
+        let Some(word) = text.get(i + 1..end) else { continue };
+        if word.to_lowercase() != name.to_lowercase() || text[end..].chars().next().is_some_and(|c| continues(name, c)) { continue; }
         out.push_str(&text[last..i]);
         out.push_str(with);
         last = end;
@@ -954,6 +977,10 @@ fn valid_name(name: &str) -> CmdResult<String> {
     let n = name.trim();
     if n.is_empty() || n.len() > 32 || !n.chars().all(|c| c.is_alphanumeric() || c == '-' || c == '_') {
         return Err("名称只能用字母、数字、- 或 _，最多 32 个字符".into());
+    }
+    let low = n.to_lowercase();
+    if ["me", "system", "all"].contains(&low.as_str()) || low.starts_with("group-") {
+        return Err(format!("{n} 是保留名称，换一个吧"));
     }
     Ok(n.to_owned())
 }
@@ -1624,8 +1651,14 @@ pub fn run() {
             stop_all, resume, save_discord_token, discord_connect, discord_settings, discord_sync, diagnose, open_url, reveal_path, discord_channels, save_group, delete_group, restore_group, memory_restore, set_memory, agent_commands,
             check_update, install_update, space, todo_new, todo_set, todo_remove, doc_save, reveal_doc, share::share_status, share::peer_check, share::create_share, share::share_invite, share::revoke_share, share::accept_invite
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running Disco");
+        .build(tauri::generate_context!())
+        .expect("error while running Disco")
+        .run(|app, ev| {
+            // Quitting must not leave agent processes behind.
+            if let tauri::RunEvent::Exit = ev && let Some(core) = app.try_state::<Arc<Core>>() {
+                tauri::async_runtime::block_on(core.hub.stop_all());
+            }
+        });
 }
 
 #[cfg(test)]
@@ -1666,5 +1699,31 @@ mod tests {
         assert_eq!(mentions("@all 并行开工", &m2, Some("coder")), ["coder-2", "coder-3"]);
         let m3 = vec!["alloy".to_string(), "coder".to_string()];
         assert_eq!(mentions("@alloy 看下", &m3, None), ["alloy"]);
+    }
+
+    #[test]
+    fn routing_v1_5_12() {
+        // Reserved names.
+        for n in ["me", "ME", "System", "all", "group-x", "Group-1"] { assert!(super::valid_name(n).is_err(), "{n}"); }
+        assert!(super::valid_name("coder").is_ok() && super::valid_name("小助手").is_ok());
+        // A Chinese word right after an ASCII name still mentions it.
+        let m = vec!["claude".to_string(), "coder".to_string(), "coder-2".to_string(), "小助".to_string()];
+        assert_eq!(mentions("@claude帮我看看", &m, None), ["claude"]);
+        assert_eq!(mentions("@coder-2看下 @coder_x", &m, None), ["coder-2"]);
+        assert_eq!(mentions("@小助手 在吗", &m, None), Vec::<String>::new());
+        assert_eq!(mentions("@all大家好", &m, Some("claude")), ["coder", "coder-2", "小助"]);
+        // No slicing on a lower-cased copy: the Kelvin sign must not panic or shift.
+        assert_eq!(super::replace_mention("\u{212A} @amy好 @Amy", "amy", "<@1>"), "\u{212A} <@1>好 <@1>");
+        assert_eq!(super::replace_mention("@amyx @am", "amy", "<@1>"), "@amyx @am");
+        // Addressing the caller first is not a hand-off back.
+        assert_eq!(super::after_address("@Amy 好的 @coder", "amy"), " 好的 @coder");
+        assert_eq!(super::after_address("@amyx 好", "amy"), "@amyx 好");
+        assert_eq!(super::after_address("中@amy", "amy"), "中@amy");
+        let m2 = vec!["a".to_string(), "b".to_string()];
+        assert!(mentions(super::after_address("@a 完成了", "a"), &m2, Some("b")).is_empty());
+        assert_eq!(mentions(super::after_address("@a 完成了，@a 再看下", "a"), &m2, Some("b")), ["a"]);
+        // Other Discos' agents are tagged, never `me` and never a bare member name.
+        let foreign = format!("me{}", super::FOREIGN_TAG);
+        assert!(!super::is_human(&foreign) && super::display(&format!("coder{}", super::FOREIGN_TAG)) == "coder");
     }
 }

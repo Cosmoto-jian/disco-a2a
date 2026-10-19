@@ -1,8 +1,10 @@
 //! Who is on the other end of a tailnet connection, and whether they may talk to us.
 //!
 //! The share server asks Tailscale itself who connected (`tailscale whois`) and
-//! checks the answer against one local access policy: a rule is a hostname, a
-//! MagicDNS name, `tag:NAME` or `user:LOGIN`, and deny always wins. Quiet hours
+//! checks the answer against one local access policy: a rule is a MagicDNS name
+//! (or its first label, for machines in our own tailnet), `tag:NAME` or
+//! `user:LOGIN`, and deny always wins. The self-reported OS hostname is never
+//! trusted: any machine, including one shared in from another tailnet, picks its own. Quiet hours
 //! keep guests from waking your agents at night.
 use std::collections::HashMap;
 use std::net::IpAddr;
@@ -15,9 +17,10 @@ use serde_json::Value;
 /// Settings key of the policy (JSON).
 pub const POLICY: &str = "tailnet_policy";
 
-/// A connecting machine, as Tailscale vouches for it.
+/// A connecting machine, as Tailscale vouches for it. `own`: its MagicDNS name
+/// sits under our tailnet's suffix (not a node shared in from elsewhere).
 #[derive(Clone, Debug, Default, Serialize, PartialEq)]
-pub struct Ident { pub node: String, pub host: String, pub user: String, pub tags: Vec<String> }
+pub struct Ident { pub node: String, pub user: String, pub tags: Vec<String>, pub own: bool }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
@@ -53,8 +56,23 @@ pub fn matches(rule: &str, who: &Ident) -> bool {
     if r.starts_with("tag:") { return who.tags.iter().any(|t| t.to_lowercase() == r); }
     if let Some(u) = r.strip_prefix("user:") { return !who.user.is_empty() && who.user.to_lowercase() == u; }
     let r = r.trim_end_matches('.');
-    let node = who.node.to_lowercase();
-    !r.is_empty() && (r == node || r == node.split('.').next().unwrap_or("") || r == who.host.to_lowercase())
+    let node = who.node.trim_end_matches('.').to_lowercase();
+    // A bare label ("box") only names machines in our own tailnet; elsewhere it's ambiguous.
+    !r.is_empty() && (r == node || (who.own && !r.contains('.') && node.split_once('.').is_some_and(|(l, _)| l == r)))
+}
+
+/// Whether MagicDNS name `node` lives directly under our tailnet `suffix` (e.g. `tail1.ts.net`).
+fn in_tailnet(node: &str, suffix: &str) -> bool {
+    let suffix = suffix.trim_matches('.').to_lowercase();
+    !suffix.is_empty() && node.split_once('.').is_some_and(|(l, rest)| !l.is_empty() && rest == suffix)
+}
+
+/// Our tailnet's MagicDNS suffix, from `tailscale status`.
+fn own_suffix() -> Option<String> {
+    let st = status()?;
+    let s = st["CurrentTailnet"]["MagicDNSSuffix"].as_str().or(st["MagicDNSSuffix"].as_str()).map(str::to_owned)
+        .or_else(|| st["Self"]["DNSName"].as_str()?.trim_end_matches('.').split_once('.').map(|(_, s)| s.to_owned()))?;
+    (!s.is_empty()).then_some(s)
 }
 
 impl Policy {
@@ -176,8 +194,8 @@ pub fn whois(ip: &IpAddr) -> Option<Ident> {
     let v = run(&["whois", "--json", &ip_s]).and_then(|d| {
         let node = d["Node"]["Name"].as_str()?.trim_end_matches('.').to_lowercase();
         (!node.is_empty()).then(|| Ident {
+            own: own_suffix().is_some_and(|s| in_tailnet(&node, &s)),
             node,
-            host: d["Node"]["Hostinfo"]["Hostname"].as_str().unwrap_or("").to_lowercase(),
             user: d["UserProfile"]["LoginName"].as_str().unwrap_or("").into(),
             tags: d["Node"]["Tags"].as_array().map(|a| a.iter().filter_map(|t| t.as_str().map(str::to_owned)).collect()).unwrap_or_default(),
         })
@@ -190,7 +208,7 @@ pub fn whois(ip: &IpAddr) -> Option<Ident> {
 mod tests {
     use super::*;
 
-    fn who() -> Ident { Ident { node: "box.tail1.ts.net".into(), host: "Box".into(), user: "me@x.com".into(), tags: vec!["tag:agent".into()] } }
+    fn who() -> Ident { Ident { node: "box.tail1.ts.net".into(), user: "me@x.com".into(), tags: vec!["tag:agent".into()], own: true } }
 
     #[test]
     fn rules_and_policy() {
@@ -206,6 +224,21 @@ mod tests {
         p.deny = vec!["box".into()];
         assert!(p.admit(&who()).is_err());
         assert!(Policy { allow: vec!["bad rule".into()], ..Default::default() }.cleaned().is_err());
+    }
+
+    #[test]
+    fn names_are_scoped() {
+        assert!(matches("BOX.tail1.ts.net.", &who()) && matches("box.", &who()));
+        // A node shared in from another tailnet: only its full name, tags or user match.
+        let shared = Ident { node: "box.other.ts.net".into(), own: false, ..who() };
+        assert!(!matches("box", &shared) && matches("box.other.ts.net", &shared) && matches("tag:agent", &shared));
+        assert!(!matches("box.tail1.ts.net", &shared) && !matches("other.ts.net", &shared));
+        // Partial suffixes and multi-label shorts never match.
+        assert!(!matches("tail1.ts.net", &who()) && !matches("box.tail1", &who()) && !matches("ts.net", &who()));
+        assert!(!matches("user:", &Ident { user: String::new(), ..who() }) && !matches("tag:other", &who()));
+        assert!(in_tailnet("box.tail1.ts.net", "tail1.ts.net.") && in_tailnet("box.tail1.ts.net", "TAIL1.ts.net"));
+        assert!(!in_tailnet("box.other.ts.net", "tail1.ts.net") && !in_tailnet("a.box.tail1.ts.net", "tail1.ts.net"));
+        assert!(!in_tailnet("box.tail1.ts.net", "") && !in_tailnet("eviltail1.ts.net", "tail1.ts.net"));
     }
 
     #[test]

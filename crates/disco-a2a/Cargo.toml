@@ -13,6 +13,7 @@ a2a-client.workspace = true
 futures.workspace = true
 async-trait = "0.1"
 thiserror.workspace = true
+url = "2.5"
 
 [dev-dependencies]
 a2a-server.workspace = true

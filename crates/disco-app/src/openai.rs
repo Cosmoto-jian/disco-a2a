@@ -21,8 +21,8 @@ pub struct OpenAi {
     http: reqwest::Client,
     history: Mutex<HashMap<String, Vec<Value>>>,
     stop: Mutex<HashMap<String, Arc<AtomicBool>>>,
-    /// Loopback Disco MCP (port, token) for tool calls.
-    mcp: Option<(u16, String)>,
+    /// Loopback Disco MCP for tool calls: (port, tokens, this agent's name).
+    mcp: Option<(u16, crate::hub::McpTokens, String)>,
 }
 
 /// Base URL as the user typed it, minus a trailing `/` or a pasted `/chat/completions`.
@@ -73,7 +73,7 @@ pub async fn models(http: &reqwest::Client, base: &str, key: Option<&str>) -> Re
 }
 
 impl OpenAi {
-    pub fn new(base: &str, key: Option<String>, model: String, http: reqwest::Client, mcp: Option<(u16, String)>) -> Self {
+    pub fn new(base: &str, key: Option<String>, model: String, http: reqwest::Client, mcp: Option<(u16, crate::hub::McpTokens, String)>) -> Self {
         Self { base: normalize(base), key, model: Mutex::new(model), http, history: Mutex::default(), stop: Mutex::default(), mcp }
     }
 
@@ -91,8 +91,11 @@ impl OpenAi {
     }
 
     async fn mcp_call(&self, context: &str, method: &str, params: Value) -> Result<Value, String> {
-        let (port, token) = self.mcp.as_ref().ok_or("Disco 工具不可用")?;
-        let body = json!({ "context": context, "msg": { "jsonrpc": "2.0", "id": 1, "method": method, "params": params } });
+        let (port, tokens, agent) = self.mcp.as_ref().ok_or("Disco 工具不可用")?;
+        // A friend's conversation gets no tools; any other gets a token bound to it.
+        if context.starts_with("peer:") { return Err("Disco 工具不可用".into()); }
+        let token = tokens.mint(agent, context);
+        let body = json!({ "msg": { "jsonrpc": "2.0", "id": 1, "method": method, "params": params } });
         let r = self.http.post(format!("http://127.0.0.1:{port}/mcp")).bearer_auth(token).json(&body).send().await.map_err(|e| e.to_string())?;
         let v: Value = r.json().await.map_err(|e| e.to_string())?;
         v.get("result").cloned().ok_or_else(|| v.pointer("/error/message").and_then(Value::as_str).unwrap_or("工具调用失败").to_owned())

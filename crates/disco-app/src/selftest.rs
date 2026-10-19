@@ -122,6 +122,16 @@ pub fn spawn(app: AppHandle, mock: String) {
             wait_msg(&core, "group:chan1", "Amy (Discord)", 0, 5).await });
         let _ = check!("Discord 另一个 Disco 的 agent @m1", { let n = count(&core, "group:chan1", "m1");
             core.on_incoming(disco_discord::Incoming { webhook_id: Some("hook9".into()), ..msg("chan1", "hook9", "coder", "@m1 帮我看看") }); wait_msg(&core, "group:chan1", "m1", n, 30).await });
+        // v1.5.12 routing
+        let _ = check!("Discord 别的 Disco 的 webhook 叫 me/m1 也不冒充", {
+            let me = count(&core, "group:chan1", "me");
+            for name in ["me", "m1"] { core.on_incoming(disco_discord::Incoming { webhook_id: Some("hook9".into()), ..msg("chan1", "hook9", name, "你好") }); }
+            wait_msg(&core, "group:chan1", &format!("m1{}", crate::FOREIGN_TAG), 0, 5).await?;
+            wait_msg(&core, "group:chan1", &format!("me{}", crate::FOREIGN_TAG), 0, 5).await?;
+            if count(&core, "group:chan1", "me") == me { Ok(String::new()) } else { Err("被当成了主人".into()) } });
+        let _ = check!("Discord @m1中文 也能叫到", { let n = count(&core, "group:chan1", "m1"); core.on_incoming(msg("chan1", "owner1", "Jian", "@m1帮我看看")); wait_msg(&core, "group:chan1", "m1", n, 30).await });
+        let _ = check!("保留名称不能用", { let r = within(5, crate::add_agent(st(), spec("System"))).await?; if r.is_err() { Ok(String::new()) } else { Err("System 被接受了".into()) } });
+        // end v1.5.12 routing
 
         // Older model API (Hermes) and ACP sign-in, with the raw mock agent.
         let raw = mock.replace("mock-acp-agent", "mock-raw-agent");
@@ -219,6 +229,39 @@ pub fn spawn(app: AppHandle, mock: String) {
         let _ = check!("自检提示", { within(10, crate::add_agent(st(), bad)).await??; wait_msg(&core, "dm:bad", "system", 0, 10).await });
         let _ = check!("remove_agent", within(10, crate::remove_agent(st(), "bad".into(), Some(true))).await.and_then(|r| r).map(|_| String::new()));
         let _ = check!("overview(结束)", within(5, crate::overview(st())).await.and_then(|r| r.map(|o| format!("{} agents, {} groups", o.agents.len(), o.groups.len()))));
+        // v1.5.12 runtime
+        // One JSON-RPC envelope to the loopback MCP endpoint, as an agent's proxy would send it.
+        async fn mcp_post(core: &Core, token: &str, body: serde_json::Value) -> Result<serde_json::Value, String> {
+            let port = *core.hub.mcp_port.get().ok_or("MCP 没启动")?;
+            let r = crate::openai::client(&[]).post(format!("http://127.0.0.1:{port}/mcp")).bearer_auth(token).json(&body).send().await.map_err(|e| e.to_string())?;
+            if !r.status().is_success() { return Err(format!("HTTP {}", r.status())); }
+            r.json().await.map_err(|e| e.to_string())
+        }
+        let _ = check!("崩溃的 agent 下一条消息自动重启", {
+            let n = count(&core, "dm:m1", "m1"); crate::send(st(), "dm:m1".into(), "__die__".into())?; wait_msg(&core, "dm:m1", "m1", n, 30).await?;
+            tokio::time::sleep(Duration::from_millis(800)).await; // the mock exits 100 ms after answering
+            let n = count(&core, "dm:m1", "m1"); crate::send(st(), "dm:m1".into(), "还在吗".into())?;
+            wait_msg(&core, "dm:m1", "m1", n, 30).await.and_then(|b| if b.contains("hello from mock") { Ok(b) } else { Err(b) }) });
+        let call = |tool: &str, args: serde_json::Value| serde_json::json!({ "context": gt, "msg": { "jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": { "name": tool, "arguments": args } } });
+        let text = |v: &serde_json::Value| (v["result"]["content"][0]["text"].as_str().unwrap_or_default().to_owned(), v["result"]["isError"] == true);
+        let _ = check!("MCP 伪造 context 被拒", {
+            let peer = core.hub.mcp_tokens.mint("m1", "peer:st|dm:x");
+            let (t, err) = text(&mcp_post(&core, &peer, call("doc_read", serde_json::json!({ "group": gid }))).await?);
+            if !err || t.contains("目标") { return Err(format!("朋友会话读到了群文档：{t}")); }
+            let list = mcp_post(&core, &peer, serde_json::json!({ "msg": { "jsonrpc": "2.0", "id": 2, "method": "tools/list" } })).await?;
+            if list["result"]["tools"].as_array().is_none_or(|a| !a.is_empty()) { return Err(format!("朋友会话有工具：{list}")); }
+            if mcp_post(&core, "forged", call("doc_read", serde_json::json!({}))).await.is_ok() { return Err("假 token 通过了".into()); }
+            let own = core.hub.mcp_tokens.mint("m1", &gt);
+            let (t, err) = text(&mcp_post(&core, &own, call("doc_read", serde_json::json!({}))).await?);
+            if err || !t.contains("目标") { return Err(format!("群内会话读不到群文档：{t}")); }
+            Ok(String::new()) });
+        let _ = check!("满载时 ask 不死锁", {
+            let held = within(5, core.hub.slots.clone().acquire_many_owned(crate::hub::MAX_CONCURRENT as u32)).await?.map_err(|e| e.to_string())?;
+            let tok = core.hub.mcp_tokens.mint("m1", "dm:m1");
+            let r = within(40, mcp_post(&core, &tok, call("ask", serde_json::json!({ "agent": "m3", "question": "1+1" })))).await;
+            drop(held);
+            let (t, err) = text(&r??);
+            if err || !t.contains("hello from mock") { Err(t) } else { Ok(t) } });
         println!("SELFTEST {}", if fails == 0 { "OK".to_string() } else { format!("{fails} FAILED") });
         std::process::exit(if fails == 0 { 0 } else { 1 });
     });

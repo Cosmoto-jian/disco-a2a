@@ -54,6 +54,9 @@ pub struct Launch {
     pub mcp: Option<McpStdio>,
 }
 
+/// How long a turn that timed out may take to wind down after it is cancelled.
+const CANCEL_GRACE: Duration = Duration::from_secs(5);
+
 /// A stdio MCP server the agent should launch for its sessions.
 #[derive(Debug, Clone)]
 pub struct McpStdio {
@@ -61,6 +64,18 @@ pub struct McpStdio {
     pub command: PathBuf,
     pub args: Vec<String>,
     pub env: Vec<(String, String)>,
+    /// More env for the session with this key (e.g. a token bound to that session).
+    pub session_env: Option<SessionEnv>,
+}
+
+type Env = Vec<(String, String)>;
+
+/// Env for one session's MCP server, by session key.
+#[derive(Clone)]
+pub struct SessionEnv(pub Arc<dyn Fn(&str) -> Env + Send + Sync>);
+
+impl std::fmt::Debug for SessionEnv {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str("SessionEnv") }
 }
 
 /// One selectable session setting the agent offers: model, reasoning effort, mode …
@@ -296,6 +311,12 @@ impl AcpAgent {
         self.cmd.send(Cmd::Cancel { key: key.into() }).await.map_err(|_| AcpError::Gone)
     }
 
+    /// False once the process has exited or its connection has ended.
+    pub fn is_alive(&self) -> bool {
+        let exited = lock(&self.child).try_wait();
+        !self.cmd.is_closed() && matches!(exited, Ok(None))
+    }
+
     /// Answer a `PermissionAsked` event.
     pub fn decide(&self, request_id: &str, decision: PermissionDecision) -> bool {
         lock(&self.pending).remove(request_id).is_some_and(|tx| tx.send(decision).is_ok())
@@ -379,9 +400,18 @@ async fn open_session(conn: &ConnectionTo<Agent>, launch: &Launch, key: &str) ->
 fn new_session(launch: &Launch, key: &str) -> NewSessionRequest {
     let req = NewSessionRequest::new(launch.cwd.clone());
     let Some(m) = &launch.mcp else { return req };
-    let env = m.env.iter().map(|(k, v)| EnvVariable::new(k, v))
+    let extra = m.session_env.as_ref().map(|f| (f.0)(key)).unwrap_or_default();
+    let env = m.env.iter().chain(&extra).map(|(k, v)| EnvVariable::new(k, v))
         .chain(std::iter::once(EnvVariable::new("DISCO_CONTEXT", key))).collect();
     req.mcp_servers(vec![McpServer::Stdio(McpServerStdio::new(&m.name, &m.command).args(m.args.clone()).env(env))])
+}
+
+/// ACP `session/cancel`; open permission prompts of that session must be answered "cancelled".
+fn cancel_turn(conn: &ConnectionTo<Agent>, pending: &Pending, sid: &SessionId) {
+    let _ = conn.send_notification(CancelNotification::new(sid.clone()));
+    let prefix = format!("{sid}/");
+    let open: Vec<_> = lock(pending).extract_if(|k, _| k.starts_with(&prefix)).map(|(_, tx)| tx).collect();
+    for tx in open { let _ = tx.send(PermissionDecision::Cancel); }
 }
 
 async fn run_connection<W, R>(
@@ -483,13 +513,7 @@ async fn run_connection<W, R>(
                     Cmd::Prompt { key, text, events } => (key, Some((text, events)), None),
                     Cmd::Warm { key, ready } => (key, None, ready),
                     Cmd::Cancel { key } => {
-                        if let Some((sid, _)) = sessions.get(&key) {
-                            let _ = conn.send_notification(CancelNotification::new(sid.clone()));
-                            // ACP: open permission prompts of that session must be answered "cancelled".
-                            let prefix = format!("{sid}/");
-                            let open: Vec<_> = lock(&pending).extract_if(|k, _| k.starts_with(&prefix)).map(|(_, tx)| tx).collect();
-                            for tx in open { let _ = tx.send(PermissionDecision::Cancel); }
-                        }
+                        if let Some((sid, _)) = sessions.get(&key) { cancel_turn(&conn, &pending, sid); }
                         continue;
                     }
                     Cmd::Login { id, done } => {
@@ -559,8 +583,10 @@ async fn run_connection<W, R>(
                     let sid = session.to_string();
                     lock(&sinks).insert(sid.clone(), events.clone());
                     let _ = events.send(AgentEvent::Phase { phase: TaskPhase::Working }).await;
-                    let req = PromptRequest::new(session, vec![ContentBlock::Text(TextContent::new(text))]);
-                    let done = match tokio::time::timeout(timeout, conn.send_request(req).block_task()).await {
+                    let req = PromptRequest::new(session.clone(), vec![ContentBlock::Text(TextContent::new(text))]);
+                    let reply = conn.send_request(req).block_task();
+                    tokio::pin!(reply);
+                    let done = match tokio::time::timeout(timeout, &mut reply).await {
                         Ok(Ok(r)) => AgentEvent::Done {
                             phase: TaskPhase::Completed,
                             stop_reason: Some(format!("{:?}", r.stop_reason).to_lowercase()),
@@ -574,7 +600,12 @@ async fn run_connection<W, R>(
                             }
                             AgentEvent::Done { phase: TaskPhase::Failed, stop_reason: Some(e.to_string()) }
                         }
-                        Err(_) => AgentEvent::Done { phase: TaskPhase::Failed, stop_reason: Some("timeout".into()) },
+                        Err(_) => {
+                            // Stop the turn and give it a moment to end, so it can't bleed into the next one.
+                            cancel_turn(&conn, &pending, &session);
+                            let _ = tokio::time::timeout(CANCEL_GRACE, reply).await;
+                            AgentEvent::Done { phase: TaskPhase::Failed, stop_reason: Some("timeout".into()) }
+                        }
                     };
                     let prefix = format!("{sid}/");
                     lock(&pending).retain(|k, _| !k.starts_with(&prefix));

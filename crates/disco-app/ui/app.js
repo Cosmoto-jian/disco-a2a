@@ -23,6 +23,8 @@ function h(tag, attrs = {}, ...kids) {
   for (const k of kids.flat()) if (k != null && k !== false) e.append(k instanceof Node ? k : String(k));
   return e;
 }
+// macOS WKWebView can deliver the IME-confirming Enter with isComposing=false but keyCode 229.
+const composing = (e) => e.isComposing || e.keyCode === 229;
 const esc = (s) => s.replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 function hash(s) { let x = 0; for (const c of s) x = (x * 31 + c.codePointAt(0)) | 0; return Math.abs(x); }
 const IS_WIN = navigator.userAgent.includes("Windows");
@@ -286,7 +288,7 @@ async function openThread(t) {
   const slash = slashPicker(ta, t);
   ta.addEventListener("keydown", (e) => {
     if (mention?.key(e) || slash.key(e)) return;
-    if (e.key === "Enter" && !e.shiftKey && !e.isComposing) { e.preventDefault(); sendMsg(); }
+    if (e.key === "Enter" && !e.shiftKey && !composing(e)) { e.preventDefault(); sendMsg(); }
   });
   ta.focus();
   drawMembers(); syncComposer();
@@ -303,7 +305,7 @@ async function openThread(t) {
     log.replaceChildren(...msgs.map((m) => bubble(m.author, m.body)));
     markResend(log);
     for (const it of S.inbox) if (it.thread === t) log.append(inboxCard(it));
-    for (const [k, v] of Object.entries(S.live)) if (k.startsWith(t + "|")) log.append(v.el);
+    for (const [k, v] of Object.entries(S.live)) if (k.startsWith(t + "|") && v.on) log.append(v.el);
     log.scrollTop = log.scrollHeight;
   };
   if (Array.isArray(S.msgs[t])) draw(S.msgs[t]);
@@ -422,9 +424,9 @@ function slashPicker(ta, t) {
   });
   ta.addEventListener("blur", () => setTimeout(close, 100));
   return { key(e) {
-    if (!box) return false;
+    if (!box || composing(e)) return false;
     if (e.key === "ArrowDown" || e.key === "ArrowUp") { idx = (idx + (e.key === "ArrowDown" ? 1 : items.length - 1)) % items.length; draw(); }
-    else if ((e.key === "Enter" || e.key === "Tab") && !e.isComposing) pick(items[idx][0]);
+    else if (e.key === "Enter" || e.key === "Tab") pick(items[idx][0]);
     else if (e.key === "Escape") close();
     else return false;
     e.preventDefault(); return true;
@@ -490,7 +492,7 @@ async function loadSpace(t) {
   const who = (a) => (a === "me" ? "我" : a);
   const add = h("input", { placeholder: "加一项待办，回车", class: "todo-in" });
   add.onkeydown = async (e) => {
-    if (e.key !== "Enter" || e.isComposing || !add.value.trim()) return;
+    if (e.key !== "Enter" || composing(e) || !add.value.trim()) return;
     try { await invoke("todo_new", { thread: t, text: add.value }); add.value = ""; } catch (er) { toast(er); }
   };
   const todos = h("ul", { class: "todos" }, ...sp.todos.map((x) => h("li", { class: x.done ? "done" : "" },
@@ -617,7 +619,7 @@ function inlineRename(el, name) {
       delete S.msgs[`dm:${name}`]; await load(); S.thread = null; openThread(`dm:${next}`); toast(`已改名为 ${next}`, 2000);
     } catch (e) { el.textContent = name; toast(e); }
   };
-  const key = (e) => { if (e.key === "Enter" && !e.isComposing) { e.preventDefault(); done(true); } else if (e.key === "Escape") { e.preventDefault(); done(false); } };
+  const key = (e) => { if (composing(e)) return; if (e.key === "Enter") { e.preventDefault(); done(true); } else if (e.key === "Escape") { e.preventDefault(); done(false); } };
   const blur = () => done(true);
   el.addEventListener("keydown", key); el.addEventListener("blur", blur);
 }
@@ -669,9 +671,9 @@ function mentionPicker(ta, members) {
   });
   ta.addEventListener("blur", () => setTimeout(close, 100));
   return { key(e) {
-    if (!box) return false;
+    if (!box || composing(e)) return false;
     if (e.key === "ArrowDown" || e.key === "ArrowUp") { idx = (idx + (e.key === "ArrowDown" ? 1 : items.length - 1)) % items.length; draw(); }
-    else if ((e.key === "Enter" || e.key === "Tab") && !e.isComposing) pick(items[idx]);
+    else if (e.key === "Enter" || e.key === "Tab") pick(items[idx]);
     else if (e.key === "Escape") close();
     else return false;
     e.preventDefault(); return true;
@@ -739,7 +741,7 @@ function inboxCard(it) {
   if (it.options.length || perm) card.append(opts);
   if (it.text) {
     const ta = h("textarea", { rows: 1, placeholder: "输入回答，↩ 发送" });
-    ta.onkeydown = (e) => { if (e.key === "Enter" && !e.shiftKey && !e.isComposing && ta.value.trim()) { e.preventDefault(); answer(null, ta.value); } };
+    ta.onkeydown = (e) => { if (e.key === "Enter" && !e.shiftKey && !composing(e) && ta.value.trim()) { e.preventDefault(); answer(null, ta.value); } };
     card.append(h("div", { class: "free" }, ta, h("button", { class: "allow", onclick: () => ta.value.trim() && answer(null, ta.value) }, "回答")));
   }
   return card;
@@ -774,6 +776,8 @@ listen("message", ({ payload: m }) => {
   if (m.thread.startsWith("dm:") && !S.ov.agents.some((a) => `dm:${a.name}` === m.thread)) load();
   const k = liveKey(m.thread, m.author);
   if (S.live[k]) { S.live[k].el.remove(); delete S.live[k]; }
+  // A failed reply ends in a system line: bubbles already off in this thread are stale.
+  if (m.author === "system") for (const [lk, v] of Object.entries(S.live)) if (lk.startsWith(m.thread + "|") && !v.on) { v.el.remove(); delete S.live[lk]; }
   const head = S.ov.heads.find((x) => x.thread === m.thread);
   if (head) Object.assign(head, m); else S.ov.heads.unshift(m);
   if (S.thread !== m.thread && m.author !== "me") S.unread[m.thread] = (S.unread[m.thread] ?? 0) + 1;
@@ -794,6 +798,8 @@ listen("typing", ({ payload: { thread, agent, on } }) => {
   const set = (S.typing[thread] ??= new Set());
   on ? set.add(agent) : set.delete(agent);
   const k = liveKey(thread, agent);
+  // A finished reply that never got its final message must not swallow the next one.
+  if (on && S.live[k] && !S.live[k].on) { S.live[k].el.remove(); delete S.live[k]; }
   if (on && !S.live[k]) {
     const b = h("div", { class: "b" }, h("span", { class: "typing-dots" }, h("i"), h("i"), h("i")));
     b.classList.add("streaming");
@@ -1332,8 +1338,9 @@ addEventListener("keydown", (e) => {
 addEventListener("wheel", (e) => { if (e.ctrlKey || e.metaKey) e.preventDefault(); }, { passive: false });
 addEventListener("keydown", (e) => { if ((e.ctrlKey || e.metaKey) && ["+", "=", "-", "_", "0"].includes(e.key)) e.preventDefault(); }, true);
 $("#search").addEventListener("keydown", (e) => {
+  if (composing(e)) return;
   if (e.key === "Escape") { e.target.value = ""; S.q = ""; renderList(); e.target.blur(); }
-  if (e.key === "Enter" && !e.isComposing) { e.preventDefault(); $("#items li:not(.empty)")?.click(); e.target.blur(); }
+  if (e.key === "Enter") { e.preventDefault(); $("#items li:not(.empty)")?.click(); e.target.blur(); }
 });
 
 (async () => { await load(); blank(); setInbox(await invoke("inbox").catch(() => []), true); })();

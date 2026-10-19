@@ -115,16 +115,16 @@ fn status(s: &a2a::TaskStatus) -> Vec<AgentEvent> {
     out
 }
 
-fn origin(url: &str) -> Option<(String, String)> {
-    let (scheme, rest) = url.split_once("://")?;
-    let host = rest.split(['/', '?', '#']).next()?.rsplit('@').next()?.to_ascii_lowercase();
-    Some((scheme.to_ascii_lowercase(), host))
+/// (scheme, host, port) as a WHATWG parser (and so reqwest) will see it; `None`
+/// for anything unparsable or host-less. Never hand-parse: `a\@b` fools splitters.
+fn origin(url: &str) -> Option<(String, String, u16)> {
+    let u = url::Url::parse(url).ok()?;
+    Some((u.scheme().to_owned(), u.host_str()?.to_owned(), u.port_or_known_default()?))
 }
 
 /// Hosts where plain http is acceptable: loopback, or a Tailscale peer
 /// (WireGuard already encrypts and authenticates the link).
-fn is_loopback(host: &str) -> bool {
-    let h = host.rsplit_once(':').filter(|(_, p)| p.bytes().all(|b| b.is_ascii_digit())).map_or(host, |(h, _)| h);
+fn is_loopback(h: &str) -> bool {
     if matches!(h, "localhost" | "127.0.0.1" | "[::1]") || h.ends_with(".ts.net") { return true; }
     h.parse::<std::net::Ipv4Addr>().is_ok_and(|ip| { let o = ip.octets(); o[0] == 100 && (64..128).contains(&o[1]) })
 }
@@ -132,8 +132,9 @@ fn is_loopback(host: &str) -> bool {
 /// A credential may only travel over https (or to loopback), and only to the
 /// host the user entered: a hostile Agent Card must not redirect it elsewhere.
 pub fn check_cred_target(base_url: &str, card: &serde_json::Value) -> Result<(), String> {
-    let (scheme, host) = origin(base_url).ok_or("无效 URL")?;
-    if scheme != "https" && !is_loopback(&host) {
+    let base = origin(base_url).ok_or("无效 URL")?;
+    let (scheme, host, _) = &base;
+    if scheme != "https" && !is_loopback(host) {
         return Err("带凭证的 Agent 必须使用 https".into());
     }
     fn urls<'a>(v: &'a serde_json::Value, out: &mut Vec<&'a str>) {
@@ -151,7 +152,7 @@ pub fn check_cred_target(base_url: &str, card: &serde_json::Value) -> Result<(),
     urls(card, &mut found);
     for u in found {
         match origin(u) {
-            Some((s, h)) if h == host && (s == "https" || is_loopback(&h)) => {}
+            Some(o) if o == base => {}
             _ => return Err(format!("Agent Card 指向其他地址（{u}），已拒绝发送凭证")),
         }
     }
@@ -178,5 +179,31 @@ mod cred_tests {
         assert!(check_cred_target("http://127.0.0.1:9000", &local).is_ok());
         let trick = json!({"url": "https://a.example@evil.example/"});
         assert!(check_cred_target("https://a.example", &trick).is_err());
+    }
+
+    #[test]
+    fn origin_follows_whatwg() {
+        use super::origin;
+        let o = |h: &str, p| Some(("https".to_owned(), h.to_owned(), p));
+        // `\` is a path separator for special schemes: this goes to evil.example.
+        assert_eq!(origin(r"https://evil.example\@a.example/rpc"), o("evil.example", 443));
+        assert_eq!(origin("https://user:pw@A.Example/x"), o("a.example", 443));
+        assert_eq!(origin("https://a.example:443/"), o("a.example", 443));
+        assert_eq!(origin("http://a.example/").map(|o| o.2), Some(80));
+        assert_eq!(origin("http://[::1]:9000/").map(|o| o.1), Some("[::1]".into()));
+        for bad in ["", "a.example/rpc", "https://", "https://a b.example/", "mailto:x@a.example"] { assert_eq!(origin(bad), None, "{bad}"); }
+    }
+
+    #[test]
+    fn cred_target_tricks() {
+        let base = "https://a.example";
+        for u in [r"https://evil.example\@a.example/rpc", "https://a.example:8443/rpc", "http://a.example/rpc", "not a url", "https://a.example.evil.example/"] {
+            assert!(check_cred_target(base, &json!({"url": u})).is_err(), "{u}");
+        }
+        for u in ["https://a.example:443/rpc", "https://u@a.example/rpc", "HTTPS://A.EXAMPLE/rpc"] {
+            assert!(check_cred_target(base, &json!({"url": u})).is_ok(), "{u}");
+        }
+        assert!(check_cred_target(r"https://evil.example\@a.example", &json!({"url": "https://a.example/rpc"})).is_err());
+        assert!(check_cred_target("http://127.0.0.1:9000", &json!({"url": "http://127.0.0.1:9001/"})).is_err());
     }
 }
