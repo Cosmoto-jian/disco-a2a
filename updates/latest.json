@@ -1,19 +1,19 @@
 {
-  "version": "1.5.11",
-  "notes": "Agent 一键重启、修复多余 null、共享撤销提示更清楚",
-  "pub_date": "2026-10-15T01:12:07Z",
+  "version": "1.5.12",
+  "notes": "安全与稳定性修复：webhook 冒充、访客记忆、MCP 上下文伪造、A2A/Tailscale 校验；Agent 崩溃自动重启、退出清理子进程、超时取消、并发槽卡死、群聊踢球、中文 @ 与输入法回车",
+  "pub_date": "2026-10-19T16:42:33Z",
   "platforms": {
     "darwin-aarch64": {
-      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVUcDdocWFJV0FyVnlTdVMrc0UrZHZqYWwweExqenYzakZSbDdKc0lXbCs5eEl1VkxpNGVZdXhrMlhwUE9odlI2aXlnOUFta3NIbGJwU0d3TGVLcXVsS2ZOcEp5M3puaFEwPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkyMDI2NzI2CWZpbGU6RGlzY29fMS41LjExX3VuaXZlcnNhbC5hcHAudGFyLmd6ClZsY1lDUE9GRXdzYXZnVUlBb0gySjRpS0JkUlRLSGFwY0NqMnp4N2xNT25vK3p6NTRiTFV5VEFHYnhwRmJDbVJkK3QyZ2NyU2ZhTUEvYk41bloyaUFnPT0K",
-      "url": "https://github.com/Cosmoto-jian/disco-a2a/releases/download/v1.5.11/Disco_1.5.11_universal.app.tar.gz"
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVUcDdocWFJV0FyVjNDQjg4SXU0SlRQVWhwSDVwVStqR0FNVUM0NDV2VFYxMm1qeWR4SndhcGRKOWRhd1dCU0VuK1k5TG5CWUdDTFh0bHNaWjVJSmgwUXZYNWlyWHBZd0FBPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkyNDI4MTUxCWZpbGU6RGlzY29fMS41LjEyX3VuaXZlcnNhbC5hcHAudGFyLmd6CnFiWWdRbnJQMHJ1OUUrempMbkx6WVhnV1R1SFE1OHZrcTdQaFlFckVIMk5MOWFobTU2L0d6QnhZb3FRaU90ckdLS0dRUksxOVNCdXJNQVBXcUJCREJ3PT0K",
+      "url": "https://github.com/Cosmoto-jian/disco-a2a/releases/download/v1.5.12/Disco_1.5.12_universal.app.tar.gz"
     },
     "darwin-x86_64": {
-      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVUcDdocWFJV0FyVnlTdVMrc0UrZHZqYWwweExqenYzakZSbDdKc0lXbCs5eEl1VkxpNGVZdXhrMlhwUE9odlI2aXlnOUFta3NIbGJwU0d3TGVLcXVsS2ZOcEp5M3puaFEwPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkyMDI2NzI2CWZpbGU6RGlzY29fMS41LjExX3VuaXZlcnNhbC5hcHAudGFyLmd6ClZsY1lDUE9GRXdzYXZnVUlBb0gySjRpS0JkUlRLSGFwY0NqMnp4N2xNT25vK3p6NTRiTFV5VEFHYnhwRmJDbVJkK3QyZ2NyU2ZhTUEvYk41bloyaUFnPT0K",
-      "url": "https://github.com/Cosmoto-jian/disco-a2a/releases/download/v1.5.11/Disco_1.5.11_universal.app.tar.gz"
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVUcDdocWFJV0FyVjNDQjg4SXU0SlRQVWhwSDVwVStqR0FNVUM0NDV2VFYxMm1qeWR4SndhcGRKOWRhd1dCU0VuK1k5TG5CWUdDTFh0bHNaWjVJSmgwUXZYNWlyWHBZd0FBPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkyNDI4MTUxCWZpbGU6RGlzY29fMS41LjEyX3VuaXZlcnNhbC5hcHAudGFyLmd6CnFiWWdRbnJQMHJ1OUUrempMbkx6WVhnV1R1SFE1OHZrcTdQaFlFckVIMk5MOWFobTU2L0d6QnhZb3FRaU90ckdLS0dRUksxOVNCdXJNQVBXcUJCREJ3PT0K",
+      "url": "https://github.com/Cosmoto-jian/disco-a2a/releases/download/v1.5.12/Disco_1.5.12_universal.app.tar.gz"
     },
     "windows-x86_64": {
-      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVUcDdocWFJV0FyVjNJT09PTU00bndCT0l1T0VoWEJOK3Q2MjdpeDhrQzNkWFhjaUFlSTJ6R2NsNVpVenZsYmdsTVNJWkpqaVdvaHYzR0J3ZEZESGpvcUlGb0llUlp5YUFBPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkyMDI2NzI3CWZpbGU6RGlzY29fMS41LjExX3g2NC1zZXR1cC5leGUKSXZWc1pQQWRqeWNNaFc1eEtCNWowWjdDRXhDOGNpM2QyMk1JQW1oYU5wQ2wzU3FqMmwyV0F1NGF1dnhieXZVbFJHT1lCWTNxVnV1T2Z0cmhkUmRRRGc9PQo=",
-      "url": "https://github.com/Cosmoto-jian/disco-a2a/releases/download/v1.5.11/Disco_1.5.11_x64-setup.exe"
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVUcDdocWFJV0FyVjRFeDVyemJNU0YrVGdoenVQcWhja2F1Um9STjVvWjU3ZFNKWkdVT2NZUndmNEpKUksvdExnaUwwTXIrVlJLbXpMTlJKYTlSNXo1SEFvMFZ5WDFieGdrPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkyNDI4MTUzCWZpbGU6RGlzY29fMS41LjEyX3g2NC1zZXR1cC5leGUKYUZmTENzeElYWmpoWVRaT1o2R01BOHJhM2lrVVg2cjdjdUVBVXN1SHR1R1pxYWJNNXh5Mi80Vnp0d2tRcGR2K0pKVnZXWWdTelFSUFdkaFNNSXA2RFE9PQo=",
+      "url": "https://github.com/Cosmoto-jian/disco-a2a/releases/download/v1.5.12/Disco_1.5.12_x64-setup.exe"
     }
   }
 }
