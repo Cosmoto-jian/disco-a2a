@@ -157,13 +157,23 @@ function ask(question, okText = "确定") {
 }
 
 // ---------- data
-async function load() {
-  S.ov = await invoke("overview");
-  document.body.classList.toggle("paused", S.ov.paused);
-  $("#paused-bar").hidden = !S.ov.paused;
-  drawKill();
-  renderList();
+// Overlapping loads (bursts of "agents" events, an action's own reload) may resolve out of order:
+// only the newest one lands, and a stale caller waits for it, so `await load()` always sees fresh data.
+let loadSeq = 0, loading = null;
+function load() {
+  const seq = ++loadSeq;
+  return (loading = invoke("overview").then((ov) => {
+    if (seq !== loadSeq) return loading;
+    S.ov = ov;
+    document.body.classList.toggle("paused", ov.paused);
+    $("#paused-bar").hidden = !ov.paused;
+    drawKill();
+    renderList();
+  }));
 }
+// The first overview: events and opens that arrive before it wait for it (in order) instead of reading S.ov == null.
+let ready = null;
+const onReady = (fn) => (e) => (S.ov ? fn(e) : ready?.then(() => fn(e)));
 const peerOf = (t) => S.ov.peers.find((p) => p.thread === t);
 const threadName = (t) => t.startsWith("dm:") ? t.slice(3)
   : t.startsWith("peer:") ? (peerOf(t) ? `${peerOf(t).guest} → ${peerOf(t).agent}` : "共享")
@@ -171,11 +181,23 @@ const threadName = (t) => t.startsWith("dm:") ? t.slice(3)
 
 // ---------- list column
 // Coalesce list redraws: typing/stream events can fire many times per frame.
-let listRaf = 0;
+// While a press is down on the list, hold redraws: swapping the row under the pointer between
+// mousedown and mouseup would swallow the click. The held redraw runs right after the click.
+let listRaf = 0, listHeld = false, listDirty = false;
 function renderList() {
-  if (!listRaf) listRaf = requestAnimationFrame(() => { listRaf = 0; drawList(); });
+  if (!listRaf) listRaf = requestAnimationFrame(() => { listRaf = 0; if (listHeld) listDirty = true; else drawList(); });
 }
+$("#items").addEventListener("pointerdown", () => { listHeld = true; });
+const releaseList = () => {
+  if (!listHeld) return;
+  listHeld = false;
+  if (listDirty) { listDirty = false; setTimeout(renderList); }
+};
+addEventListener("pointerup", releaseList, true);
+addEventListener("pointercancel", releaseList, true);
+addEventListener("blur", releaseList); // the window losing focus, not the composer (no capture)
 function drawList() {
+  if (!S.ov) return;
   const ul = $("#items"); ul.replaceChildren();
   // Same header on every tab: ＋ keeps its place (just goes quiet) so the search box never jumps.
   const add = $("#list-add"); add.classList.toggle("off", S.tab === "inbox" || S.tab === "settings");
@@ -255,6 +277,7 @@ function prefetch(t) {
   invoke("messages", { thread: t }).then((m) => { S.msgs[t] = m; }).catch(() => { delete S.msgs[t]; });
 }
 async function openThread(t) {
+  if (!S.ov) await ready;
   if (S.thread === t && $("#log")) return;
   const isGroup = t.startsWith("group:"); const name = threadName(t);
   // Opened from a toast on 设置: leave settings so a status event can't repaint over the chat.
@@ -781,12 +804,17 @@ function setInbox(items, quiet = false) {
   if (S.thread) drawMembers();
   renderList();
 }
-listen("inbox", ({ payload }) => setInbox(payload));
+let inboxLive = false; // a pushed inbox beats the startup fetch, which may be older
+listen("inbox", onReady(({ payload }) => { inboxLive = true; setInbox(payload); }));
 
 // ---------- events
 const liveKey = (thread, agent) => `${thread}|${agent}`;
-listen("agents", () => load());
-listen("message", ({ payload: m }) => {
+// Added / removed / renamed / restarted (payload may be null): refresh the overview; a chat whose agent is gone closes.
+listen("agents", onReady(async () => {
+  await load();
+  if (S.thread?.startsWith("dm:") && !S.ov.agents.some((a) => `dm:${a.name}` === S.thread)) blank();
+}));
+listen("message", onReady(({ payload: m }) => {
   if (m.thread.startsWith("dm:") && !S.ov.agents.some((a) => `dm:${a.name}` === m.thread)) load();
   const k = liveKey(m.thread, m.author);
   if (S.live[k]) { S.live[k].el.remove(); delete S.live[k]; }
@@ -807,8 +835,8 @@ listen("message", ({ payload: m }) => {
     if (g && !g.people.includes(who)) g.people.push(who);
   }
   renderList();
-});
-listen("typing", ({ payload: { thread, agent, on } }) => {
+}));
+listen("typing", onReady(({ payload: { thread, agent, on } }) => {
   const set = (S.typing[thread] ??= new Set());
   on ? set.add(agent) : set.delete(agent);
   const k = liveKey(thread, agent);
@@ -824,8 +852,8 @@ listen("typing", ({ payload: { thread, agent, on } }) => {
   if (!on && S.live[k]) { S.live[k].on = false; S.live[k].b.classList.remove("streaming"); }
   setStatus(thread, agent, on ? "think" : null);
   drawKill();
-});
-listen("stream", ({ payload: { thread, agent, event } }) => {
+}));
+listen("stream", onReady(({ payload: { thread, agent, event } }) => {
   const live = S.live[liveKey(thread, agent)];
   if (event.type === "text_chunk" && live) {
     live.text += event.text;
@@ -842,7 +870,7 @@ listen("stream", ({ payload: { thread, agent, event } }) => {
       live ? live.el.before(chip) : $("#log").append(chip);
     }
   }
-});
+}));
 async function installUpdate() {
   $("#update-bar")?.replaceChildren("正在下载更新…");
   try { await invoke("install_update"); } catch (e) { toast(`更新失败：${e}`); }
@@ -1371,4 +1399,5 @@ $("#search").addEventListener("keydown", (e) => {
   if (e.key === "Enter") { e.preventDefault(); $("#items li:not(.empty)")?.click(); e.target.blur(); }
 });
 
-(async () => { await load(); blank(); setInbox(await invoke("inbox").catch(() => []), true); })();
+ready = load();
+(async () => { await ready; blank(); const items = await invoke("inbox").catch(() => []); if (!inboxLive) setInbox(items, true); })();

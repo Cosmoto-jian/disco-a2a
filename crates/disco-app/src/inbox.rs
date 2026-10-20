@@ -50,6 +50,16 @@ impl Inbox {
     }
 }
 
+fn question_item(thread: &str, agent: &str, question: &str, options: Vec<String>, text: bool) -> (Item, oneshot::Sender<String>, oneshot::Receiver<String>) {
+    let (tx, rx) = oneshot::channel();
+    let item = Item {
+        id: uuid::Uuid::new_v4().simple().to_string(), kind: "question", thread: thread.into(), agent: agent.into(), title: question.into(),
+        options: options.into_iter().enumerate().map(|(i, l)| Opt { id: i.to_string(), label: l, allow: false, always: false }).collect(),
+        text, ts: crate::now(),
+    };
+    (item, tx, rx)
+}
+
 /// What the user picked.
 pub struct Answer { pub option: Option<String>, pub text: Option<String> }
 
@@ -62,7 +72,11 @@ impl Core {
         thread.strip_prefix("group:").filter(|id| !id.starts_with("local-")).map(str::to_owned)
     }
 
-    fn inbox_add(&self, item: Item, reply: Reply) {
+    fn inbox_add(&self, item: Item, reply: Reply) { self.inbox_add_once(item, reply, false); }
+
+    /// Add an item; with `once`, nothing is added (false) while the same agent already
+    /// has one with this title open. Checked and inserted under one lock.
+    fn inbox_add_once(&self, item: Item, reply: Reply, once: bool) -> bool {
         let id = item.id.clone();
         let discord = self.discord_rest().zip(self.thread_channel(&item.thread));
         let card = format!("{} **{}** {}：{}", if item.kind == "permission" { "🔐" } else { "❓" }, item.agent,
@@ -71,7 +85,11 @@ impl Core {
             .map(|(i, o)| (format!("disco:{id}:{i}"), o.label.clone(), o.allow)).collect();
         if item.kind == "permission" { buttons.push((format!("disco:{id}:x"), "拒绝".into(), false)); }
         let note = if item.text && item.options.is_empty() { "\n（请在 Disco 里回答）" } else { "" };
-        lock(&self.inbox.items).insert(id.clone(), Entry { item, reply, discord: None });
+        {
+            let mut items = lock(&self.inbox.items);
+            if once && items.values().any(|e| e.item.agent == item.agent && e.item.title == item.title) { return false; }
+            items.insert(id.clone(), Entry { item, reply, discord: None });
+        }
         self.inbox_changed();
         if let Some((rest, ch)) = discord {
             let inbox = self.inbox.clone();
@@ -86,6 +104,7 @@ impl Core {
                 }
             });
         }
+        true
     }
 
     /// An agent asked for permission (ACP `session/request_permission`).
@@ -102,15 +121,17 @@ impl Core {
     /// An agent's question for the user: its item id, and the answer (an error if
     /// it is withdrawn, e.g. the user stopped everything).
     pub(crate) fn inbox_question(&self, thread: &str, agent: &str, question: &str, options: Vec<String>, text: bool) -> (String, oneshot::Receiver<String>) {
-        let (tx, rx) = oneshot::channel();
-        let item = Item {
-            id: uuid::Uuid::new_v4().simple().to_string(), kind: "question", thread: thread.into(), agent: agent.into(), title: question.into(),
-            options: options.into_iter().enumerate().map(|(i, l)| Opt { id: i.to_string(), label: l, allow: false, always: false }).collect(),
-            text, ts: crate::now(),
-        };
+        let (item, tx, rx) = question_item(thread, agent, question, options, text);
         let id = item.id.clone();
         self.inbox_add(item, Reply::Question(tx));
         (id, rx)
+    }
+
+    /// Like `inbox_question`, but None while `agent` already has this question open
+    /// (repeated failures must not stack identical cards).
+    pub(crate) fn inbox_question_once(&self, thread: &str, agent: &str, question: &str, options: Vec<String>) -> Option<oneshot::Receiver<String>> {
+        let (item, tx, rx) = question_item(thread, agent, question, options, false);
+        self.inbox_add_once(item, Reply::Question(tx), true).then_some(rx)
     }
 
     /// Take one item back (nobody waits on it any more, e.g. `ask_user` timed out).

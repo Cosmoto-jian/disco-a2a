@@ -27,19 +27,32 @@ const DOC_MAX: usize = 200_000;
 
 /// Forward MCP JSON-RPC lines from stdin to the app; print the replies on stdout.
 /// Requests run on their own threads, so a slow `ask` never blocks a `ping`.
+/// Exits as soon as stdin closes (the agent is gone) or Disco stops answering on its
+/// port, so the proxy never outlives either.
 pub fn stdio_proxy() {
     use std::io::{BufRead, Write};
     let port: u16 = std::env::var("DISCO_MCP_PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(0);
     let token = std::env::var("DISCO_MCP_TOKEN").unwrap_or_default();
     // Started outside Disco (e.g. pi in a terminal reading its mcp.json): no tools, no noise.
     let offline = port == 0;
+    if !offline {
+        std::thread::spawn(move || {
+            let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+            let mut misses = 0;
+            loop {
+                std::thread::sleep(std::time::Duration::from_secs(5));
+                let up = std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_secs(2)).is_ok();
+                misses = if up { 0 } else { misses + 1 };
+                if misses >= 3 { std::process::exit(0); }
+            }
+        });
+    }
     let out = Arc::new(std::sync::Mutex::new(std::io::stdout()));
-    let mut jobs = Vec::new();
     for line in std::io::stdin().lock().lines() {
         let Ok(line) = line else { break };
         if line.trim().is_empty() { continue; }
         let (out, token) = (out.clone(), token.clone());
-        jobs.push(std::thread::spawn(move || {
+        std::thread::spawn(move || {
             let reply = match if offline { Ok(offline_reply(&line)) } else { forward(port, &token, &line) } {
                 Ok(body) => body,
                 Err(e) => match serde_json::from_str::<Value>(&line).ok().and_then(|v| v.get("id").cloned()) {
@@ -52,10 +65,10 @@ pub fn stdio_proxy() {
                 let _ = writeln!(o, "{}", reply.trim());
                 let _ = o.flush();
             }
-        }));
-        jobs.retain(|j| !j.is_finished());
+        });
     }
-    for j in jobs { let _ = j.join(); }
+    // EOF: nobody reads the replies of requests still in flight (a long `ask`), so don't wait.
+    std::process::exit(0);
 }
 
 /// Answers when Disco isn't running: an empty server, so the host just shows no tools.
@@ -292,8 +305,8 @@ impl Call<'_> {
         }
         let agents: Vec<String> = self.core.db().list_agents().unwrap_or_default().into_iter().map(|a| a.name).filter(|n| n != self.agent).collect();
         o.push_str(&format!("\n其他 agent：{}\n", if agents.is_empty() { "（无）".into() } else { agents.join("、") }));
-        if let Ok((thread, _)) = self.space(&json!({})) {
-            o.push_str(&format!("\n这里的群文档文件：{}\n", doc_path(self.core, &thread).display()));
+        if let Ok((thread, _)) = self.space(&json!({})) && let Ok(p) = doc_path(self.core, &thread) {
+            o.push_str(&format!("\n这里的群文档文件：{}\n", p.display()));
         }
         o
     }
@@ -334,7 +347,8 @@ impl Call<'_> {
         let thread = match self.place() { Place::Group(g) => format!("group:{}", g.id), _ => format!("dm:{}", self.agent) };
         self.core.post_message(&thread, self.agent, &format!("→ 请教 {target}：{question}"));
         let prompt = format!("{} 通过 Disco 向你请教。你的回答会直接交给它，不会发到群里。请简洁作答：\n\n{question}", self.agent);
-        let answer = self.core.turn(&thread, &target, &format!("ask:{}", self.agent), &prompt).await?;
+        // The asking chat is part of the context, so its memory switch holds here too.
+        let answer = self.core.turn(&thread, &target, &format!("ask:{}:{thread}", self.agent), &prompt).await?;
         let answer = answer.trim().to_owned();
         self.core.post_message(&thread, &target, &format!("↩ 回复 {}：{answer}", self.agent));
         Ok(answer)
@@ -390,14 +404,14 @@ impl Call<'_> {
 
     fn doc_read(&self, args: &Value) -> Result<String, String> {
         let (thread, label) = self.space(args)?;
-        let doc = std::fs::read_to_string(doc_path(self.core, &thread)).unwrap_or_default();
+        let doc = std::fs::read_to_string(doc_path(self.core, &thread)?).unwrap_or_default();
         Ok(if doc.trim().is_empty() { format!("「{label}」的群文档还是空的") } else { doc })
     }
 
     fn doc_write(&self, args: &Value) -> Result<String, String> {
         let content = args.get("content").and_then(Value::as_str).ok_or("content 不能为空")?;
         let (thread, label) = self.space(args)?;
-        let path = doc_path(self.core, &thread);
+        let path = doc_path(self.core, &thread)?;
         let replace = s(args, "mode") == Some("replace");
         let _guard = crate::memory::fs_lock();
         let mut doc = if replace { String::new() } else { std::fs::read_to_string(&path).unwrap_or_default() };
@@ -428,7 +442,7 @@ pub struct Todo {
     pub done: bool,
 }
 
-fn todo_prefix(thread: &str) -> String { format!("{TODO}{thread}/") }
+pub(crate) fn todo_prefix(thread: &str) -> String { format!("{TODO}{thread}/") }
 
 pub fn todos(core: &Core, thread: &str) -> Vec<Todo> {
     let prefix = todo_prefix(thread);
@@ -476,11 +490,24 @@ pub fn delete_todo(core: &Core, thread: &str, id: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// `<app data>/spaces/<thread>/group.md`; one folder per group or DM.
-pub fn doc_path(core: &Core, thread: &str) -> PathBuf {
+/// The folder name of a thread's space: `group:1` → `group-1`. Anything that could step
+/// outside `spaces/` (`..`, a path separator, NUL) is refused.
+fn space_name(thread: &str) -> Result<String, String> {
+    if thread.is_empty() || thread.contains("..") || thread.contains(['/', '\\', '\0']) {
+        return Err(format!("无效的会话：{thread:?}"));
+    }
+    Ok(thread.replace(':', "-"))
+}
+
+/// `<app data>/spaces/<thread>/`: one folder per group or DM (doc, team blackboard, files).
+pub fn space_dir(core: &Core, thread: &str) -> Result<PathBuf, String> {
     let base = core.app.path().app_data_dir().unwrap_or_else(|_| std::env::temp_dir());
-    let dir: String = thread.chars().map(|c| if c == '/' || c == '\\' || c == ':' { '-' } else { c }).collect();
-    base.join("spaces").join(dir).join("group.md")
+    Ok(base.join("spaces").join(space_name(thread)?))
+}
+
+/// `<app data>/spaces/<thread>/group.md`.
+pub fn doc_path(core: &Core, thread: &str) -> Result<PathBuf, String> {
+    Ok(space_dir(core, thread)?.join("group.md"))
 }
 
 pub fn write_doc(path: &std::path::Path, doc: &str) -> Result<(), String> {
@@ -513,6 +540,15 @@ impl EmitSpace for tauri::AppHandle {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn space_names_stay_inside() {
+        assert_eq!(super::space_name("group:123").as_deref(), Ok("group-123"));
+        assert_eq!(super::space_name("dm:小助手").as_deref(), Ok("dm-小助手"));
+        for bad in ["", "..", "dm:..", "group:../x", "dm:a/b", "dm:a\\b", "dm:a\0", "/etc"] {
+            assert!(super::space_name(bad).is_err(), "{bad:?}");
+        }
+    }
+
     #[test]
     fn tmp_names_are_unique() {
         let p = std::path::Path::new("/x/y/group.md");

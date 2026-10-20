@@ -25,6 +25,9 @@ pub struct OpenAi {
     turns: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     /// Loopback Disco MCP for tool calls: (port, tokens, this agent's name).
     mcp: Option<(u16, crate::hub::McpTokens, String)>,
+    /// Dropped (removed, renamed, restarted, stopped): turns in flight stop, and no tool
+    /// call mints a token again after the agent's tokens were revoked.
+    closed: AtomicBool,
 }
 
 /// Base URL as the user typed it, minus a trailing `/` or a pasted `/chat/completions`.
@@ -76,10 +79,16 @@ pub async fn models(http: &reqwest::Client, base: &str, key: Option<&str>) -> Re
 
 impl OpenAi {
     pub fn new(base: &str, key: Option<String>, model: String, http: reqwest::Client, mcp: Option<(u16, crate::hub::McpTokens, String)>) -> Self {
-        Self { base: normalize(base), key, model: Mutex::new(model), http, history: Mutex::default(), stop: Mutex::default(), turns: Mutex::default(), mcp }
+        Self { base: normalize(base), key, model: Mutex::new(model), http, history: Mutex::default(), stop: Mutex::default(), turns: Mutex::default(), mcp, closed: AtomicBool::new(false) }
     }
 
     pub async fn models(&self) -> Result<Vec<String>, String> { models(&self.http, &self.base, self.key.as_deref()).await }
+
+    /// Stop every turn and refuse further tool calls (the hub dropped this client).
+    pub fn close(&self) {
+        self.closed.store(true, Ordering::Relaxed);
+        for f in self.stop.lock().unwrap_or_else(|p| p.into_inner()).values() { f.store(true, Ordering::Relaxed); }
+    }
 
     pub fn cancel(&self, context: &str) -> bool {
         self.stop.lock().unwrap_or_else(|p| p.into_inner()).get(context).map(|f| f.store(true, Ordering::Relaxed)).is_some()
@@ -93,7 +102,7 @@ impl OpenAi {
     }
 
     async fn mcp_call(&self, context: &str, method: &str, params: Value) -> Result<Value, String> {
-        let (port, tokens, agent) = self.mcp.as_ref().ok_or("Disco 工具不可用")?;
+        let (port, tokens, agent) = self.mcp.as_ref().filter(|_| !self.closed.load(Ordering::Relaxed)).ok_or("Disco 工具不可用")?;
         // A friend's conversation gets no tools; any other gets a token bound to it.
         if context.starts_with("peer:") { return Err("Disco 工具不可用".into()); }
         let token = tokens.mint(agent, context);

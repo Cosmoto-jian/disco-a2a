@@ -55,6 +55,17 @@ enum Runtime {
     Openai(Arc<crate::openai::OpenAi>),
 }
 
+impl Runtime {
+    /// Stop it for good: kill the agent process, or close the OpenAI client.
+    fn shut(&self) {
+        match self {
+            Runtime::Acp(a) => a.kill(),
+            Runtime::Openai(o) => o.close(),
+            Runtime::A2a(_) => {}
+        }
+    }
+}
+
 type Cell = Arc<tokio::sync::OnceCell<Runtime>>;
 
 fn lock<T>(m: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -444,19 +455,18 @@ impl Hub {
     }
 
     pub async fn drop_agent(&self, agent: &str) {
-        self.mcp_tokens.revoke(agent);
         let cell = self.live.lock().await.remove(agent);
-        if let Some(Runtime::Acp(a)) = cell.as_ref().and_then(|c| c.get()) {
-            a.kill();
-        }
+        if let Some(rt) = cell.as_ref().and_then(|c| c.get()) { rt.shut(); }
+        // After the shutdown, so nothing still running mints a token that would outlive it.
+        self.mcp_tokens.revoke(agent);
     }
 
     /// Kill switch: stop every running agent process and forget every client.
     pub async fn stop_all(&self) -> usize {
         let all: Vec<_> = self.live.lock().await.drain().collect();
         for (name, c) in &all {
+            if let Some(rt) = c.get() { rt.shut(); }
             self.mcp_tokens.revoke(name);
-            if let Some(Runtime::Acp(a)) = c.get() { a.kill(); }
         }
         all.len()
     }
@@ -651,9 +661,24 @@ fn open_terminal(cmd: &str, args: &[String], env: &[(String, String)], cwd: &std
 
 #[cfg(windows)]
 fn login_script(cmd: &str, args: &[String], env: &[(String, String)], cwd: &std::path::Path) -> String {
-    let q = |s: &str| format!("\"{}\"", s.replace('"', "\"\""));
-    let mut script = format!("@echo off\r\ncd /d {}\r\n", q(&cwd.to_string_lossy()));
-    for (k, v) in env { script.push_str(&format!("set \"{k}={v}\"\r\n")); }
+    cmd_script(cmd, args, env, &cwd.to_string_lossy())
+}
+
+/// A UTF-8 `.cmd` script. `%` is doubled so cmd expands nothing in our text; a leading
+/// `~\` (or `~/`) becomes `%USERPROFILE%\`; every path and argument is quoted.
+#[cfg(any(windows, test))]
+fn cmd_script(cmd: &str, args: &[String], env: &[(String, String)], cwd: &str) -> String {
+    let esc = |s: &str| s.replace('%', "%%");
+    let q = |s: &str| {
+        let s = match s.strip_prefix("~\\").or_else(|| s.strip_prefix("~/")) {
+            Some(rest) => format!("%USERPROFILE%\\{}", esc(rest)),
+            None if s == "~" => "%USERPROFILE%".into(),
+            None => esc(s),
+        };
+        format!("\"{}\"", s.replace('"', "\"\""))
+    };
+    let mut script = format!("@chcp 65001>nul\r\n@echo off\r\ncd /d {}\r\n", q(cwd));
+    for (k, v) in env { script.push_str(&format!("set \"{}={}\"\r\n", esc(k), esc(v))); }
     let line: Vec<String> = std::iter::once(cmd).chain(args.iter().map(String::as_str)).map(q).collect();
     script.push_str(&format!("{}\r\necho.\r\necho 完成后可以关闭这个窗口，回到 Disco。\r\npause\r\n", line.join(" ")));
     script
@@ -757,5 +782,20 @@ mod env_tests {
     fn login_script_quotes() {
         let s = super::login_script("/x/agent", &["--cli".into(), "it's".into()], &[("PATH".into(), "/a b".into())], std::path::Path::new("/tmp"));
         assert!(s.contains("export PATH='/a b'") && s.contains("'/x/agent' '--cli' 'it'\\''s'"), "{s}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn cmd_script_escapes() {
+        let env = vec![("KEY".to_string(), "a%PATH%b".to_string())];
+        let s = super::cmd_script("~\\bin\\claude.cmd", &["/login".into(), "50%".into()], &env, "~\\项目 x");
+        let lines: Vec<&str> = s.split("\r\n").collect();
+        assert_eq!(lines[0], "@chcp 65001>nul");
+        assert_eq!(lines[2], "cd /d \"%USERPROFILE%\\项目 x\"");
+        assert_eq!(lines[3], "set \"KEY=a%%PATH%%b\"");
+        assert_eq!(lines[4], "\"%USERPROFILE%\\bin\\claude.cmd\" \"/login\" \"50%%\"");
+        assert!(super::cmd_script("C:\\a b\\x.exe", &[], &[], "C:\\w").contains("\"C:\\a b\\x.exe\"\r\n"));
     }
 }

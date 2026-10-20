@@ -49,14 +49,44 @@ pub fn command(text: &str) -> Option<&str> {
 #[derive(Deserialize)]
 struct Assign { agent: String, #[serde(default)] role: String, #[serde(default)] task: String }
 
-/// The lead's plan: the first JSON array in its answer, members only, unique roles.
+/// Every balanced JSON array or object in `text` that parses, in order (prose, ``` fences
+/// and brackets inside strings around it are fine).
+fn json_values(text: &str) -> impl Iterator<Item = serde_json::Value> + '_ {
+    text.char_indices().filter(|(_, c)| matches!(c, '[' | '{')).filter_map(|(i, _)| {
+        let (mut depth, mut in_str, mut esc) = (0usize, false, false);
+        for (j, c) in text[i..].char_indices() {
+            match c {
+                _ if esc => esc = false,
+                '\\' if in_str => esc = true,
+                '"' => in_str = !in_str,
+                '[' | '{' if !in_str => depth += 1,
+                ']' | '}' if !in_str => {
+                    depth -= 1;
+                    if depth == 0 { return serde_json::from_str(&text[i..=i + j]).ok(); }
+                }
+                _ => {}
+            }
+        }
+        None
+    })
+}
+
+/// The assignments in the lead's JSON: an array, `{"roles": [...]}`-style, or one object.
+fn assigns(v: serde_json::Value) -> Vec<Assign> {
+    match v {
+        serde_json::Value::Array(a) => a.into_iter().filter_map(|x| serde_json::from_value(x).ok()).collect(),
+        serde_json::Value::Object(o) if !o.contains_key("agent") => o.into_iter().find_map(|(_, x)| x.is_array().then(|| assigns(x))).unwrap_or_default(),
+        o => serde_json::from_value(o).into_iter().collect(),
+    }
+}
+
+/// The lead's plan: the first JSON in its answer that assigns anyone, members only (once each), unique roles.
 fn parse_plan(answer: &str, members: &[String], task: &str) -> Vec<(String, String, String)> {
-    let parsed: Vec<Assign> = answer.find('[').zip(answer.rfind(']'))
-        .and_then(|(a, b)| (a < b).then(|| &answer[a..=b]))
-        .and_then(|j| serde_json::from_str(j).ok()).unwrap_or_default();
+    let parsed = json_values(answer).map(assigns).find(|a| !a.is_empty()).unwrap_or_default();
     let mut out: Vec<(String, String, String)> = Vec::new();
     for a in parsed {
         let Some(m) = members.iter().find(|m| m.eq_ignore_ascii_case(a.agent.trim().trim_start_matches('@'))) else { continue };
+        if out.iter().any(|(o, _, _)| o == m) { continue; }
         let mut role = crate::memory::slug(if a.role.trim().is_empty() { m } else { &a.role });
         while out.iter().any(|(_, r, _)| *r == role) { role.push('2'); }
         out.push((m.clone(), role, if a.task.trim().is_empty() { task.to_owned() } else { a.task.trim().to_owned() }));
@@ -69,8 +99,8 @@ fn parse_plan(answer: &str, members: &[String], task: &str) -> Vec<(String, Stri
 }
 
 impl Core {
-    fn team_dir(&self, thread: &str) -> PathBuf {
-        mcp::doc_path(self, thread).with_file_name("team")
+    fn team_dir(&self, thread: &str) -> Result<PathBuf, String> {
+        Ok(mcp::space_dir(self, thread)?.join("team"))
     }
 
     fn team_emit(&self, thread: &str) {
@@ -103,7 +133,7 @@ impl Core {
     pub(crate) async fn team(&self, g: &GroupRow, task: &str) {
         let thread = format!("group:{}", g.id);
         let Some(lead) = g.lead_agent.clone().filter(|l| g.members.contains(l)).or_else(|| g.members.first().cloned()) else { return };
-        let dir = self.team_dir(&thread);
+        let Ok(dir) = self.team_dir(&thread) else { return };
         {
             let mut teams = lock(&self.teams.0);
             if teams.get(&thread).is_some_and(|s| matches!(s.stage, "plan" | "work" | "summary")) {
@@ -207,7 +237,7 @@ impl Core {
 
     /// The blackboard files of a group's last team run: `(name, content)`.
     pub(crate) fn team_files(&self, thread: &str) -> Vec<(String, String)> {
-        let dir = self.team_dir(thread);
+        let Ok(dir) = self.team_dir(thread) else { return Vec::new() };
         let mut out = Vec::new();
         for name in ["summary.md", "context.md"] {
             if let Ok(t) = std::fs::read_to_string(dir.join(name)) { out.push((name.to_owned(), t)); }
@@ -229,6 +259,12 @@ mod tests {
         let p = parse_plan("好的：\n[{\"agent\":\"@Claude\",\"role\":\"research\",\"task\":\"查资料\"},{\"agent\":\"codex\",\"role\":\"research\",\"task\":\"写代码\"},{\"agent\":\"nobody\",\"role\":\"x\"}]", &m, "T");
         assert_eq!(p, vec![("claude".into(), "research".into(), "查资料".into()), ("codex".into(), "research2".into(), "写代码".into())]);
         assert_eq!(parse_plan("没有 JSON", &m, "T").len(), 2);
+        // Prose with brackets, a ```json fence, brackets inside strings, a duplicate agent.
+        let fenced = "计划如下 [1]：\n```json\n[{\"agent\":\"claude\",\"role\":\"r]1\",\"task\":\"看 \\\"[x]\\\" 和 {y}\"},{\"agent\":\"claude\",\"role\":\"r2\"},{\"agent\":\"codex\"}]\n```\n有问题再说 [1]";
+        assert_eq!(parse_plan(fenced, &m, "T"), vec![("claude".into(), "r-1".into(), "看 \"[x]\" 和 {y}".into()), ("codex".into(), "codex".into(), "T".into())]);
+        let obj = "{\"roles\":[{\"agent\":\"codex\",\"role\":\"dev\",\"task\":\"写\"}]}";
+        assert_eq!(parse_plan(obj, &m, "T"), vec![("codex".into(), "dev".into(), "写".into())]);
+        assert_eq!(parse_plan("{\"agent\":\"claude\",\"task\":\"一\"}", &m, "T"), vec![("claude".into(), "claude".into(), "一".into())]);
         assert_eq!(command("/team  调研 A2A "), Some("调研 A2A"));
         assert_eq!(command("/team"), None);
     }

@@ -338,9 +338,9 @@ impl Core {
         let (thread, agent) = (thread.to_owned(), agent.to_owned());
         tauri::async_runtime::spawn(async move {
             let Some(logins) = core.hub.wants_login(&agent).await else { return };
-            if core.inbox.list().iter().any(|i| i.agent == agent && i.title.starts_with(LOGIN_TITLE)) { return; }
             let label = |l: &disco_acp::Login| if l.terminal.is_some() { format!("在终端登录：{}", l.name) } else { l.name.clone() };
-            let (_, rx) = core.inbox_question(&thread, &agent, &format!("{LOGIN_TITLE}，选一种方式"), logins.iter().map(label).collect(), false);
+            // One card per agent: a failure while one is still open adds nothing.
+            let Some(rx) = core.inbox_question_once(&thread, &agent, &format!("{LOGIN_TITLE}，选一种方式"), logins.iter().map(label).collect()) else { return };
             let Ok(pick) = rx.await else { return };
             let Some(l) = logins.iter().find(|l| label(l) == pick) else { return };
             let line = core.hub.login(&agent, &l.id).await.unwrap_or_else(|e| format!("{agent} 登录失败：{e}"));
@@ -671,6 +671,24 @@ impl Core {
         (p, history.last().map(|m| m.id))
     }
 
+    /// A renamed agent's DM keeps its memory switch, to-dos and space folder (doc, files).
+    fn move_dm_state(&self, old: &str, new: &str) {
+        let (a, b) = (format!("dm:{old}"), format!("dm:{new}"));
+        let off_key = |t: &str| format!("{}{t}", memory::MEM_OFF);
+        let off = self.db().setting(&off_key(&a)).filter(|v| !v.is_empty());
+        if let Some(v) = off {
+            let _ = self.db().set_setting(&off_key(&a), "");
+            let _ = self.db().set_setting(&off_key(&b), &v);
+        }
+        let _ = self.db().rename_setting_prefix(&mcp::todo_prefix(&a), &mcp::todo_prefix(&b));
+        if let (Ok(from), Ok(to)) = (mcp::space_dir(self, &a), mcp::space_dir(self, &b)) && from.exists() && !to.exists() {
+            let _ = std::fs::rename(from, to);
+        }
+    }
+
+    /// Tell the UI the agent list changed (added, removed, renamed, restarted).
+    pub(crate) fn agents_changed(&self) { let _ = self.app.emit("agents", ()); }
+
     /// The agent's sessions are gone (stopped or crashed): forget what they had seen.
     fn forget_sessions(&self, agent: Option<&str>) {
         let keep = |k: &String| agent.is_some_and(|a| !k.starts_with(&format!("{a}|")));
@@ -696,23 +714,33 @@ fn remember_cmd(text: &str) -> Option<&str> {
 /// `@coder` does not match `@coder-2`), in order of first mention, excluding `me`.
 /// `@all` / `@所有人` addresses every member at once.
 fn mentions(text: &str, members: &[String], me: Option<&str>) -> Vec<String> {
-    let lower = text.to_lowercase();
     let others = members.iter().filter(|m| Some(m.as_str()) != me);
+    // First whole-word `@name`, as a byte offset into `text`.
+    let at = |name: &str| text.match_indices('@').map(|(i, _)| i).find(|&i| word_at(text, i + 1, name).is_some());
     // `@all` as a word (so a member called `alloy` is not everyone).
-    let all = lower.match_indices("@all").any(|(i, _)| !lower[i + 4..].chars().next().is_some_and(|c| continues("all", c))) && !members.iter().any(|m| m.eq_ignore_ascii_case("all"));
+    let all = at("all").is_some() && !members.iter().any(|m| m.eq_ignore_ascii_case("all"));
     if all || text.contains("@所有人") {
         return others.cloned().collect();
     }
-    let mut hits: Vec<(usize, &String)> = others
-        .filter_map(|m| {
-            let needle = format!("@{}", m.to_lowercase());
-            lower.match_indices(&needle).map(|(i, _)| i).find(|&i| {
-                !lower[i + needle.len()..].chars().next().is_some_and(|c| continues(m, c))
-            }).map(|i| (i, m))
-        })
-        .collect();
+    let mut hits: Vec<(usize, &String)> = others.filter_map(|m| at(m).map(|i| (i, m))).collect();
     hits.sort_unstable_by_key(|(i, _)| *i);
     hits.into_iter().map(|(_, m)| m.clone()).collect()
+}
+
+/// End (byte offset into `text`) of `name` as a whole word starting at `start`, compared
+/// case-insensitively char by char. Offsets always come from `text` itself, so letters whose
+/// lower case has another byte length (Kelvin sign `K`) can never cut a char.
+fn word_at(text: &str, start: usize, name: &str) -> Option<usize> {
+    let rest = text.get(start..)?;
+    let mut want = name.chars().flat_map(char::to_lowercase).peekable();
+    want.peek()?;
+    let mut end = rest.len();
+    for (i, c) in rest.char_indices() {
+        if want.peek().is_none() { end = i; break; }
+        if !c.to_lowercase().all(|l| want.next() == Some(l)) { return None; }
+    }
+    if want.peek().is_some() || rest[end..].chars().next().is_some_and(|c| continues(name, c)) { return None; }
+    Some(start + end)
 }
 
 /// Whether `c` right after `@name` makes it a longer name. Only ASCII continues an ASCII
@@ -756,11 +784,8 @@ fn group_help() -> &'static str {
 
 /// The command line after `@agent` when the text is `@agent /command …`.
 fn slash_for(text: &str, agent: &str) -> Option<String> {
-    let lower = text.to_lowercase();
-    let needle = format!("@{}", agent.to_lowercase());
-    let i = lower.find(&needle)? + needle.len();
-    // Lower-casing can change byte lengths outside ASCII: then no match rather than a bad slice.
-    let rest = if lower.len() == text.len() { text.get(i..)? } else { return None }.trim_start();
+    let i = text.match_indices('@').find_map(|(i, _)| word_at(text, i + 1, agent))?;
+    let rest = text[i..].trim_start();
     rest.starts_with('/').then(|| rest.lines().next().unwrap_or(rest).trim().to_owned())
 }
 
@@ -776,22 +801,16 @@ fn lead_mention(answer: &str, to: &str) -> String {
 
 /// `answer` without its opening `@to` (when it opens with it).
 fn after_address<'a>(answer: &'a str, to: &str) -> &'a str {
-    let Some(body) = answer.strip_prefix('@') else { return answer };
-    match (body.get(..to.len()), body.get(to.len()..)) {
-        (Some(name), Some(rest)) if name.to_lowercase() == to.to_lowercase() && !rest.chars().next().is_some_and(|c| continues(to, c)) => rest,
-        _ => answer,
-    }
+    if !answer.starts_with('@') { return answer; }
+    word_at(answer, 1, to).map_or(answer, |e| &answer[e..])
 }
 
 /// Replace whole-word `@name` (case-insensitive) with `with`.
 fn replace_mention(text: &str, name: &str, with: &str) -> String {
-    if name.is_empty() { return text.to_owned(); }
     let (mut out, mut last) = (String::new(), 0);
     for (i, _) in text.match_indices('@') {
-        let end = i + 1 + name.len();
-        // Compared on the original text, so lower-casing can never shift an offset.
-        let Some(word) = text.get(i + 1..end) else { continue };
-        if word.to_lowercase() != name.to_lowercase() || text[end..].chars().next().is_some_and(|c| continues(name, c)) { continue; }
+        if i < last { continue; }
+        let Some(end) = word_at(text, i + 1, name) else { continue };
         out.push_str(&text[last..i]);
         out.push_str(with);
         last = end;
@@ -1022,6 +1041,7 @@ pub(crate) struct NewAgent {
 #[tauri::command]
 async fn add_agent(core: St<'_>, spec: NewAgent) -> CmdResult<Vec<String>> {
     let names = add_agent_rows(&core, spec).await?;
+    core.agents_changed();
     core.inner().warm(Some(names.clone()));
     if core.discord_rest().is_some() {
         let (c, n) = (core.inner().clone(), names.clone());
@@ -1132,6 +1152,7 @@ async fn remove_agent(core: St<'_>, name: String, purge: Option<bool>) -> CmdRes
     core.shares_follow(&name, None);
     let _ = core.db().set_setting(&format!("{SET_AVATAR}{name}"), "");
     let _ = core.db().audit("user", Some(&name), "remove_agent", "ok");
+    core.agents_changed();
     if let Some(ch) = core.agent_channel(&name) {
         let _ = core.db().set_setting(&format!("{SET_AGENT_CH}{name}"), "");
         secret_del(&format!("webhook/{ch}"));
@@ -1148,6 +1169,7 @@ async fn restart_agent(core: St<'_>, name: String) -> CmdResult<()> {
     core.hub.drop_agent(&name).await;
     core.forget_sessions(Some(&name));
     let _ = core.db().audit("user", Some(&name), "restart_agent", "ok");
+    core.agents_changed();
     core.inner().warm(Some(vec![name]));
     Ok(())
 }
@@ -1181,6 +1203,7 @@ async fn rename_agent(core: St<'_>, name: String, new_name: String) -> CmdResult
     }
     core.db().rename_agent(&name, &new).map_err(err)?;
     core.memory_rename(&name, &new);
+    core.move_dm_state(&name, &new);
     let avatar = core.db().setting(&format!("{SET_AVATAR}{name}")).filter(|v| !v.is_empty());
     if let Some(av) = avatar {
         core.db().set_setting(&format!("{SET_AVATAR}{name}"), "").map_err(err)?;
@@ -1194,6 +1217,7 @@ async fn rename_agent(core: St<'_>, name: String, new_name: String) -> CmdResult
         }
     }
     let _ = core.db().audit("user", Some(&name), "rename_agent", &new_name);
+    core.agents_changed();
     core.inner().warm(Some(vec![new_name.trim().to_owned()]));
     Ok(())
 }
@@ -1364,7 +1388,7 @@ struct Space { todos: Vec<mcp::Todo>, doc: String, doc_path: String }
 /// A group's or DM's shared to-dos and doc (`thread` is `group:<id>` or `dm:<agent>`).
 #[tauri::command]
 fn space(core: St<'_>, thread: String) -> CmdResult<Space> {
-    let path = mcp::doc_path(&core, &thread);
+    let path = mcp::doc_path(&core, &thread)?;
     Ok(Space { todos: mcp::todos(&core, &thread), doc: std::fs::read_to_string(&path).unwrap_or_default(), doc_path: path.display().to_string() })
 }
 
@@ -1387,7 +1411,7 @@ fn todo_remove(core: St<'_>, thread: String, id: String) -> CmdResult<()> {
 
 #[tauri::command]
 fn doc_save(core: St<'_>, thread: String, content: String) -> CmdResult<()> {
-    mcp::write_doc(&mcp::doc_path(&core, &thread), &content)?;
+    mcp::write_doc(&mcp::doc_path(&core, &thread)?, &content)?;
     use mcp::EmitSpace;
     let _ = core.app.emit_space(&thread);
     Ok(())
@@ -1396,7 +1420,7 @@ fn doc_save(core: St<'_>, thread: String, content: String) -> CmdResult<()> {
 /// Show the doc in Finder (creating an empty one first), so it can be opened in any editor.
 #[tauri::command]
 fn reveal_doc(core: St<'_>, thread: String) -> CmdResult<()> {
-    let path = mcp::doc_path(&core, &thread);
+    let path = mcp::doc_path(&core, &thread)?;
     if !path.exists() { mcp::write_doc(&path, "")?; }
     reveal(&path)
 }
@@ -1752,5 +1776,24 @@ mod tests {
         // Other Discos' agents are tagged, never `me` and never a bare member name.
         let foreign = format!("me{}", super::FOREIGN_TAG);
         assert!(!super::is_human(&foreign) && super::display(&format!("coder{}", super::FOREIGN_TAG)) == "coder");
+    }
+
+    #[test]
+    fn kelvin_sign_mentions() {
+        // `\u{212A}` (Kelvin sign) is 3 bytes but lower-cases to the 1-byte `k`.
+        let k = "\u{212A}elvin";
+        let m = vec!["kelvin".to_string(), "amy".to_string()];
+        assert_eq!(mentions(&format!("@{k} 看下 @amy"), &m, None), ["kelvin", "amy"]);
+        assert_eq!(mentions(&format!("{k}{k} @amy @{k}x"), &m, None), ["amy"]);
+        assert_eq!(super::replace_mention(&format!("@{k} hi @kelvin"), "kelvin", "<@1>"), "<@1> hi <@1>");
+        // A non-ASCII name (it holds `\u{212A}`) is continued by any letter, as other non-ASCII names are.
+        assert_eq!(super::replace_mention("@kelvin @KELVIN 好 @kelvin好", k, "<@1>"), "<@1> <@1> 好 @kelvin好");
+        assert_eq!(super::replace_mention(&format!("@{k}"), "kel", "X"), format!("@{k}"));
+        assert_eq!(super::after_address(&format!("@{k} 好"), "kelvin"), " 好");
+        assert_eq!(super::after_address(&format!("@{k}"), "kelvinx"), format!("@{k}"));
+        assert_eq!(super::slash_for(&format!("{k} @{k} /review x"), "kelvin").as_deref(), Some("/review x"));
+        assert_eq!(super::slash_for("@\u{212A}", "k"), None);
+        assert_eq!(super::replace_mention("@a@a", "a", "b"), "bb");
+        assert_eq!(super::replace_mention("@a", "", "b"), "@a");
     }
 }

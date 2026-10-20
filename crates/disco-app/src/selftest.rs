@@ -304,6 +304,37 @@ pub fn spawn(app: AppHandle, mock: String) {
             a?; b?;
             Ok(String::new()) });
         // end v1.5.13 runtime
+        // v1.5.14
+        let _ = check!("改名带走记忆开关、待办、文档和记忆", {
+            within(20, crate::add_agent(st(), spec("m5"))).await??;
+            crate::set_memory(st(), "dm:m5".into(), false)?;
+            crate::doc_save(st(), "dm:m5".into(), "# 私聊文档\n".into())?;
+            core.remember("m5", "改名前的记忆")?;
+            let tid = crate::todo_new(st(), "dm:m5".into(), "改名前的待办".into())?;
+            within(20, crate::rename_agent(st(), "m5".into(), "m6".into())).await??;
+            let off = |t: &str| core.db().setting(&format!("{}{t}", crate::memory::MEM_OFF));
+            if off("dm:m6").as_deref() != Some("1") || off("dm:m5").is_some() { return Err(format!("记忆开关没跟过去：{:?} {:?}", off("dm:m6"), off("dm:m5"))); }
+            let sp = crate::space(st(), "dm:m6".into())?;
+            if !sp.doc.contains("私聊文档") { return Err(format!("文档没跟过去：{}", sp.doc)); }
+            if !sp.todos.iter().any(|t| t.id == tid) { return Err("待办没跟过去".into()); }
+            if !core.memory_list().iter().any(|m| m.scope == "m6" && m.text == "改名前的记忆") { return Err("记忆没跟过去".into()); }
+            Ok(String::new()) });
+        let _ = within(10, crate::remove_agent(st(), "m6".into(), Some(true))).await;
+        let _ = check!("登录卡片不重复", {
+            within(20, crate::add_agent(st(), raw_spec("r3", "auth"))).await??;
+            let cards = || core.inbox.list().into_iter().filter(|i| i.agent == "r3").collect::<Vec<_>>();
+            let n = count(&core, "dm:r3", "system"); crate::send(st(), "dm:r3".into(), "hi".into())?;
+            wait_msg(&core, "dm:r3", "system", n, 20).await?;
+            within(10, async { while cards().is_empty() { tokio::time::sleep(Duration::from_millis(100)).await; } }).await?;
+            for _ in 0..3 { core.offer_login("dm:r3", "r3"); }
+            let n = count(&core, "dm:r3", "system"); crate::send(st(), "dm:r3".into(), "再试".into())?;
+            wait_msg(&core, "dm:r3", "system", n, 20).await?;
+            tokio::time::sleep(Duration::from_millis(1500)).await;
+            let open = cards();
+            for c in &open { core.inbox_withdraw(&c.id, "（selftest）"); }
+            if open.len() == 1 { Ok(String::new()) } else { Err(format!("{} 张卡片", open.len())) } });
+        let _ = within(10, crate::remove_agent(st(), "r3".into(), Some(true))).await;
+        // end v1.5.14
         println!("SELFTEST {}", if fails == 0 { "OK".to_string() } else { format!("{fails} FAILED") });
         std::process::exit(if fails == 0 { 0 } else { 1 });
     });

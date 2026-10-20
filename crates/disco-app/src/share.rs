@@ -537,6 +537,7 @@ pub async fn accept_invite(core: St<'_>, code: String, name: Option<String>) -> 
     });
     let spec = crate::NewAgent::remote(name, inv.url, inv.token);
     let names = crate::add_agent_rows(&core, spec).await?;
+    core.agents_changed();
     core.inner().warm(Some(names.clone()));
     Ok(names.into_iter().next().unwrap_or_default())
 }

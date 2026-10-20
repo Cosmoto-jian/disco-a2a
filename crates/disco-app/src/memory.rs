@@ -27,7 +27,9 @@ pub struct Note { pub key: String, pub scope: String, pub topic: String, pub tex
 pub fn slug(s: &str) -> String {
     let out: String = s.trim().chars().map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '-' })
         .collect::<String>().trim_matches('-').chars().take(40).collect();
-    if out.is_empty() { DEFAULT_TOPIC.into() } else { out }
+    // Trimmed again after the cut, so slug(slug(x)) == slug(x).
+    let out = out.trim_end_matches('-');
+    if out.is_empty() { DEFAULT_TOPIC.into() } else { out.to_owned() }
 }
 
 /// Serialises read-modify-write of note and doc files across the process. Held
@@ -179,7 +181,9 @@ impl Core {
 }
 
 /// The chat a session context belongs to (`group:<id>` or `dm:<agent>`), if any.
+/// `ask:<asker>:<thread>` (one agent consulting another) belongs to the chat it was asked from.
 pub fn thread_of(context: &str) -> Option<String> {
+    if let Some(rest) = context.strip_prefix("ask:") { return rest.split_once(':').and_then(|(_, t)| thread_of(t)); }
     match group_of(context) {
         Some(g) => Some(format!("group:{}", &g["group-".len()..])),
         None => context.starts_with("dm:").then(|| context.to_owned()),
@@ -199,11 +203,17 @@ mod tests {
     fn slugs_and_groups() {
         assert_eq!(slug("代码 风格/偏好"), "代码-风格-偏好");
         assert_eq!(slug("  "), DEFAULT_TOPIC);
+        for x in ["代码 风格/偏好", "  ", "-a-", &format!("{}/x", "a".repeat(39)), "K..", "../etc", "a b c d e f g h i j k l m n o p q r s t u v w x y z"] {
+            assert_eq!(slug(&slug(x)), slug(x), "{x:?}");
+        }
+        assert_eq!(slug(&format!("{}/x", "a".repeat(39))), "a".repeat(39));
         assert_eq!(group_of("group:123").as_deref(), Some("group-123"));
         assert_eq!(group_of("team:group:local-x:claude").as_deref(), Some("group-local-x"));
         assert_eq!(group_of("dm:claude"), None);
         assert_eq!(thread_of("team:group:local-x:claude").as_deref(), Some("group:local-x"));
         assert_eq!(thread_of("dm:claude").as_deref(), Some("dm:claude"));
         assert_eq!(thread_of("ask:coder"), None);
+        assert_eq!(thread_of("ask:coder:dm:coder").as_deref(), Some("dm:coder"));
+        assert_eq!(thread_of("ask:coder:group:42").as_deref(), Some("group:42"));
     }
 }

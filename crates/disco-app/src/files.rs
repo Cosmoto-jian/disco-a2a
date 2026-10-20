@@ -73,7 +73,7 @@ impl Core {
         if !meta.is_file() { return Err("只能发送文件，不能发送文件夹".into()); }
         if meta.len() > MAX_SEND { return Err(format!("文件超过 {}", human_size(MAX_SEND))); }
         let name = safe_name(&p.to_string_lossy());
-        let dir = crate::mcp::doc_path(self, thread).with_file_name("files");
+        let dir = crate::mcp::space_dir(self, thread)?.join("files");
         // Copying and hashing up to 100 MB is blocking work: keep it off the async threads.
         let (dst, size, hash) = {
             let name = name.clone();
