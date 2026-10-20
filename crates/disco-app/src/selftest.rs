@@ -335,6 +335,23 @@ pub fn spawn(app: AppHandle, mock: String) {
             if open.len() == 1 { Ok(String::new()) } else { Err(format!("{} 张卡片", open.len())) } });
         let _ = within(10, crate::remove_agent(st(), "r3".into(), Some(true))).await;
         // end v1.5.14
+        // v1.6.0
+        let _ = check!("自定义头像：设置、改名保留、清除", {
+            within(20, crate::add_agent(st(), spec("p1"))).await??;
+            let png = "data:image/png;base64,iVBORw0KGgo=";
+            let pic = |name: &'static str| async move {
+                within(5, crate::overview(st())).await?.map(|o| o.agents.into_iter().find(|a| a.name == name).and_then(|a| a.avatar))
+            };
+            crate::set_avatar(st(), "p1".into(), Some(png.into()))?;
+            if pic("p1").await?.as_deref() != Some(png) { return Err("设置后 overview 里没有头像".into()); }
+            if crate::set_avatar(st(), "nobody".into(), Some(png.into())).is_ok() { return Err("不存在的 agent 也能设置".into()); }
+            within(20, crate::rename_agent(st(), "p1".into(), "p2".into())).await??;
+            if pic("p2").await?.as_deref() != Some(png) { return Err("改名后头像没跟过去".into()); }
+            crate::set_avatar(st(), "p2".into(), None)?;
+            if pic("p2").await?.is_some() { return Err("清除后还有头像".into()); }
+            Ok(String::new()) });
+        let _ = within(10, crate::remove_agent(st(), "p2".into(), Some(true))).await;
+        // end v1.6.0
         println!("SELFTEST {}", if fails == 0 { "OK".to_string() } else { format!("{fails} FAILED") });
         std::process::exit(if fails == 0 { 0 } else { 1 });
     });

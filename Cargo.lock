@@ -1044,6 +1044,7 @@ dependencies = [
  "a2a-lf",
  "a2a-server-lf",
  "axum",
+ "base64 0.22.1",
  "chrono",
  "disco-a2a",
  "disco-acp",

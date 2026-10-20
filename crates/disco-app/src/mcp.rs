@@ -492,7 +492,7 @@ pub fn delete_todo(core: &Core, thread: &str, id: &str) -> Result<(), String> {
 
 /// The folder name of a thread's space: `group:1` → `group-1`. Anything that could step
 /// outside `spaces/` (`..`, a path separator, NUL) is refused.
-fn space_name(thread: &str) -> Result<String, String> {
+pub(crate) fn space_name(thread: &str) -> Result<String, String> {
     if thread.is_empty() || thread.contains("..") || thread.contains(['/', '\\', '\0']) {
         return Err(format!("无效的会话：{thread:?}"));
     }
@@ -522,7 +522,7 @@ pub fn write_doc(path: &std::path::Path, doc: &str) -> Result<(), String> {
 
 /// A scratch name beside `path`, unique per process and call, so concurrent
 /// writers never share one (hidden, and not `.md`, so no listing picks it up).
-fn tmp_path(path: &std::path::Path) -> PathBuf {
+pub(crate) fn tmp_path(path: &std::path::Path) -> PathBuf {
     static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let name = path.file_name().map(|f| f.to_string_lossy().into_owned()).unwrap_or_default();

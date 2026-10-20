@@ -32,6 +32,7 @@ axum.workspace = true
 chrono.workspace = true
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls-no-provider"] }
 sha2 = "0.10"
+base64 = "0.22"
 hex = "0.4"
 
 [target.'cfg(target_os = "macos")'.dependencies]
