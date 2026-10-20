@@ -97,7 +97,14 @@ type Slot = Option<tokio::sync::OwnedSemaphorePermit>;
 /// A turn in flight; its slot (if it still holds one) is freed when it ends.
 struct Turn<'a>(&'a Hub, u64);
 impl Drop for Turn<'_> {
-    fn drop(&mut self) { lock(&self.0.turns).remove(&self.1); }
+    fn drop(&mut self) {
+        let ended = lock(&self.0.turns).remove(&self.1);
+        // The turn's plan step ends with it (unless a newer turn elsewhere replaced it).
+        if let Some((agent, context, ..)) = ended {
+            let mut doing = lock(&self.0.doing);
+            if doing.get(&agent).is_some_and(|(c, _)| *c == context) { doing.remove(&agent); }
+        }
+    }
 }
 
 pub struct Hub {
@@ -105,8 +112,10 @@ pub struct Hub {
     live: Mutex<HashMap<String, Cell>>,
     /// Caps simultaneous agent turns across the whole app.
     pub(crate) slots: Arc<tokio::sync::Semaphore>,
-    /// Turns in flight: id -> (agent, context, its slot).
-    turns: std::sync::Mutex<HashMap<u64, (String, String, Slot)>>,
+    /// Turns in flight: id -> (agent, context, its slot, started at in ms since the epoch).
+    turns: std::sync::Mutex<HashMap<u64, (String, String, Slot, i64)>>,
+    /// Agent -> (context, step): the plan step in progress of its latest planning turn.
+    doing: std::sync::Mutex<HashMap<String, (String, String)>>,
     next_turn: AtomicU64,
     /// The user's login-shell PATH: GUI apps start with a bare one, so npx and
     /// Homebrew tools would otherwise be invisible.
@@ -133,7 +142,7 @@ pub type CredLookup = dyn Fn(&str) -> Option<String> + Send + Sync;
 impl Hub {
     pub fn new() -> Self {
         let (user_path, user_env) = login_env();
-        Self { live: Mutex::default(), slots: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT)), turns: Default::default(), next_turn: AtomicU64::new(0),
+        Self { live: Mutex::default(), slots: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT)), turns: Default::default(), doing: Default::default(), next_turn: AtomicU64::new(0),
             user_path, user_env, launches: Default::default(), mcp_port: Default::default(), mcp_tokens: Default::default(), last_context: Default::default() }
     }
 
@@ -194,11 +203,7 @@ impl Hub {
             }
             "acp" => {
                 let spec: LocalSpec = row.card_json.as_deref().and_then(|j| serde_json::from_str(j).ok()).ok_or("缺少启动配置")?;
-                let mut cwd = match spec.cwd.strip_prefix('~') {
-                    _ if spec.cwd.is_empty() => dirs_home(),
-                    Some(rest) => dirs_home().join(rest.trim_start_matches('/')),
-                    None => PathBuf::from(&spec.cwd),
-                };
+                let mut cwd = spec_dir(&spec.cwd);
                 if !cwd.is_dir() {
                     return Err(format!("工作目录不存在：{}", cwd.display()));
                 }
@@ -300,14 +305,33 @@ impl Hub {
 
     /// A friend is talking to `agent` right now (its agent-wide token must not act then).
     pub fn peer_busy(&self, agent: &str) -> bool {
-        lock(&self.turns).values().any(|(a, c, _)| a == agent && c.starts_with("peer:"))
+        lock(&self.turns).values().any(|(a, c, ..)| a == agent && c.starts_with("peer:"))
     }
 
     /// The turn of `agent` in `context` is waiting on a person: give its slot back so
     /// other turns aren't held up for as long as the human takes. It finishes unslotted.
     pub fn yield_slot(&self, agent: &str, context: &str) {
-        let freed: Vec<_> = lock(&self.turns).values_mut().filter(|(a, c, _)| a == agent && c == context).filter_map(|(_, _, p)| p.take()).collect();
+        let freed: Vec<_> = lock(&self.turns).values_mut().filter(|(a, c, ..)| a == agent && c == context).filter_map(|(_, _, p, _)| p.take()).collect();
         drop(freed);
+    }
+
+    /// When `agent`'s oldest running turn started (ms since the epoch) and the plan step
+    /// it is on, if its agent reports a plan.
+    pub fn activity(&self, agent: &str) -> (Option<i64>, Option<String>) {
+        let since = lock(&self.turns).values().filter(|t| t.0 == agent).map(|t| t.3).min();
+        let doing = lock(&self.doing).get(agent).map(|(_, s)| s.clone());
+        (since, doing)
+    }
+
+    /// Current git branch of a local agent's working folder.
+    pub fn branch(&self, row: &AgentRow) -> Option<String> {
+        if row.transport != "acp" { return None; }
+        let launched = lock(&self.launches).get(&row.name).map(|l| l.cwd.clone());
+        let dir = launched.or_else(|| {
+            let spec: LocalSpec = serde_json::from_str(row.card_json.as_deref()?).ok()?;
+            Some(spec_dir(&spec.cwd))
+        })?;
+        crate::git::branch(&dir)
     }
 
     /// Run one prompt; every event goes to `on_event`; returns the answer text.
@@ -323,11 +347,16 @@ impl Hub {
         // so it takes none: waiting for one could deadlock a full house.
         let slot = if context.starts_with("ask:") { None } else { Some(self.slots.clone().acquire_owned().await.map_err(|e| e.to_string())?) };
         let id = self.next_turn.fetch_add(1, Ordering::Relaxed);
-        lock(&self.turns).insert(id, (row.name.clone(), context.to_owned(), slot));
+        let started = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0);
+        lock(&self.turns).insert(id, (row.name.clone(), context.to_owned(), slot, started));
         let _turn = Turn(self, id);
         let rt = self.runtime(row, secret).await?;
         let mut answer = String::new();
         let mut finish = |ev: AgentEvent| -> Option<Result<(), String>> {
+            if let AgentEvent::Plan { step } = &ev {
+                let mut doing = lock(&self.doing);
+                match step { Some(s) => { doing.insert(row.name.clone(), (context.to_owned(), s.clone())); } None => { doing.remove(&row.name); } }
+            }
             on_event(&ev);
             match ev {
                 AgentEvent::TextChunk { text } => { answer.push_str(&text); None }
@@ -469,6 +498,15 @@ impl Hub {
             self.mcp_tokens.revoke(name);
         }
         all.len()
+    }
+}
+
+/// An agent's configured working folder: `~` is home, empty means home.
+fn spec_dir(cwd: &str) -> PathBuf {
+    match cwd.strip_prefix('~') {
+        _ if cwd.is_empty() => dirs_home(),
+        Some(rest) => dirs_home().join(rest.trim_start_matches('/')),
+        None => PathBuf::from(cwd),
     }
 }
 

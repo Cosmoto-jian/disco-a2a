@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::schema::v1::{
-    AuthCapabilities, AuthMethod, AuthenticateRequest, CancelNotification, ClientCapabilities, ContentBlock, EnvVariable, InitializeRequest, McpServer, NewSessionResponse, McpServerStdio, NewSessionRequest, PermissionOptionKind, PromptRequest,
+    AuthCapabilities, AuthMethod, AuthenticateRequest, CancelNotification, ClientCapabilities, ContentBlock, EnvVariable, InitializeRequest, McpServer, NewSessionResponse, McpServerStdio, NewSessionRequest, PermissionOptionKind, PlanEntry, PlanEntryStatus, PromptRequest,
     RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
     SelectedPermissionOutcome, SessionConfigKind, SessionConfigOption, SessionConfigOptionCategory,
     SessionConfigSelectOptions, SessionId, SessionNotification, SessionUpdate,
@@ -402,8 +402,15 @@ fn map_update(u: SessionUpdate) -> Option<AgentEvent> {
             title: t.fields.title.clone().unwrap_or_default(),
             status: t.fields.status.map(|s| format!("{s:?}").to_lowercase()).unwrap_or_default(),
         }),
+        SessionUpdate::Plan(p) => Some(AgentEvent::Plan { step: current_step(&p.entries) }),
         _ => None,
     }
+}
+
+/// What the agent is doing now: the first plan entry in progress.
+fn current_step(entries: &[PlanEntry]) -> Option<String> {
+    entries.iter().find(|e| e.status == PlanEntryStatus::InProgress)
+        .map(|e| e.content.trim().to_owned()).filter(|c| !c.is_empty())
 }
 
 /// `session/new`, read raw so fields this protocol version no longer types
@@ -669,3 +676,18 @@ async fn run_connection<W, R>(
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use agent_client_protocol::schema::v1::PlanEntryPriority;
+
+    #[test]
+    fn plan_step_is_the_first_entry_in_progress() {
+        let e = |c: &str, s| PlanEntry::new(c, PlanEntryPriority::Medium, s);
+        let plan = [e("读代码", PlanEntryStatus::Completed), e(" 写测试 ", PlanEntryStatus::InProgress), e("提交", PlanEntryStatus::InProgress)];
+        assert_eq!(current_step(&plan).as_deref(), Some("写测试"));
+        assert_eq!(current_step(&[e("提交", PlanEntryStatus::Pending)]), None);
+        assert_eq!(current_step(&[e("  ", PlanEntryStatus::InProgress)]), None);
+        assert_eq!(current_step(&[]), None);
+    }
+}

@@ -356,6 +356,9 @@ button.li:hover { background:var(--hover); }
 .li > .ib { width:26px; height:26px; margin-right:-4px; }
 .ihero { display:flex; flex-direction:column; align-items:center; gap:2px; padding:8px 0 2px; text-align:center; }
 .ihero .av { margin-bottom:8px; }
+/* git branch after a subtitle: tiny grey icon + name */
+.branch { color:var(--mute); white-space:nowrap; }
+.branch .ic { display:inline-block; width:12px; height:12px; vertical-align:-2px; margin-right:2px; }
 .ihero small { color:var(--mute); max-width:100%; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
 /* toggles (memory switch + .tgl checkboxes) */
 .memrow { cursor:pointer; outline:none; }

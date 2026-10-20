@@ -53,6 +53,8 @@ pub enum AgentEvent {
     Tool { id: String, title: String, status: String },
     /// The agent asks permission; resolved through [`PermissionDecision`].
     PermissionAsked { request_id: String, title: String, options: Vec<PermissionChoice> },
+    /// The agent's plan changed: `step` is the entry in progress, if any.
+    Plan { step: Option<String> },
     /// Task phase changed.
     Phase { phase: TaskPhase },
     /// Final event. `text` is the full concatenated answer when known.

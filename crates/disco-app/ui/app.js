@@ -178,6 +178,7 @@ function load() {
     $("#paused-bar").hidden = !ov.paused;
     drawKill();
     renderList();
+    if (S.thread) { $("#chat-sub")?.replaceChildren(...chatSub(S.thread)); drawMembers(); }
   }));
 }
 // The first overview: events and opens that arrive before it wait for it (in order) instead of reading S.ov == null.
@@ -207,6 +208,9 @@ addEventListener("pointercancel", releaseList, true);
 addEventListener("blur", releaseList); // the window losing focus, not the composer (no capture)
 const KIND = { acp: "本机", openai: "模型 API", a2a: "A2A" };
 const agentSub = (a) => [...new Set([KIND[a.kind] ?? "A2A", a.kind === "acp" ? shortPath(a.detail) : a.detail].filter(Boolean))].join(" · ");
+// The git branch of a local agent's folder, as a tiny grey tag after a subtitle (nothing when there is none).
+const branchTag = (a) => a?.branch ? h("span", { class: "branch", title: `git 分支 ${a.branch}` }, ic("git-branch"), a.branch) : null;
+const withBranch = (sub, a) => a?.branch ? [sub, sub ? " · " : "", branchTag(a)] : sub;
 const SETTINGS_SECS = [["dc", "Discord", "discord-logo:fill"], ["net", "共享与 Tailscale", "share-network"], ["mem", "记忆", "brain"], ["run", "运行", "power"], ["gen", "通用与更新", "gear-six"]];
 const runLabel = () => (S.ov?.paused ? "已全部停止" : busyAgents().size ? `${busyAgents().size} 个 agent 正在回复` : "运行中");
 function drawList() {
@@ -239,7 +243,7 @@ function drawList() {
       avatar(a.name, { live: a.live, busy: busy.has(a.name) }),
       h("div", { class: "meta" },
         h("div", { class: "row" }, h("span", { class: "name" }, a.name), a.kind === "acp" && OFFICIAL.has(a.template) ? h("span", { class: "tag" }, "官方") : null),
-        h("div", { class: "sub" }, busy.has(a.name) ? "正在回复…" : agentSub(a))),
+        h("div", { class: "sub" }, busy.has(a.name) ? "正在回复…" : withBranch(agentSub(a), a))),
       h("div", { class: "acts" },
         act("重启", "arrow-counter-clockwise", () => restartAgent(a.name)),
         a.kind !== "a2a" ? act("共享给朋友", "share-network", () => shareDialog(a.name)) : null,
@@ -260,7 +264,9 @@ function drawList() {
 function threadRow(t, head, fallback) {
   const isGroup = t.startsWith("group:"); const name = threadName(t);
   const typing = S.typing[t]?.size ? [...S.typing[t]].join("、") : "";
-  const live = !isGroup && S.ov.agents.find((a) => `dm:${a.name}` === t)?.live;
+  const me = !isGroup && S.ov.agents.find((a) => `dm:${a.name}` === t), live = me?.live;
+  // Replying with a plan: the step it is on says more than the last message.
+  const doing = me?.busy_since && me.doing ? me.doing : "";
   const waiting = S.inbox.filter((it) => it.thread === t).length;
   // The last word was a system notice (a failed start, an MCP server needing attention): flag it.
   const warn = !typing && head?.author === "system";
@@ -278,7 +284,7 @@ function threadRow(t, head, fallback) {
     h("div", { class: "meta" },
       h("div", { class: "row" }, title, h("span", { class: "time" }, when(head?.ts))),
       h("div", { class: "row" },
-        h("div", { class: `sub${typing ? " typing" : ""}` }, typing ? `${typing} ${isGroup ? "正在回复" : ST_LABEL[S.status[`${t}|${name}`]?.st] ?? "正在输入"}…` : head ? `${isGroup && head.author !== "me" && head.author !== "system" ? head.author.replace(/ \(Discord\)$/, "") + "：" : ""}${head.body}` : (fallback ?? "")),
+        doing ? h("div", { class: "sub", title: doing }, doing) : h("div", { class: `sub${typing ? " typing" : ""}` }, typing ? `${typing} ${isGroup ? "正在回复" : ST_LABEL[S.status[`${t}|${name}`]?.st] ?? "正在输入"}…` : head ? `${isGroup && head.author !== "me" && head.author !== "system" ? head.author.replace(/ \(Discord\)$/, "") + "：" : ""}${head.body}` : (fallback ?? "")),
         unread ? h("i", { class: "unread-n" }, unread > 99 ? "99+" : String(unread)) : null),
     ));
 }
@@ -311,7 +317,7 @@ function chatSub(t) {
       S.teamMode[t] ? " · 团队模式" : ""];
   }
   const a = agentOf(t.slice(3));
-  return a ? [agentSub(a)] : [];
+  return a ? [withBranch(agentSub(a), a)].flat() : [];
 }
 async function openThread(t) {
   if (!S.ov) await ready;
@@ -622,7 +628,7 @@ function drawInfo(t) {
   const a = agentOf(name); if (!a) return;
   const val = (v, cls = "") => h("span", { class: `val${cls}`, title: v }, v);
   body.replaceChildren(
-    h("div", { class: "ihero" }, avatar(name, { size: "lg", live: a.live, status: statusOf(t, name), busy: S.typing[t]?.has(name) }), h("b", {}, name), h("small", {}, agentSub(a))),
+    h("div", { class: "ihero" }, avatar(name, { size: "lg", live: a.live, status: statusOf(t, name), busy: S.typing[t]?.has(name) }), h("b", {}, name), h("small", {}, withBranch(agentSub(a), a))),
     isec(null, irow(null, "类型", null, val(KIND[a.kind] ?? "A2A")),
       a.detail ? irow(null, a.kind === "acp" ? "目录" : "地址", null, val(a.kind === "acp" ? shortPath(a.detail) : a.detail, " mono")) : null,
       irow(null, "状态", null, val(a.live ? "在线" : "未启动"))),

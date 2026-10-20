@@ -12,6 +12,7 @@ mod team;
 pub use mcp::stdio_proxy as mcp_stdio;
 mod share;
 mod files;
+mod git;
 mod tailnet;
 mod templates;
 #[cfg(debug_assertions)]
@@ -194,6 +195,8 @@ pub struct Core {
     server: Mutex<share::Server>,
     /// Agent -> custom picture as a data URL (None: has none); see avatar.rs.
     avatars: Mutex<HashMap<String, Option<String>>>,
+    /// An "agents" emit is already scheduled (see `agents_soon`).
+    agents_due: Arc<AtomicBool>,
     app: AppHandle,
 }
 
@@ -255,9 +258,11 @@ impl Core {
         let app = self.app.clone();
         let (t, a) = (thread.to_owned(), agent.to_owned());
         let asked = Mutex::new(Vec::new());
+        let planned = AtomicBool::new(false);
         let res = self
             .hub
             .ask(&row, &secret_get, context, prompt, |ev| {
+                if matches!(ev, AgentEvent::Plan { .. }) { planned.store(true, Ordering::Relaxed); self.agents_soon(); }
                 if !tap(ev) { return; }
                 if let AgentEvent::PermissionAsked { request_id, title, options } = ev {
                     self.inbox_permission(&t, &a, request_id, title, options);
@@ -272,6 +277,8 @@ impl Core {
             .await;
         let asked = asked.into_inner().unwrap_or_else(|p| p.into_inner());
         self.inbox_expire(&asked).await;
+        // The turn's plan step is gone now; show that.
+        if planned.into_inner() { self.agents_soon(); }
         if first && res.is_ok() { self.primed.lock().unwrap_or_else(|p| p.into_inner()).insert(key); }
         if !hidden { let _ = self.app.emit("typing", TypingEvt { thread: thread.into(), agent: agent.into(), on: false }); }
         if matches!(&res, Err(e) if e.contains("进程已退出")) { self.forget_sessions(Some(agent)); }
@@ -692,6 +699,18 @@ impl Core {
     /// Tell the UI the agent list changed (added, removed, renamed, restarted).
     pub(crate) fn agents_changed(&self) { let _ = self.app.emit("agents", ()); }
 
+    /// "agents" for live status (plan steps): at most one a second, sent a second after
+    /// the first change so the last change of a burst is never lost.
+    fn agents_soon(&self) {
+        if self.agents_due.swap(true, Ordering::Relaxed) { return; }
+        let (app, due) = (self.app.clone(), self.agents_due.clone());
+        tauri::async_runtime::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            due.store(false, Ordering::Relaxed);
+            let _ = app.emit("agents", ());
+        });
+    }
+
     /// The agent's sessions are gone (stopped or crashed): forget what they had seen.
     fn forget_sessions(&self, agent: Option<&str>) {
         let keep = |k: &String| agent.is_some_and(|a| !k.starts_with(&format!("{a}|")));
@@ -874,6 +893,15 @@ struct AgentView {
     look: String,
     /// Custom picture as a data URL (see avatar.rs); shown instead of the look.
     avatar: Option<String>,
+    /// Git branch of a local agent's working folder.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    branch: Option<String>,
+    /// The plan step its current turn is on (agents that report a plan).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    doing: Option<String>,
+    /// When its current turn started, in ms since the epoch.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    busy_since: Option<i64>,
 }
 #[derive(Serialize)]
 struct GroupView { id: String, name: String, guild_id: String, lead: Option<String>, members: Vec<String>, people: Vec<String>, guests: Vec<String> }
@@ -912,7 +940,9 @@ async fn overview(core: St<'_>) -> CmdResult<Overview> {
         let template = if a.transport == "a2a" { "a2a".into() } else { spec.template };
         let look = core.db().setting(&format!("{SET_LOOK}{}", a.name)).unwrap_or_default();
         let avatar = avatar::get(&core, &a.name);
-        agents.push(AgentView { live: core.hub.is_live(&a.name).await, name: a.name, kind: a.transport, template, detail, look, avatar });
+        let branch = core.hub.branch(&a);
+        let (busy_since, doing) = core.hub.activity(&a.name);
+        agents.push(AgentView { live: core.hub.is_live(&a.name).await, name: a.name, kind: a.transport, template, detail, look, avatar, branch, doing, busy_since });
     }
     let peers = core.shares().into_iter().map(|(id, s)| {
         let missing = core.peer_missing(&id);
@@ -1681,6 +1711,7 @@ pub fn run() {
                 teams: team::Teams::default(),
                 server: Mutex::default(),
                 avatars: Mutex::default(),
+                agents_due: Arc::default(),
                 app: app.handle().clone(),
             });
             // Installs from before v0.4 kept only the Keychain entry.

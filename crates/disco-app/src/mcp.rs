@@ -303,8 +303,14 @@ impl Call<'_> {
             o.push_str(&format!("- {}（id {}）成员：{}{}\n", g.name, g.id, g.members.join("、"),
                 g.lead_agent.as_deref().map(|l| format!("，组长 {l}")).unwrap_or_default()));
         }
-        let agents: Vec<String> = self.core.db().list_agents().unwrap_or_default().into_iter().map(|a| a.name).filter(|n| n != self.agent).collect();
-        o.push_str(&format!("\n其他 agent：{}\n", if agents.is_empty() { "（无）".into() } else { agents.join("、") }));
+        let rows: Vec<_> = self.core.db().list_agents().unwrap_or_default().into_iter().filter(|a| a.name != self.agent).collect();
+        o.push_str(if rows.is_empty() { "\n其他 agent：（无）\n" } else { "\n其他 agent：\n" });
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0);
+        for a in &rows {
+            let (since, doing) = self.core.hub.activity(&a.name);
+            let busy = since.map(|t| (now - t).max(0) / 1000);
+            o.push_str(&format!("- {}\n", agent_line(&a.name, busy, self.core.hub.branch(a).as_deref(), doing.as_deref())));
+        }
         if let Ok((thread, _)) = self.space(&json!({})) && let Ok(p) = doc_path(self.core, &thread) {
             o.push_str(&format!("\n这里的群文档文件：{}\n", p.display()));
         }
@@ -454,6 +460,17 @@ pub fn todos(core: &Core, thread: &str) -> Vec<Todo> {
 }
 
 /// Ids are microsecond keys; their last 6 digits are plenty to tell a list apart.
+/// One agent at a glance: `claude · busy 2m · main · 写 README 章节`.
+fn agent_line(name: &str, busy_secs: Option<i64>, branch: Option<&str>, doing: Option<&str>) -> String {
+    let busy = match busy_secs {
+        None => "idle".to_owned(),
+        Some(s) if s < 60 => format!("busy {s}s"),
+        Some(s) if s < 3600 => format!("busy {}m", s / 60),
+        Some(s) => format!("busy {}h{}m", s / 3600, s % 3600 / 60),
+    };
+    [Some(name), Some(busy.as_str()), branch, doing].into_iter().flatten().collect::<Vec<_>>().join(" · ")
+}
+
 fn short_id(key: &str) -> String { key[key.len().saturating_sub(6)..].to_owned() }
 
 pub fn add_todo(core: &Core, thread: &str, text: &str, assignee: Option<&str>, by: &str) -> String {
@@ -540,6 +557,14 @@ impl EmitSpace for tauri::AppHandle {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn agent_lines() {
+        assert_eq!(super::agent_line("claude", Some(130), Some("main"), Some("写 README 章节")), "claude · busy 2m · main · 写 README 章节");
+        assert_eq!(super::agent_line("pi", None, None, None), "pi · idle");
+        assert_eq!(super::agent_line("x", Some(5), None, Some("跑测试")), "x · busy 5s · 跑测试");
+        assert_eq!(super::agent_line("x", Some(3720), Some("dev"), None), "x · busy 1h2m · dev");
+    }
+
     #[test]
     fn space_names_stay_inside() {
         assert_eq!(super::space_name("group:123").as_deref(), Ok("group-123"));

@@ -352,6 +352,27 @@ pub fn spawn(app: AppHandle, mock: String) {
             Ok(String::new()) });
         let _ = within(10, crate::remove_agent(st(), "p2".into(), Some(true))).await;
         // end v1.6.0
+        // v1.6.2
+        let _ = check!("计划步骤：回复中显示 doing，结束后清除", {
+            within(20, crate::add_agent(st(), spec("c1"))).await??;
+            let doing = || async {
+                within(5, crate::overview(st())).await?.map(|o| o.agents.into_iter().find(|a| a.name == "c1").map(|a| (a.doing, a.busy_since)).unwrap_or_default())
+            };
+            let n = count(&core, "dm:c1", "c1");
+            crate::send(st(), "dm:c1".into(), "__plan__".into())?;
+            let seen = within(10, async {
+                loop {
+                    if let Ok((Some(d), Some(_))) = doing().await { return d; }
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+            }).await?;
+            if seen != "写测试" { return Err(format!("doing = {seen}")); }
+            wait_msg(&core, "dm:c1", "c1", n, 30).await?;
+            let after = doing().await?;
+            if after != (None, None) { return Err(format!("结束后还有 {after:?}")); }
+            Ok(seen) });
+        let _ = within(10, crate::remove_agent(st(), "c1".into(), Some(true))).await;
+        // end v1.6.2
         println!("SELFTEST {}", if fails == 0 { "OK".to_string() } else { format!("{fails} FAILED") });
         std::process::exit(if fails == 0 { 0 } else { 1 });
     });

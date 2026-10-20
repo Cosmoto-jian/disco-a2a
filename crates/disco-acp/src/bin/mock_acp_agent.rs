@@ -1,9 +1,10 @@
 //! Deterministic ACP agent for tests and CI: streams two chunks, asks one
 //! permission, reports whether the parent's environment reached it, then ends the turn.
-//! A prompt containing `__hang__` waits until it is cancelled; `__die__` answers, then exits.
+//! A prompt containing `__hang__` waits until it is cancelled; `__die__` answers, then exits;
+//! `__plan__` reports a plan step in progress, waits 1.5 s, then answers.
 use agent_client_protocol::schema::v1::{
     AgentCapabilities, CancelNotification, ContentBlock, ContentChunk, InitializeRequest, InitializeResponse, NewSessionRequest,
-    NewSessionResponse, PermissionOption, PermissionOptionKind, PromptRequest, PromptResponse,
+    NewSessionResponse, PermissionOption, Plan, PlanEntry, PlanEntryPriority, PlanEntryStatus, PermissionOptionKind, PromptRequest, PromptResponse,
     RequestPermissionOutcome, RequestPermissionRequest, SessionId, SessionNotification,
     SessionUpdate, StopReason, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind,
 };
@@ -46,7 +47,7 @@ async fn main() -> agent_client_protocol::Result<()> {
             async move |r: PromptRequest, responder, cx: ConnectionTo<Client>| {
                 let cx2 = cx.clone();
                 let has = |w: &str| r.prompt.iter().any(|b| matches!(b, ContentBlock::Text(t) if t.text.contains(w)));
-                let (hang, die) = (has("__hang__"), has("__die__"));
+                let (hang, die, plan) = (has("__hang__"), has("__die__"), has("__plan__"));
                 cx.spawn(async move {
                     let s = r.session_id.clone();
                     if hang {
@@ -58,6 +59,14 @@ async fn main() -> agent_client_protocol::Result<()> {
                     if die {
                         std::thread::spawn(|| { std::thread::sleep(std::time::Duration::from_millis(100)); std::process::exit(3) });
                         chunk(&cx2, &s, "dying")?;
+                        return responder.respond(PromptResponse::new(StopReason::EndTurn));
+                    }
+                    if plan {
+                        let e = |c: &str, st| PlanEntry::new(c, PlanEntryPriority::Medium, st);
+                        let p = Plan::new(vec![e("读代码", PlanEntryStatus::Completed), e("写测试", PlanEntryStatus::InProgress), e("提交", PlanEntryStatus::Pending)]);
+                        cx2.send_notification(SessionNotification::new(s.clone(), SessionUpdate::Plan(p)))?;
+                        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+                        chunk(&cx2, &s, "planned")?;
                         return responder.respond(PromptResponse::new(StopReason::EndTurn));
                     }
                     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
