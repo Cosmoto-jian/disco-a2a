@@ -1,19 +1,19 @@
 {
-  "version": "1.6.1",
-  "notes": "macOS 左侧栏加宽，分隔线不再贴着红绿灯",
-  "pub_date": "2026-10-20T05:51:20Z",
+  "version": "1.6.2",
+  "notes": "列表、标题和信息栏显示 agent 的 git 分支；回复中显示它计划里正在做的那一步",
+  "pub_date": "2026-10-20T17:06:11Z",
   "platforms": {
     "darwin-aarch64": {
-      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVUcDdocWFJV0FyVnhhaGQ1SlBpNFUvcTBpVVJmT2JnOG01Ujk1M2hVWWhNMUdTbWtGbkc5VmdxRG1sRER5ekY3cTgxSWl2ZHBQbWkvRG14bzlHVFVqT1FHOERLZUIrNlFZPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkyNDc1NDc5CWZpbGU6RGlzY29fMS42LjFfdW5pdmVyc2FsLmFwcC50YXIuZ3oKc1NjM3Q1Y1UxVlRPa0F2UVJjZkJKb1A0cTVWR1VHaGhTMWc1YjdJSVpRZFEzZHFmTHcvcGlyekVyeUxnb2pqWElobjFlT2RLZjI5UmtQRUozUFZRREE9PQo=",
-      "url": "https://github.com/Cosmoto-jian/disco-a2a/releases/download/v1.6.1/Disco_1.6.1_universal.app.tar.gz"
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVUcDdocWFJV0FyVnpENlc1TUlKbFJBVFJ6b2ttQitxYS9pdWV4QjBUV0pHN3VTWENBdzdYak1rT0lnMTZ6K09mUlBqdVA3NmY2d1BjTGE3V2N0UDQ4OTVEYys4YTVxVHdjPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkyNTE1OTcwCWZpbGU6RGlzY29fMS42LjJfdW5pdmVyc2FsLmFwcC50YXIuZ3oKS2t2Z3o2bjFqZnlTY2VrdHlYODYyQmRweXNPY3N1Z2NaQUliUlY4WUFLcDdmOHIwZjBad3NCcVRxWkxrbmpvN1NSQ2NJQTlLVEtES3U5amltdy9qQkE9PQo=",
+      "url": "https://github.com/Cosmoto-jian/disco-a2a/releases/download/v1.6.2/Disco_1.6.2_universal.app.tar.gz"
     },
     "darwin-x86_64": {
-      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVUcDdocWFJV0FyVnhhaGQ1SlBpNFUvcTBpVVJmT2JnOG01Ujk1M2hVWWhNMUdTbWtGbkc5VmdxRG1sRER5ekY3cTgxSWl2ZHBQbWkvRG14bzlHVFVqT1FHOERLZUIrNlFZPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkyNDc1NDc5CWZpbGU6RGlzY29fMS42LjFfdW5pdmVyc2FsLmFwcC50YXIuZ3oKc1NjM3Q1Y1UxVlRPa0F2UVJjZkJKb1A0cTVWR1VHaGhTMWc1YjdJSVpRZFEzZHFmTHcvcGlyekVyeUxnb2pqWElobjFlT2RLZjI5UmtQRUozUFZRREE9PQo=",
-      "url": "https://github.com/Cosmoto-jian/disco-a2a/releases/download/v1.6.1/Disco_1.6.1_universal.app.tar.gz"
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVUcDdocWFJV0FyVnpENlc1TUlKbFJBVFJ6b2ttQitxYS9pdWV4QjBUV0pHN3VTWENBdzdYak1rT0lnMTZ6K09mUlBqdVA3NmY2d1BjTGE3V2N0UDQ4OTVEYys4YTVxVHdjPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkyNTE1OTcwCWZpbGU6RGlzY29fMS42LjJfdW5pdmVyc2FsLmFwcC50YXIuZ3oKS2t2Z3o2bjFqZnlTY2VrdHlYODYyQmRweXNPY3N1Z2NaQUliUlY4WUFLcDdmOHIwZjBad3NCcVRxWkxrbmpvN1NSQ2NJQTlLVEtES3U5amltdy9qQkE9PQo=",
+      "url": "https://github.com/Cosmoto-jian/disco-a2a/releases/download/v1.6.2/Disco_1.6.2_universal.app.tar.gz"
     },
     "windows-x86_64": {
-      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVUcDdocWFJV0FyVjNKOXk3dXRpbG05aGo2M1o0Z1J5UW9GUkQvMW9VRXNaS3MwcVZ1OEg1dW8wNFdmVDVFSi9hWlJiRHlXcVNqekJBd09GWHpMbkJRK1hWRE9xd21OL3dNPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkyNDc1NDgwCWZpbGU6RGlzY29fMS42LjFfeDY0LXNldHVwLmV4ZQpCNnFodXZmYVlWbDlsRTFWS3JmOFhRVVBTdHVzSTFabDYzV1NDL2FIZGZqOWpaemE2Q3l1Zmd3S0EwckMzeWhHcWtKekxsWUVSellyamJuT1VybkxEZz09Cg==",
-      "url": "https://github.com/Cosmoto-jian/disco-a2a/releases/download/v1.6.1/Disco_1.6.1_x64-setup.exe"
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVUcDdocWFJV0FyVjFRYStBRVpzMDJPWmNaRGQ5RlJqdVN6a3RSR1VyTDFQY2dreThydE1XQU1kaTZBYmk0c1JCUGovSGIzeGNlTkkyWmlmbmxIYWhMNkJYbit2YWdSQkFFPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkyNTE1OTcxCWZpbGU6RGlzY29fMS42LjJfeDY0LXNldHVwLmV4ZQowaVArcUZtR1ZVWjZSY2NUNTlldzNJZ2tNV0FUZ2pNWXl6TlBIenAyeFBTNk1OUGs3SWNjT2xrTWZtNjJ3MVQzYnlHTDNEQjlNMitlcFlLY2ZHeldCQT09Cg==",
+      "url": "https://github.com/Cosmoto-jian/disco-a2a/releases/download/v1.6.2/Disco_1.6.2_x64-setup.exe"
     }
   }
 }
