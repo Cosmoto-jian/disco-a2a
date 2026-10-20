@@ -1,7 +1,7 @@
 /* Disco — Apple-style UI. One type size (--fs); hierarchy from weight and grey.
    One accent (--acc) only for: the user's bubble, primary buttons, toggles, badges and the selected rail icon. */
 [hidden] { display:none !important; }
-:root { --fs:13px; --rail-w:64px; --list-w:270px; --insp-w:288px;
+:root { --fs:13px; --rail-w:84px; --list-w:270px; --insp-w:288px;
   color-scheme:light dark;
   --rail:rgba(236,237,240,.82); --list:#f7f7f8; --main:#ffffff; --side:#fbfbfc; --card:#ffffff;
   --line:rgba(0,0,0,.07); --line2:rgba(0,0,0,.12); --fg:#1d1d1f; --fg2:#3a3a3c; --mute:#8e8e93; --mute2:#aeaeb2;
@@ -51,6 +51,7 @@ kbd { font:11px ui-monospace, Menlo, monospace; padding:1px 6px; border-radius:5
 #rail { background:var(--rail); -webkit-backdrop-filter:blur(20px) saturate(1.6); backdrop-filter:blur(20px) saturate(1.6); border-right:1px solid var(--line); display:flex; flex-direction:column; align-items:center; gap:4px; padding-bottom:14px; }
 #rail .drag { height:46px; width:100%; flex:none; }
 .win #rail .drag { height:12px; }
+:root.win { --rail-w:64px; } /* macOS: rail clears the traffic lights (end ~72px) with a 12px margin */
 #rail .grow { flex:1; }
 .tab { width:40px; height:40px; border-radius:10px; display:grid; place-items:center; color:var(--mute); position:relative; }
 .tab .ic { width:22px; height:22px; grid-area:1/1; transition:transform .18s var(--ease); }
