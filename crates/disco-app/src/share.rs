@@ -62,7 +62,7 @@ pub struct ShareStatus {
 /// The running server: bound port, the Tailscale addresses it listens on
 /// (besides 127.0.0.1), or the reason it could not start / listen.
 #[derive(Default)]
-pub struct Server { port: Option<u16>, ips: Vec<IpAddr>, error: Option<String> }
+pub struct Server { port: Option<u16>, error: Option<String> }
 
 #[derive(Serialize, Deserialize)]
 struct Invite { url: String, token: String, agent: String, owner: String }
@@ -151,31 +151,27 @@ impl Core {
         secret_del(&format!("share/{id}"));
     }
 
-    /// Start the share server (idempotent): 127.0.0.1 first, then each of this
-    /// machine's Tailscale addresses (v4 and v6) on the same port, never 0.0.0.0, which
-    /// would also expose it on a carrier's 100.64/10 network. Calling it again
-    /// adds addresses Tailscale has gained since (e.g. it was logged in later).
+    /// Start the share server (idempotent) on all interfaces, as v0.6–v1.5.12 did
+    /// (binding only the detected Tailscale address broke sharing on real machines).
+    /// `guard` admits loopback and Tailscale peers only, and every call needs the
+    /// guest's token, so a LAN or carrier-NAT neighbour gets nothing.
     pub(crate) fn serve_shares(self: &Arc<Self>) {
-        let want = tailnet::my_ips();
         let mut srv = self.server.lock().unwrap_or_else(|p| p.into_inner());
-        if srv.port.is_none() {
-            let mut last = String::new();
-            for port in PORTS {
-                match std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, port)) {
-                    Ok(l) => { self.listen(l); *srv = Server { port: Some(port), ..Server::default() }; break; }
-                    Err(e) => last = e.to_string(),
+        if srv.port.is_some() { return; }
+        let mut last = String::new();
+        for port in PORTS {
+            match std::net::TcpListener::bind((Ipv4Addr::UNSPECIFIED, port)) {
+                Ok(l) => {
+                    self.listen(l);
+                    // Tailscale's IPv6 address, where the OS keeps v6 separate; harmless if it fails.
+                    if let Ok(l6) = std::net::TcpListener::bind((std::net::Ipv6Addr::UNSPECIFIED, port)) { self.listen(l6); }
+                    *srv = Server { port: Some(port), error: None };
+                    return;
                 }
-            }
-            if srv.port.is_none() { srv.error = Some(format!("端口 7480–7489 都被占用：{last}")); return; }
-        }
-        let Some(port) = srv.port else { return };
-        let new: Vec<IpAddr> = want.into_iter().filter(|ip| !srv.ips.contains(ip)).collect();
-        for ip in new {
-            match std::net::TcpListener::bind((ip, port)) {
-                Ok(l) => { self.listen(l); srv.ips.push(ip); srv.error = None; }
-                Err(e) => srv.error = Some(format!("无法在 Tailscale 地址 {ip} 的端口 {port} 上监听：{e}")),
+                Err(e) => last = e.to_string(),
             }
         }
+        srv.error = Some(format!("端口 7480–7489 都被占用：{last}"));
     }
 
     fn listen(self: &Arc<Self>, l: std::net::TcpListener) {
@@ -193,20 +189,17 @@ impl Core {
     }
 
     pub(crate) fn share_base(&self) -> Result<String, String> {
-        let (port, ip, error) = {
+        let (port, error) = {
             let s = self.server.lock().unwrap_or_else(|p| p.into_inner());
-            (s.port, tailnet::best_ip(&s.ips), s.error.clone())
+            (s.port, s.error.clone())
         };
-        let port = port.ok_or_else(|| error.clone().unwrap_or_else(|| "共享服务未启动".into()))?;
+        let port = port.ok_or_else(|| error.unwrap_or_else(|| "共享服务未启动".into()))?;
         // The IP, not the MagicDNS name: a guest may have Tailscale DNS off (e.g. under another VPN).
-        let host = match ip {
+        let host = match tailnet::best_ip(&tailnet::my_ips()) {
             Some(IpAddr::V6(v)) => format!("[{v}]"),
             Some(v4) => v4.to_string(),
             None if crate::selftest_mode() => "127.0.0.1".into(),
-            None => return Err(error.unwrap_or_else(|| match tailnet::diagnose() {
-                Err(why) => format!("{why}，再回来生成邀请（共享服务目前只在本机监听）"),
-                Ok(_) => "Tailscale 刚连上，请再试一次".into(),
-            })),
+            None => return Err(match tailnet::diagnose() { Err(why) => format!("{why}，再回来生成邀请"), Ok(_) => "Tailscale 刚连上，请再试一次".into() }),
         };
         Ok(format!("http://{host}:{port}"))
     }

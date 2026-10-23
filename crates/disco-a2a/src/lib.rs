@@ -18,6 +18,8 @@ pub enum A2aError {
     Protocol(#[from] a2a::A2AError),
     #[error("{0}")]
     Insecure(String),
+    #[error("{0}")]
+    Unreachable(String),
 }
 
 /// Static credential injected on every call. OAuth tokens are refreshed upstream
@@ -48,14 +50,22 @@ pub struct RemoteAgent {
 impl RemoteAgent {
     /// Resolve `/.well-known/agent-card.json` under `base_url`, negotiate a binding.
     pub async fn connect(base_url: &str, cred: Credential) -> Result<Self, A2aError> {
-        let card = AgentCardResolver::new(None).resolve(base_url).await?;
+        // Loopback and tailnet peers are reached directly: a system proxy (a VPN app)
+        // would forward 100.x to a remote exit that can't see the tailnet.
+        let direct = origin(base_url).is_some_and(|(_, h, _)| is_loopback(&h));
+        let http = direct.then(|| reqwest::Client::builder().no_proxy().build().ok()).flatten();
+        let card = AgentCardResolver::new(http.clone()).resolve(base_url).await.map_err(|e| unreachable_hint(base_url, e))?;
         if matches!(cred, Credential::Header { .. }) {
             check_cred_target(base_url, &serde_json::to_value(&card).unwrap_or_default())
                 .map_err(A2aError::Insecure)?;
         }
-        let factory = A2AClientFactory::builder()
-            .with_interceptor(Arc::new(AuthInterceptor(cred)))
-            .build();
+        let mut factory = A2AClientFactory::builder().with_interceptor(Arc::new(AuthInterceptor(cred)));
+        if let Some(c) = http {
+            factory = factory
+                .register(Arc::new(a2a_client::jsonrpc::JsonRpcTransportFactory::new(Some(c.clone()))))
+                .register(Arc::new(a2a_client::rest::RestTransportFactory::new(Some(c))));
+        }
+        let factory = factory.build();
         let client = factory.create_from_card(&card).await?;
         Ok(Self { card, client })
     }
@@ -113,6 +123,16 @@ fn status(s: &a2a::TaskStatus) -> Vec<AgentEvent> {
         AgentEvent::Phase { phase: p }
     });
     out
+}
+
+/// A tailnet address that can't be reached gets a plain-language reason.
+fn unreachable_hint(base_url: &str, e: a2a::A2AError) -> A2aError {
+    let msg = e.to_string();
+    let tailnet = origin(base_url).is_some_and(|(_, h, _)| is_loopback(&h) && !h.starts_with("127.") && h != "localhost" && h != "[::1]");
+    if tailnet && msg.contains("error sending request") {
+        return A2aError::Unreachable(format!("连不上对方（{}）。请确认：对方的 Disco 开着；两台都在 Tailscale 里显示在线；VPN 没开 TUN/增强模式，或已把 100.64.0.0/10 设为直连；对方电脑的防火墙允许 Disco 接收连接（更新后 macOS 可能再弹一次「允许传入连接」，要点允许）。", origin(base_url).map(|o| format!("{}:{}", o.1, o.2)).unwrap_or_default()));
+    }
+    A2aError::Protocol(e)
 }
 
 /// (scheme, host, port) as a WHATWG parser (and so reqwest) will see it; `None`
