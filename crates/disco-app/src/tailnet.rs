@@ -144,53 +144,70 @@ fn run(args: &[&str]) -> Option<Value> {
     None
 }
 
-/// `tailscale status --json`, cached for a few seconds.
+/// `tailscale status --json`, cached for a few seconds (a missing CLI too, so
+/// callers without one don't respawn it on every check).
 pub fn status() -> Option<Value> {
-    static CACHE: Mutex<Option<(Instant, Value)>> = Mutex::new(None);
+    static CACHE: Mutex<Option<(Instant, Option<Value>)>> = Mutex::new(None);
     let mut c = CACHE.lock().unwrap_or_else(|p| p.into_inner());
-    if let Some((t, v)) = c.as_ref() && t.elapsed() < Duration::from_secs(5) { return Some(v.clone()); }
-    let v = run(&["status", "--json"])?;
+    if let Some((t, v)) = c.as_ref() && t.elapsed() < Duration::from_secs(5) { return v.clone(); }
+    let v = run(&["status", "--json"]);
     *c = Some((Instant::now(), v.clone()));
-    Some(v)
-}
-
-/// A machine on the tailnet.
-#[derive(Clone, Debug, Serialize)]
-pub struct Node { pub node: String, pub host: String, pub ip: String, pub online: bool, pub me: bool }
-
-fn node_of(n: &Value, me: bool, running: bool) -> Option<Node> {
-    let node = n["DNSName"].as_str()?.trim_end_matches('.').to_lowercase();
-    let ips: Vec<&str> = n["TailscaleIPs"].as_array()?.iter().filter_map(Value::as_str).collect();
-    let ip = ips.iter().find(|i| !i.contains(':')).or(ips.first())?.to_string();
-    if node.is_empty() { return None; }
-    Some(Node { node, host: n["HostName"].as_str().unwrap_or("").into(), ip, online: if me { running } else { n["Online"].as_bool() == Some(true) }, me })
-}
-
-pub fn nodes() -> Vec<Node> {
-    let Some(st) = status() else { return vec![] };
-    let running = st["BackendState"].as_str() == Some("Running");
-    let mut v: Vec<Node> = node_of(&st["Self"], true, running).into_iter().collect();
-    if let Some(peers) = st["Peer"].as_object() { v.extend(peers.values().filter_map(|n| node_of(n, false, running))); }
     v
 }
 
-/// This machine's own Tailscale addresses (v4 and v6), as Tailscale reports them
-/// while it is running. Never guessed from interfaces: 100.64/10 is also carrier NAT.
-pub fn my_ips() -> Vec<IpAddr> { status().map(|st| self_ips(&st)).unwrap_or_default() }
+/// This machine on the tailnet.
+#[derive(Clone, Debug, Serialize)]
+pub struct Node { pub node: String, pub host: String, pub ip: String, pub online: bool, pub me: bool }
+
+/// This machine's own Tailscale addresses (v4 and v6): what Tailscale reports while
+/// it is running, else what sits on its own network interface (the CLI is often
+/// unusable: Mac App Store build, a GUI app's PATH).
+pub fn my_ips() -> Vec<IpAddr> { own_ips(status().as_ref()) }
+
+fn own_ips(st: Option<&Value>) -> Vec<IpAddr> {
+    let ips = st.map(self_ips).unwrap_or_default();
+    if !ips.is_empty() { return ips; }
+    let ifs = if_addrs::get_if_addrs().unwrap_or_default();
+    tailscale_ifaces(ifs.iter().map(|i| (i.name.as_str(), i.ip())))
+}
 
 fn self_ips(st: &Value) -> Vec<IpAddr> {
     if st["BackendState"].as_str() != Some("Running") { return vec![]; }
     st["Self"]["TailscaleIPs"].as_array().into_iter().flatten().filter_map(|v| v.as_str()?.parse().ok()).filter(is_tailnet).collect()
 }
 
-/// This Mac on the tailnet.
-pub fn me() -> Option<Node> {
-    if let Some(n) = nodes().into_iter().find(|n| n.me) { return Some(n); }
-    // The CLI may be missing (App Store build): find a 100.64/10 address on an interface.
-    let o = crate::hub::quiet_cmd(if cfg!(windows) { "ipconfig" } else { "ifconfig" }).output().ok()?;
-    String::from_utf8_lossy(&o.stdout).split(|c: char| c.is_whitespace() || c == '(' || c == '/')
-        .find(|w| w.parse::<IpAddr>().is_ok_and(|ip| is_tailnet(&ip)))
-        .map(|ip| Node { node: ip.to_owned(), host: String::new(), ip: ip.to_owned(), online: true, me: true })
+/// The tailnet addresses among `(interface, ip)` that sit on Tailscale's own interface
+/// (macOS `utunN`, Linux `tailscale0`, the Windows "Tailscale" adapter): 100.64/10 on
+/// any other interface is a carrier's NAT, not Tailscale.
+fn tailscale_ifaces<'a>(ifs: impl IntoIterator<Item = (&'a str, IpAddr)>) -> Vec<IpAddr> {
+    let ts = |n: &str| n.starts_with("utun") || n.to_lowercase().contains("tailscale");
+    let mut out: Vec<IpAddr> = ifs.into_iter().filter(|(n, ip)| ts(n) && is_tailnet(ip)).map(|(_, ip)| ip).collect();
+    out.dedup();
+    out
+}
+
+/// The address to give out: IPv4 if there is one (works whatever the guest's DNS does).
+pub fn best_ip(ips: &[IpAddr]) -> Option<IpAddr> { ips.iter().find(|i| i.is_ipv4()).or(ips.first()).copied() }
+
+/// This machine on the tailnet, or why not (in words the user can act on).
+pub fn diagnose() -> Result<Node, String> {
+    let st = status();
+    let Some(ip) = best_ip(&own_ips(st.as_ref())) else { return Err(why_not(st.as_ref().map(|s| s["BackendState"].as_str().unwrap_or("")))) };
+    let me = st.as_ref().map(|s| &s["Self"]);
+    let node = me.and_then(|m| m["DNSName"].as_str()).map(|d| d.trim_end_matches('.').to_lowercase()).filter(|d| !d.is_empty()).unwrap_or_else(|| ip.to_string());
+    let host = me.and_then(|m| m["HostName"].as_str()).unwrap_or("").to_owned();
+    Ok(Node { node, host, ip: ip.to_string(), online: true, me: true })
+}
+
+/// Why there is no Tailscale address, given the CLI's `BackendState` (None: no CLI answered).
+fn why_not(state: Option<&str>) -> String {
+    match state {
+        None => "没找到 Tailscale：请安装并打开 Tailscale".into(),
+        Some("Stopped") => "Tailscale 已断开：请在 Tailscale 里点 Connect".into(),
+        Some("NeedsLogin") => "Tailscale 未登录：请打开 Tailscale 登录".into(),
+        Some("NeedsMachineAuth") => "Tailscale 在等管理员批准这台设备".into(),
+        Some(s) => format!("Tailscale 状态：{}（需要 Running）", if s.is_empty() { "未知" } else { s }),
+    }
 }
 
 /// Who `ip` is, according to Tailscale (cached for a minute). None if it can't say.
@@ -264,6 +281,34 @@ mod tests {
         assert_eq!(self_ips(&st), vec!["100.101.2.3".parse::<IpAddr>().unwrap(), "fd7a:115c:a1e0::1".parse().unwrap()]);
         assert!(self_ips(&serde_json::json!({ "BackendState": "Stopped", "Self": st["Self"] })).is_empty());
         assert!(self_ips(&serde_json::json!({})).is_empty());
+    }
+
+    #[test]
+    fn interface_fallback_only_takes_tailscale() {
+        let ip = |s: &str| s.parse::<IpAddr>().unwrap();
+        let ifs = [
+            ("en0", ip("100.70.1.2")),          // carrier NAT on Wi-Fi
+            ("utun4", ip("100.101.2.3")),        // macOS Tailscale
+            ("utun4", ip("fd7a:115c:a1e0::1")),
+            ("utun2", ip("10.8.0.2")),           // another VPN
+            ("tailscale0", ip("100.90.0.1")),    // Linux
+            ("Tailscale", ip("100.91.0.1")),     // Windows adapter (friendly name)
+            ("Tailscale Tunnel", ip("192.168.1.5")),
+            ("wlan0", ip("100.127.0.9")),
+        ];
+        assert_eq!(tailscale_ifaces(ifs), vec![ip("100.101.2.3"), ip("fd7a:115c:a1e0::1"), ip("100.90.0.1"), ip("100.91.0.1")]);
+        assert!(tailscale_ifaces([("en0", ip("100.64.0.1")), ("eth0", ip("100.100.1.1"))]).is_empty());
+        assert_eq!(best_ip(&[ip("fd7a:115c:a1e0::1"), ip("100.101.2.3")]), Some(ip("100.101.2.3")));
+        assert_eq!(best_ip(&[ip("fd7a:115c:a1e0::1")]), Some(ip("fd7a:115c:a1e0::1")));
+        assert_eq!(best_ip(&[]), None);
+    }
+
+    #[test]
+    fn why_not_says_what_to_do() {
+        assert_eq!(why_not(None), "没找到 Tailscale：请安装并打开 Tailscale");
+        assert_eq!(why_not(Some("Stopped")), "Tailscale 已断开：请在 Tailscale 里点 Connect");
+        assert!(why_not(Some("NeedsLogin")).starts_with("Tailscale 未登录"));
+        assert!(why_not(Some("Starting")).contains("Starting") && why_not(Some("")).contains("未知"));
     }
 
     #[test]

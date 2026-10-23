@@ -127,6 +127,7 @@ fn origin(url: &str) -> Option<(String, String, u16)> {
 fn is_loopback(h: &str) -> bool {
     if matches!(h, "localhost" | "127.0.0.1" | "[::1]") || h.ends_with(".ts.net") { return true; }
     h.parse::<std::net::Ipv4Addr>().is_ok_and(|ip| { let o = ip.octets(); o[0] == 100 && (64..128).contains(&o[1]) })
+        || h.strip_prefix('[').and_then(|h| h.strip_suffix(']')).and_then(|h| h.parse::<std::net::Ipv6Addr>().ok()).is_some_and(|ip| ip.segments()[..3] == [0xfd7a, 0x115c, 0xa1e0])
 }
 
 /// A credential may only travel over https (or to loopback), and only to the
@@ -175,6 +176,8 @@ mod cred_tests {
         assert!(check_cred_target("http://mac.tail1.ts.net:7480/a/x", &ts).is_ok());
         assert!(check_cred_target("http://100.70.1.2:7480/a/x", &json!({"url": "http://100.70.1.2:7480/a/x/jsonrpc"})).is_ok());
         assert!(check_cred_target("http://192.168.1.2:7480", &json!({})).is_err());
+        assert!(check_cred_target("http://[fd7a:115c:a1e0::1]:7480/a/x", &json!({"url": "http://[fd7a:115c:a1e0::1]:7480/a/x/jsonrpc"})).is_ok());
+        assert!(check_cred_target("http://[fd00::1]:7480", &json!({})).is_err());
         let local = json!({"url": "http://127.0.0.1:9000/"});
         assert!(check_cred_target("http://127.0.0.1:9000", &local).is_ok());
         let trick = json!({"url": "https://a.example@evil.example/"});

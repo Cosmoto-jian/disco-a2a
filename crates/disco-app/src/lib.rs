@@ -1529,8 +1529,8 @@ async fn diagnose(core: St<'_>) -> CmdResult<Vec<Check>> {
             }
         }
     }
-    let me = tauri::async_runtime::spawn_blocking(tailnet::me).await.map_err(err)?;
-    add("Tailscale", me.map(|n| format!("这台 Mac：{}", n.node)).ok_or("没检测到：共享 agent 需要先安装并登录 Tailscale".into()));
+    let me = tauri::async_runtime::spawn_blocking(tailnet::diagnose).await.map_err(err)?;
+    add("Tailscale", me.map(|n| if n.node == n.ip { format!("这台机器：{}", n.ip) } else { format!("这台机器：{}（{}）", n.node, n.ip) }));
     let path = core.hub.user_path.clone();
     add("Node.js / npx", hub::which("npx", &path).map(|p| p.display().to_string()).ok_or("找不到 npx：Claude Code、Codex、pi 需要先安装 Node.js".into()));
     let agents = core.db().list_agents().map_err(err)?;

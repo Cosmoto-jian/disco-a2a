@@ -53,7 +53,7 @@ pub struct ShareView { id: String, agent: String, guest: String, mode: String, l
 
 #[derive(Serialize)]
 pub struct ShareStatus {
-    /// e.g. "http://my-mac.tail1234.ts.net:7480" once the server runs and Tailscale is found.
+    /// e.g. "http://100.101.2.3:7480" (the Tailscale IP) once the server runs and Tailscale is found.
     base: Option<String>,
     problem: Option<String>,
     shares: Vec<ShareView>,
@@ -195,13 +195,18 @@ impl Core {
     pub(crate) fn share_base(&self) -> Result<String, String> {
         let (port, ip, error) = {
             let s = self.server.lock().unwrap_or_else(|p| p.into_inner());
-            (s.port, s.ips.first().copied(), s.error.clone())
+            (s.port, tailnet::best_ip(&s.ips), s.error.clone())
         };
         let port = port.ok_or_else(|| error.clone().unwrap_or_else(|| "共享服务未启动".into()))?;
+        // The IP, not the MagicDNS name: a guest may have Tailscale DNS off (e.g. under another VPN).
         let host = match ip {
-            Some(ip) => crate::tailnet::me().map(|me| me.node).unwrap_or_else(|| match ip { IpAddr::V6(v) => format!("[{v}]"), v4 => v4.to_string() }),
+            Some(IpAddr::V6(v)) => format!("[{v}]"),
+            Some(v4) => v4.to_string(),
             None if crate::selftest_mode() => "127.0.0.1".into(),
-            None => return Err(error.unwrap_or_else(|| "没检测到 Tailscale：共享服务目前只在本机监听。请先安装 Tailscale 并登录，再回来生成邀请".into())),
+            None => return Err(error.unwrap_or_else(|| match tailnet::diagnose() {
+                Err(why) => format!("{why}，再回来生成邀请（共享服务目前只在本机监听）"),
+                Ok(_) => "Tailscale 刚连上，请再试一次".into(),
+            })),
         };
         Ok(format!("http://{host}:{port}"))
     }
