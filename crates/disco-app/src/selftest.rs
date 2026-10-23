@@ -195,7 +195,8 @@ pub fn spawn(app: AppHandle, mock: String) {
         let _ = check!("对方群可回话", {
             let pc = |ctx: &str| { let _ = core.db().set_setting(&format!("{}st", crate::share::PEER_CTX), ctx); core.peer_channel("st") };
             if pc("group:1234567890").as_deref() != Some("1234567890") { return Err("认不出 Discord 群".into()); }
-            if pc("group:local-x").is_some() || pc("dm:x").is_some() { return Err("本地群/私聊不该能回话".into()); }
+            if pc("team:group:1234567890:m1").as_deref() != Some("1234567890") || pc("ask:m1:group:1234567890").as_deref() != Some("1234567890") { return Err("认不出团队/委托里的群".into()); }
+            if pc("group:local-x").is_some() || pc("dm:x").is_some() || pc("ask:m1:dm:x").is_some() { return Err("本地群/私聊不该能回话".into()); }
             Ok(String::new()) });
         let _ = check!("对方群需你和 Bot 都在", {
             let _ = core.db().set_setting(&format!("{}st", crate::share::PEER_CTX), "group:1234567890");

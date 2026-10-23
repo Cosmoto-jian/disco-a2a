@@ -173,12 +173,19 @@ function load() {
   const seq = ++loadSeq;
   return (loading = invoke("overview").then((ov) => {
     if (seq !== loadSeq) return loading;
+    // A peer chat whose talk state changed (the guest just used it in their group) redraws in place.
+    const pk = (o) => { const p = o?.peers.find((x) => x.thread === S.thread); return p ? `${p.talk}|${p.group}|${p.missing}` : ""; };
+    const peerMoved = S.thread?.startsWith("peer:") && pk(S.ov) !== pk(ov);
     S.ov = ov;
     document.body.classList.toggle("paused", ov.paused);
     $("#paused-bar").hidden = !ov.paused;
     drawKill();
     renderList();
-    if (S.thread) { $("#chat-sub")?.replaceChildren(...chatSub(S.thread)); drawMembers(); }
+    if (peerMoved && $("#pane.chat")) {
+      $("#log")?.remove(); openThread(S.thread);
+      if (peerOf(S.thread)?.talk) toast("可以在对方的群里说话了", 3000);
+    }
+    else if (S.thread) { $("#chat-sub")?.replaceChildren(...chatSub(S.thread)); drawMembers(); }
   }));
 }
 // The first overview: events and opens that arrive before it wait for it (in order) instead of reading S.ov == null.

@@ -217,12 +217,21 @@ impl Core {
         if !counted { return Err(format!("今天的 {} 次额度已用完", share.limit)); }
         let thread = format!("peer:{id}");
         // The guest's Discord-synced group the agent was last used in lets the owner talk back.
-        // Only a group is remembered: a later DM or delegated `ask:` turn must not erase it.
-        // The guest names it, so it must also be a Discord group the owner has synced here:
-        // otherwise a guest could make the owner's words land in any channel.
-        let known = discord_group(guest_ctx).and_then(|ch| self.db().list_groups().ok()?.into_iter().find(|g| g.id == ch));
-        if known.is_some() {
-            let _ = self.db().set_setting(&format!("{PEER_CTX}{id}"), guest_ctx);
+        // Only a group is remembered: a later DM turn must not erase it. The guest names the
+        // channel, so it is only a candidate: `peer_check` opens the chat once Discord confirms
+        // the owner's bot can see that channel and the owner's own account is in its server.
+        if let Some(ch) = discord_group(guest_ctx) {
+            let fresh = format!("group:{ch}");
+            if self.peer_channel(id).as_deref() != Some(ch) {
+                let _ = self.db().set_setting(&format!("{PEER_CTX}{id}"), &fresh);
+                let _ = self.db().set_setting(&format!("{PEER_OK}{id}"), CHECKING);
+                self.agents_changed();
+            }
+            let (core, id) = (self.app.state::<Arc<Core>>().inner().clone(), id.to_owned());
+            tauri::async_runtime::spawn(async move {
+                let before = core.db().setting(&format!("{PEER_OK}{id}"));
+                if core.peer_check(&id).await != before { core.agents_changed(); }
+            });
         }
         self.post_message(&thread, &share.guest, text);
         let deny = share.mode != "ask";
@@ -271,6 +280,7 @@ impl Core {
 pub(crate) const PEER_CTX: &str = "peer_ctx/";
 /// Result of the last talk check per share: "" = ready, else what is still missing.
 const PEER_OK: &str = "peer_ok/";
+const CHECKING: &str = "正在确认你和你的 Bot 是否都在对方的服务器里…";
 
 impl Core {
     /// The Discord channel of the guest's group the shared agent was last used in, if any.
@@ -281,7 +291,7 @@ impl Core {
     /// What still keeps the owner from talking in the guest's group ("" = nothing).
     pub(crate) fn peer_missing(&self, id: &str) -> Option<String> {
         self.peer_channel(id)?;
-        Some(self.db().setting(&format!("{PEER_OK}{id}")).unwrap_or_else(|| "正在确认你和你的 Bot 是否都在对方的服务器里…".into()))
+        Some(self.db().setting(&format!("{PEER_OK}{id}")).unwrap_or_else(|| CHECKING.into()))
     }
 
     /// Check (and remember) whether both the owner's Discord account and bot are in the
@@ -325,8 +335,12 @@ impl Core {
 }
 
 /// The Discord channel id in an A2A context `group:<channel>` (local groups have none).
+/// The Discord channel in a guest's group context: `group:<ch>`, or the team and
+/// delegated forms `team:group:<ch>:<agent>` and `ask:<agent>:group:<ch>`.
 fn discord_group(ctx: &str) -> Option<&str> {
-    let ch = ctx.strip_prefix("group:")?;
+    let rest = ctx.strip_prefix("team:").or_else(|| ctx.strip_prefix("ask:").and_then(|r| r.split_once(':').map(|(_, t)| t))).unwrap_or(ctx);
+    let ch = rest.strip_prefix("group:")?;
+    let ch = ch.split_once(':').map_or(ch, |(c, _)| c);
     (!ch.is_empty() && ch.bytes().all(|b| b.is_ascii_digit())).then_some(ch)
 }
 
