@@ -677,7 +677,8 @@ pub fn spawn(app: AppHandle, mock: String) {
             let b = wait_msg(&core, "dm:fg1", "fg1", n, 60).await?;
             if !b.contains(&sha(&data)) || !b.contains(&owner_copy.display().to_string()) { return Err(b.chars().take(300).collect()); }
             if std::fs::read(&owner_copy).ok() != Some(data) { return Err("主人那边存的内容不对".into()); }
-            if !last_from(&core, &format!("peer:{fshare}"), "文件友").is_some_and(|l| l.contains("📎 报告.txt")) { return Err("主人的会话里没显示文件".into()); }
+            let shown = core.db().messages(&format!("peer:{fshare}"), 50).map(|v| v.iter().any(|m| m.author == "文件友" && m.body.contains("📎 报告.txt"))).unwrap_or(false);
+            if !shown { return Err("主人的会话里没显示文件".into()); }
             Ok(String::new()) });
         let _ = check!("跨设备文件 主人的 agent 用 MCP send_file 发回访客（只聊天只能发共享空间里的）", {
             let ctx = format!("peer:{fshare}|dm:fg1");
@@ -690,16 +691,16 @@ pub fn spawn(app: AppHandle, mock: String) {
             std::fs::write(&outside, "no").map_err(|e| e.to_string())?;
             let refused = tool(&core, &tok, "send_file", json!({ "path": outside.display().to_string() })).await;
             let sent = tool(&core, &tok, "send_file", json!({ "path": owner_copy.display().to_string(), "note": "给你" })).await;
-            let line = within(30, async { loop {
+            let line = if sent.is_err() { Err("没发出".to_string()) } else { within(30, async { loop {
                 let got = core.db().messages("dm:fg1", 50).ok().and_then(|v| v.into_iter().rev().find(|m| m.author == "fg1" && m.body.contains("📎")).map(|m| m.body));
                 if let Some(l) = got && count(&core, "dm:fg1", "fg1") > n { return l; }
                 tokio::time::sleep(Duration::from_millis(100)).await;
-            } }).await;
+            } }).await };
             core.hub.cancel("m1", &ctx).await;
             let _ = wait_busy(&core, "m1", false).await;
             if !refused.as_ref().is_err_and(|e| e.contains("只聊天")) { return Err(format!("空间外的文件：{refused:?}")); }
             let sent = sent?;
-            let line = line?;
+            let line = line.map_err(|e| format!("{e}；{sent}；访客：{:?}", last_from(&core, "dm:fg1", "system")))?;
             let path = line.lines().last().unwrap_or_default().to_owned();
             if std::fs::read(&path).ok() != std::fs::read(&owner_copy).ok() { return Err(format!("访客收到的不对：{line}")); }
             Ok(sent) });
