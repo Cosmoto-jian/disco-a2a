@@ -124,6 +124,7 @@ fn copy_in(src: &Path, dir: &Path, name: &str) -> Result<(PathBuf, u64, String),
 
 pub fn human_size(n: u64) -> String {
     match n {
+        n if n >= 1 << 20 && n % (1 << 20) == 0 => format!("{} MB", n >> 20),
         n if n >= 1 << 20 => format!("{:.1} MB", n as f64 / (1u64 << 20) as f64),
         n if n >= 1 << 10 => format!("{:.0} KB", n as f64 / 1024.0),
         n => format!("{n} B"),
@@ -205,6 +206,7 @@ mod tests {
         assert_eq!(safe_name("x:y?.txt"), "x_y_.txt");
         assert_eq!(safe_name(""), "file");
         assert_eq!(human_size(2048), "2 KB");
+        assert_eq!((human_size(MAX_A2A), human_size(3 << 19)), ("20 MB".into(), "1.5 MB".into()));
     }
 
     #[test]

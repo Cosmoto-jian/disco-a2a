@@ -55,7 +55,7 @@ async fn streams_echo_over_jsonrpc() {
         .await
         .unwrap();
     assert_eq!(agent.card.name, "echo");
-    let events: Vec<AgentEvent> = agent.prompt("ctx-1", "hi").await.unwrap().collect().await;
+    let events: Vec<AgentEvent> = agent.prompt("ctx-1", "hi", &[]).await.unwrap().collect().await;
     assert!(events.contains(&AgentEvent::Phase { phase: TaskPhase::Working }), "{events:?}");
     assert!(events.contains(&AgentEvent::TextChunk { text: "echo:hi".into() }), "{events:?}");
     assert!(matches!(events.last(), Some(AgentEvent::Done { phase: TaskPhase::Completed, .. })), "{events:?}");
@@ -115,11 +115,11 @@ async fn prefixed_share_with_bearer() {
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
 
     let bad = RemoteAgent::connect(&base, Credential::Header { name: "authorization".into(), value: "Bearer nope".into() }).await.unwrap();
-    let ev: Vec<AgentEvent> = match bad.prompt("c", "hi").await { Ok(s) => s.collect().await, Err(_) => vec![] };
+    let ev: Vec<AgentEvent> = match bad.prompt("c", "hi", &[]).await { Ok(s) => s.collect().await, Err(_) => vec![] };
     assert!(!ev.iter().any(|e| matches!(e, AgentEvent::TextChunk { .. })), "{ev:?}");
 
     let agent = RemoteAgent::connect(&base, Credential::Header { name: "authorization".into(), value: "Bearer s3cret".into() }).await.unwrap();
-    let events: Vec<AgentEvent> = agent.prompt("ctx", "hi").await.unwrap().collect().await;
+    let events: Vec<AgentEvent> = agent.prompt("ctx", "hi", &[]).await.unwrap().collect().await;
     let text: String = events.iter().filter_map(|e| match e { AgentEvent::TextChunk { text } => Some(text.as_str()), _ => None }).collect();
     assert_eq!(text, "hello", "{events:?}");
     assert!(matches!(events.last(), Some(AgentEvent::Done { phase: TaskPhase::Completed, .. })), "{events:?}");

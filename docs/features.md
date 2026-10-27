@@ -8,7 +8,7 @@
 - `手动验证` = 无法离线确定性测试（真实 Discord 网关、Tailscale、系统对话框、更新服务器），后面写手动步骤。
 - `UI` = 纯界面行为，由 ui-test/ 与 `notes/ui-feature-inventory.md` 守护，本文件只登记。
 
-v1.6.5 基线新增的 selftest 检查在下表中用 ★ 标出。
+v1.6.5 基线新增的 selftest 检查在下表中用 ★ 标出；v1.8.0 跨设备传文件新增的用 ◆ 标出。
 
 ## 私聊
 
@@ -28,7 +28,7 @@ v1.6.5 基线新增的 selftest 检查在下表中用 ★ 标出。
 | 失败提示 | 常见错误（Claude 原生二进制、os error 193、未登录、超时）附 💡 提示 | UT:lib::hints_for_known_errors, ST:自检提示 |
 | 记住命令 | `记住 …`/`/remember …` 存进该 agent 的记忆，不触发回复；「记住了吗？」不算 | ST:记住(开), ST:记住了吗？ 不当成记住, UT:lib::remember_needs_a_separator |
 | 回答里的【记住】 | agent 回答中以【记住】开头的行存进它的记忆（记忆开时） | ★ST:回答里的【记住】存进记忆 |
-| 发文件 `send_file` | 文件复制进会话共享空间，贴出路径和 SHA-256，不覆盖同名文件 | ST:发文件到共享空间, UT:files::copy_in_hashes_and_never_overwrites, UT:files::names_and_sizes |
+| 发文件 `send_file` | 文件复制进会话共享空间，贴出路径和 SHA-256，不覆盖同名文件（会话里有其他设备上的 agent 时见「跨设备传文件」） | ST:发文件到共享空间, UT:files::copy_in_hashes_and_never_overwrites, UT:files::names_and_sizes |
 
 ## 群聊 / Discord
 
@@ -114,6 +114,9 @@ v1.6.5 基线新增的 selftest 检查在下表中用 ★ 标出。
 | Tailscale 检测 | CLI Running 用 Self IP，否则扫描 Tailscale 网卡；给出能操作的原因 | UT:tailnet::own_ips_only_while_running, interface_fallback_only_takes_tailscale, why_not_says_what_to_do；手动验证：两台登录 Tailscale 的机器互发邀请并聊天 |
 | 设备身份 whois | 非回环连接用 `tailscale whois` 识别设备并套规则；无 CLI 且规则严格时拒绝 | 手动验证：设 allowlist 只含另一台设备，第三台用邀请码连接应被拒 |
 | 对方群候选 | 客人在 Discord 群用共享 agent 时（含 `team:group:<ch>:<a>`、`ask:<a>:group:<ch>`）记为 `group:<ch>`，状态重置为确认中；私聊不覆盖 | ★ST:对方群 peer_turn 记下候选群（team:/ask: 形式），私聊不覆盖，换群重新确认, ST:对方群可回话 |
+| 跨设备传文件 访客 → 主人 | 和共享来的（A2A）agent 的会话里附件或 MCP `send_file`：先放进本地共享空间，再随下一条消息作为 A2A 文件部件（inline base64）发过去；主人端 guard 取出文件（绕开 A2A 服务器 10 MB 正文上限），校验大小与 SHA-256，用 safe_name 存进 `peer:<id>` 共享空间，会话里显示 📎，agent 的提示里带保存路径和完整 SHA-256；每条消息合计 ≤20 MB；没送到（连不上）的文件留到下一条 | ◆ST:跨设备文件 访客附件随下一条消息送达，主人校验 SHA 后存下并告诉 agent, UT:disco-a2a file_tests::file_part_survives_the_wire；手动验证：两台电脑经 Tailscale 接入邀请码，访客在私聊附一个 5–15 MB 文件再发一句话，主人端 peer 会话出现 📎 且 agent 能读到文件 |
+| 跨设备传文件 主人 agent → 访客 | 朋友会话里 agent 只有 `send_file` 一个 MCP 工具；文件只在对方这一轮进行中发回（A2A 文件部件带 url），访客 Disco 用同一共享 token 到同一来源取一次（1 小时内），校验 SHA 后存进自己的会话空间并显示 📎；「只聊天」共享只能发共享空间里的文件，「需要时问我」其他文件要主人在收件箱同意（5 分钟） | ◆ST:跨设备文件 主人的 agent 用 MCP send_file 发回访客（只聊天只能发共享空间里的）, ◆ST:跨设备文件 需要时问我：主人拒绝不发、同意后对方不在线也不发, ST:MCP 伪造 context 被拒；手动验证：主人的 Claude 在朋友会话里被要求「把刚才那个文件发回给我」，访客端出现 📎 |
+| 跨设备传文件 限制与安全 | >20 MB 在附件、MCP、接收三处都拒绝并给中文原因；SHA 不符或不完整的文件不落盘；文件名只取安全的基名；主人旁观 peer 会话不能发文件；取回地址需共享 token、只能取一次 | ◆ST:跨设备文件 超过 20 MB 被拒（附件、MCP、接收）, ◆ST:跨设备文件 SHA 不符或不完整就丢弃，文件名不能越界, ◆ST:跨设备文件 旁观中不能发、取回地址要共享 token 且只能取一次 |
 | 对方群回话 `peer_check` | 只有 Bot 能看到频道且主人账号在该服务器时才能说话；否则只读并说明缺什么 | ST:对方群需你和 Bot 都在, ★ST:对方群 peer_turn …（peer_check 返回原因）；手动验证：朋友把你的 Bot 和你拉进他的服务器，你的 agent 被 @ 后，peer 会话出现输入框 |
 
 ## Agent 接入（ACP / OpenAI / A2A / 邀请码）
@@ -140,7 +143,7 @@ v1.6.5 基线新增的 selftest 检查在下表中用 ★ 标出。
 | remember / memory_read | 按 self/group/all 存取；记忆关时拒绝 | ★ST:分层记忆 self/group/all 各归其层，新会话按层拿到 |
 | overview 工具 | 一行一个 agent（忙碌时长、分支、步骤） | UT:mcp::agent_lines |
 | stdio 代理 | `--mcp` 代理：app 不在时返回空工具列表 | UT:mcp::offline_is_an_empty_server |
-| post / send_file 工具 | post 发到群，被 @ 的成员会回答；send_file 放进共享空间 | ★ST:MCP post 叫来被 @ 的成员、send_file 放进空间 |
+| post / send_file 工具 | post 发到群，被 @ 的成员会回答；send_file 放进共享空间（会话里有其他设备上的 agent 时也随下一条消息发给它） | ★ST:MCP post 叫来被 @ 的成员、send_file 放进空间 |
 
 ## 头像 / 改名 / 重启 / 停止
 
@@ -172,7 +175,7 @@ v1.6.5 基线新增的 selftest 检查在下表中用 ★ 标出。
 |---|---|---|
 | 打开链接 `open_url` | 只打开 discord.com、github.com/Cosmoto-jian、tailscale.com | ★ST:只打开白名单链接、只显示数据目录里的文件 |
 | 显示文件 `reveal_path` | 只显示 Disco 数据目录里存在的文件，拒绝 `..` 和外部路径 | ★ST:只打开白名单链接、只显示数据目录里的文件 |
-| 朋友会话隔离 | `peer:` 会话没有记忆、没有 MCP 工具 | ST:MCP 伪造 context 被拒 |
+| 朋友会话隔离 | `peer:` 会话没有记忆；MCP 只有 `send_file`（只能发回给这位朋友），读群文档等一律拒绝 | ST:MCP 伪造 context 被拒 |
 | 冒充防护 | 外来 webhook 永远不是主人；保留名不能用 | ST:Discord 别的 Disco 的 webhook 叫 me/m1 也不冒充, ST:保留名称不能用 |
 | 密钥 | 所有密钥存在一条钥匙串/凭据管理器项（Windows 分片）；selftest 用内存保险箱 | 手动验证：设置 → 一键诊断「钥匙串 可读写」 |
 | 存储安全 | 全文搜索查询防注入；作用域隔离 | UT:disco-store fts_query_is_injection_safe, scopes_are_isolated_and_quarantine_hides |
@@ -196,7 +199,7 @@ v1.6.5 基线新增的 selftest 检查在下表中用 ★ 标出。
 | messages, send | ST:messages, ST:dm send |
 | inbox, inbox_answer | ★ST:提问 空回答不算、自由回答、全部停止撤回 |
 | net_policy, net_policy_set | ★ST:免打扰 net_policy_set 往返，期间拒绝且不扣额度 |
-| send_file | ST:发文件到共享空间 |
+| send_file | ST:发文件到共享空间, ◆ST:跨设备文件 访客附件随下一条消息送达…, ◆ST:跨设备文件 旁观中不能发… |
 | team_state, team_files | ST:/team 分工到完成, ★ST:团队黑板文件 |
 | agent_configs, set_agent_config | ST:旧版模型接口 列出模型/切换模型, ★ST:模型选择被保存 |
 | stop_all, resume | ST:stop_all, ST:恢复后私聊 |

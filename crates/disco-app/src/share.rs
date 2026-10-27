@@ -101,10 +101,12 @@ type Out = mpsc::UnboundedSender<AgentEvent>;
 /// Peer turns in flight: (ticket, share id, context, where its events go back to the
 /// guest). Revoking a share takes its entries out, which both cancels those turns and
 /// tells them they were revoked.
-static RUNNING: Mutex<Vec<(u64, String, String, Option<Out>)>> = Mutex::new(Vec::new());
+type Running = (u64, String, String, Option<Out>);
+static RUNNING: Mutex<Vec<Running>> = Mutex::new(Vec::new());
 
 /// Files taken out of guests' messages by `guard`, for `PeerExec` (key → files, when).
-static STAGED_IN: Mutex<Vec<(String, Vec<FilePart>, std::time::Instant)>> = Mutex::new(Vec::new());
+type StagedIn = (String, Vec<FilePart>, std::time::Instant);
+static STAGED_IN: Mutex<Vec<StagedIn>> = Mutex::new(Vec::new());
 
 /// A file the shared agent sent back, until the guest fetches it (once, within an hour).
 struct Staged { key: String, share: String, path: std::path::PathBuf, sha256: String, at: std::time::Instant }
