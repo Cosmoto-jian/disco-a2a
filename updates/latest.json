@@ -1,19 +1,19 @@
 {
-  "version": "1.7.0",
-  "notes": "稳定基线：全部功能有对应测试，界面巡检进 CI",
-  "pub_date": "2026-10-27T03:57:37Z",
+  "version": "1.8.0",
+  "notes": "跨设备传文件：通过邀请码共享的 agent 之间可以在聊天里互发文件（最多 20 MB，校验 SHA-256），agent 也能用 send_file 自主发送",
+  "pub_date": "2026-10-27T05:51:11Z",
   "platforms": {
     "darwin-aarch64": {
-      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVUcDdocWFJV0FyVjdDTnV0VXJreEJPWW1peWp6dU1mVkVlMWN2THBvdnZ5T0xIZG00d1dZUTA2SHhzeW1UTVRldTUyUHo3OUhpVUM1MURJYzlBVjgybHNGQTNtc3lYQ3dnPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkzMDczNDU1CWZpbGU6RGlzY29fMS43LjBfdW5pdmVyc2FsLmFwcC50YXIuZ3oKOXFlVUMzZ0ZxSEVueUpiTXN5T3hzYnNwYkN6WGF0UFJrSHltN1QrT0pYSzBoSVllUkRjV3NFekJFc28veUsxeTJSUlF0OTdDbHBScURwRmx6elVaQmc9PQo=",
-      "url": "https://github.com/Cosmoto-jian/disco-a2a/releases/download/v1.7.0/Disco_1.7.0_universal.app.tar.gz"
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVUcDdocWFJV0FyVjVQemNIUWtyYkR1Znc5WElVbXhicWg0ZnFhT1J2amRvcUZKUXpMT1VoVnh0ejJyZHZhV3Q3cTBsd3JIdHhYM2tNazZYaXFPeExKbzZueFc2bE1pdWdFPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkzMDgwMjY5CWZpbGU6RGlzY29fMS44LjBfdW5pdmVyc2FsLmFwcC50YXIuZ3oKZkVmMXNrVUFqOFZYakFPa09tRkhxdGVoM1RDc0pVUUozZHdHMVFPb0JlZU1qNHBrK2hpWnFhckRjcEpzZ09wMC9xeUNCdk9OMlJrZjc0WFNyaENqQ3c9PQo=",
+      "url": "https://github.com/Cosmoto-jian/disco-a2a/releases/download/v1.8.0/Disco_1.8.0_universal.app.tar.gz"
     },
     "darwin-x86_64": {
-      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVUcDdocWFJV0FyVjdDTnV0VXJreEJPWW1peWp6dU1mVkVlMWN2THBvdnZ5T0xIZG00d1dZUTA2SHhzeW1UTVRldTUyUHo3OUhpVUM1MURJYzlBVjgybHNGQTNtc3lYQ3dnPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkzMDczNDU1CWZpbGU6RGlzY29fMS43LjBfdW5pdmVyc2FsLmFwcC50YXIuZ3oKOXFlVUMzZ0ZxSEVueUpiTXN5T3hzYnNwYkN6WGF0UFJrSHltN1QrT0pYSzBoSVllUkRjV3NFekJFc28veUsxeTJSUlF0OTdDbHBScURwRmx6elVaQmc9PQo=",
-      "url": "https://github.com/Cosmoto-jian/disco-a2a/releases/download/v1.7.0/Disco_1.7.0_universal.app.tar.gz"
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVUcDdocWFJV0FyVjVQemNIUWtyYkR1Znc5WElVbXhicWg0ZnFhT1J2amRvcUZKUXpMT1VoVnh0ejJyZHZhV3Q3cTBsd3JIdHhYM2tNazZYaXFPeExKbzZueFc2bE1pdWdFPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkzMDgwMjY5CWZpbGU6RGlzY29fMS44LjBfdW5pdmVyc2FsLmFwcC50YXIuZ3oKZkVmMXNrVUFqOFZYakFPa09tRkhxdGVoM1RDc0pVUUozZHdHMVFPb0JlZU1qNHBrK2hpWnFhckRjcEpzZ09wMC9xeUNCdk9OMlJrZjc0WFNyaENqQ3c9PQo=",
+      "url": "https://github.com/Cosmoto-jian/disco-a2a/releases/download/v1.8.0/Disco_1.8.0_universal.app.tar.gz"
     },
     "windows-x86_64": {
-      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVUcDdocWFJV0FyVjdoWkt1a2dHcFZPN3JMMUUva3YrZ0pNZGRFeUxCSVFFQjlySmlnTVQvb0FPOC9hbVJyV2NSVEplYmV1SS9jeTZUcXVkMGFpbW5kMURHdkpCRVBHY3dZPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkzMDczNDU3CWZpbGU6RGlzY29fMS43LjBfeDY0LXNldHVwLmV4ZQpVR0lNL2ZPQlpYZkc1WEpjWW1sUnZZMU5BS0JOL0xrVWhHbFMrUGlucXFCOC9xL1dmdjhoN1I0NFJOekpjYW9QaFRrd1JnWHdDd0pFaEJUd0N0N09Cdz09Cg==",
-      "url": "https://github.com/Cosmoto-jian/disco-a2a/releases/download/v1.7.0/Disco_1.7.0_x64-setup.exe"
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVUcDdocWFJV0FyVngzdlJ4cmppMWpGSi9HSmxhZ1hZMFRiaThQMFhpUlNxaWxLYzNNbGNJRDgzRGIrY3p4dnN5ZVpJRXNvYzFpSWJSdFBGa05HSnMxK0JyTWhuRFRtelFNPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkzMDgwMjcxCWZpbGU6RGlzY29fMS44LjBfeDY0LXNldHVwLmV4ZQpXcVFrODN3TVlPSGRPWnRaM2VxUHdaak1lZ1RYNCtpSitnVy9TMGtnZFBtazVuQzZEZjJvc1hLUjdYZHhpK3BuNFVUdmg3YUlWa1dJOHZRQUM1MDlDQT09Cg==",
+      "url": "https://github.com/Cosmoto-jian/disco-a2a/releases/download/v1.8.0/Disco_1.8.0_x64-setup.exe"
     }
   }
 }
