@@ -14,6 +14,8 @@ const REDUCED = matchMedia("(prefers-reduced-motion: reduce)").matches;
 // the first character for CJK names), or the picture the user uploaded. People: grey circles.
 // Groups: the group's first character on a tile with a faint offset tile behind it.
 const agentOf = (name) => S.ov?.agents.find((a) => a.name === name);
+// The chat has an agent on another device (A2A): attached files also travel to it.
+const remoteIn = (a, g) => a ? a.kind === "a2a" : !!g && g.members.some((m) => agentOf(m)?.kind === "a2a");
 const CJK = /[\u2e80-\u9fff\uf900-\ufaff\uac00-\ud7af]/;
 const letters = (s) => [...String(s ?? "").replace(/[^\p{L}\p{N}]/gu, "")];
 function initials(name) {
@@ -351,7 +353,7 @@ async function openThread(t) {
   const bottom = peer && !peer.talk
     ? h("div", { class: "peer-note" }, peer.group ? `对方在同步到 Discord 的群里用你的 agent。${peer.missing}` : "你现在只能旁观。想一起聊：对方建一个同步到 Discord 的群，拉你和你的 Bot 进去，再在群里 @ 一次你的 agent，这里就会变成聊天。")
     : h("div", { id: "composer", class: S.teamMode[t] ? "team" : "" },
-      peer ? null : h("button", { class: "ib attach", type: "button", title: "放一个文件到共享空间，agent 都能读到", onclick: () => attachFile(t) }, ic("paperclip")),
+      peer ? null : h("button", { class: "ib attach", type: "button", title: remoteIn(a, g) ? "发文件：放进共享空间，并随下一条消息发给其他设备上的 agent（最多 20 MB）" : "放一个文件到共享空间，agent 都能读到", onclick: () => attachFile(t) }, ic("paperclip")),
       isGroup ? h("button", { class: `team-chip${S.teamMode[t] ? " on" : ""}`, type: "button", title: "团队模式：成员分工并行处理，最后由组长汇总", onclick: () => setTeamMode(t, !S.teamMode[t]) }, ic("squares-four"), "团队") : null,
       h("textarea", { id: "input", rows: 1, placeholder: placeholderFor(t), title: isGroup ? "@名字 叫 agent 回答，@all 一起回答，/help 看群规" : peer ? null : "/ 看它的命令" }),
       sendButton());

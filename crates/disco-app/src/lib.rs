@@ -259,11 +259,17 @@ impl Core {
         let (t, a) = (thread.to_owned(), agent.to_owned());
         let asked = Mutex::new(Vec::new());
         let planned = AtomicBool::new(false);
+        // Files attached in this thread for an agent on another device go with this message.
+        let pending = if row.transport == "a2a" { files::take_pending(agent, thread) } else { Vec::new() };
+        let parts = files::load(&pending).await;
+        let reached = AtomicBool::new(false);
         let res = self
             .hub
-            .ask(&row, &secret_get, context, prompt, |ev| {
+            .ask(&row, &secret_get, context, prompt, &parts, |ev| {
+                reached.store(true, Ordering::Relaxed);
                 if matches!(ev, AgentEvent::Plan { .. }) { planned.store(true, Ordering::Relaxed); self.agents_soon(); }
                 if !tap(ev) { return; }
+                if let AgentEvent::File(f) = ev { self.receive_file(&t, &a, f); return; }
                 if let AgentEvent::PermissionAsked { request_id, title, options } = ev {
                     self.inbox_permission(&t, &a, request_id, title, options);
                     asked.lock().unwrap_or_else(|p| p.into_inner()).push(request_id.clone());
@@ -275,6 +281,8 @@ impl Core {
                 let _ = app.emit("stream", StreamEvt { thread: t.clone(), agent: a.clone(), event: ev.clone() });
             })
             .await;
+        // Files that never got there (nothing came back) wait for the next message.
+        if res.is_err() && !reached.into_inner() { files::requeue(pending); }
         let asked = asked.into_inner().unwrap_or_else(|p| p.into_inner());
         self.inbox_expire(&asked).await;
         // The turn's plan step is gone now; show that.

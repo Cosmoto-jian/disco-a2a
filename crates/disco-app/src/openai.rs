@@ -103,8 +103,7 @@ impl OpenAi {
 
     async fn mcp_call(&self, context: &str, method: &str, params: Value) -> Result<Value, String> {
         let (port, tokens, agent) = self.mcp.as_ref().filter(|_| !self.closed.load(Ordering::Relaxed)).ok_or("Disco 工具不可用")?;
-        // A friend's conversation gets no tools; any other gets a token bound to it.
-        if context.starts_with("peer:") { return Err("Disco 工具不可用".into()); }
+        // Every conversation gets a token bound to it (a friend's reaches only send_file).
         let token = tokens.mint(agent, context);
         let body = json!({ "msg": { "jsonrpc": "2.0", "id": 1, "method": method, "params": params } });
         let r = self.http.post(format!("http://127.0.0.1:{port}/mcp")).bearer_auth(token).json(&body).send().await.map_err(|e| e.to_string())?;

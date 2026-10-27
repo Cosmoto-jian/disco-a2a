@@ -9,7 +9,7 @@ use a2a::{AgentCard, Message, Part, PartContent, Role, SendMessageRequest, TaskS
 use a2a_client::agent_card::AgentCardResolver;
 use a2a_client::middleware::CallInterceptor;
 use a2a_client::{A2AClient, A2AClientFactory, ServiceParams, Transport};
-use disco_types::{AgentEvent, TaskPhase};
+use disco_types::{AgentEvent, FilePart, TaskPhase};
 use futures::{Stream, StreamExt};
 
 #[derive(Debug, thiserror::Error)]
@@ -45,6 +45,10 @@ impl CallInterceptor for AuthInterceptor {
 pub struct RemoteAgent {
     pub card: AgentCard,
     client: A2AClient<Box<dyn Transport>>,
+    /// For fetching files the agent sends back by url: always from `base`'s origin, with `cred`.
+    base: String,
+    cred: Credential,
+    http: reqwest::Client,
 }
 
 impl RemoteAgent {
@@ -59,7 +63,8 @@ impl RemoteAgent {
             check_cred_target(base_url, &serde_json::to_value(&card).unwrap_or_default())
                 .map_err(A2aError::Insecure)?;
         }
-        let mut factory = A2AClientFactory::builder().with_interceptor(Arc::new(AuthInterceptor(cred)));
+        let mut factory = A2AClientFactory::builder().with_interceptor(Arc::new(AuthInterceptor(cred.clone())));
+        let fetcher = http.clone().unwrap_or_default();
         if let Some(c) = http {
             factory = factory
                 .register(Arc::new(a2a_client::jsonrpc::JsonRpcTransportFactory::new(Some(c.clone()))))
@@ -67,21 +72,73 @@ impl RemoteAgent {
         }
         let factory = factory.build();
         let client = factory.create_from_card(&card).await?;
-        Ok(Self { card, client })
+        Ok(Self { card, client, base: base_url.to_owned(), cred, http: fetcher })
     }
 
-    /// Send a text prompt in `context_id` and stream normalised events.
+    /// Send a text prompt (with any files, as inline A2A file parts) in `context_id`
+    /// and stream normalised events.
     pub async fn prompt(
         &self,
         context_id: &str,
         text: &str,
+        files: &[FilePart],
     ) -> Result<impl Stream<Item = AgentEvent> + Send + 'static, A2aError> {
-        let mut message = Message::new(Role::User, vec![Part::text(text)]);
+        let parts = std::iter::once(Part::text(text)).chain(files.iter().map(file_part)).collect();
+        let mut message = Message::new(Role::User, parts);
         message.context_id = Some(context_id.to_owned());
         let req = SendMessageRequest { message, configuration: None, metadata: None, tenant: None };
         let raw = self.client.send_streaming_message(&req).await?;
         Ok(raw.flat_map(|ev| futures::stream::iter(map_event(ev))))
     }
+}
+
+impl RemoteAgent {
+    /// Download a file the agent sent back by url. Only the url's path is used, joined to
+    /// the agent's own origin, so the credential never goes anywhere else. At most `max` bytes.
+    pub async fn fetch(&self, url: &str, max: u64) -> Result<Vec<u8>, String> {
+        let base = url::Url::parse(&self.base).map_err(|e| e.to_string())?;
+        let path = url::Url::parse(url).or_else(|_| base.join(url)).map_err(|e| e.to_string())?;
+        let mut at = base.clone();
+        at.set_path(path.path());
+        at.set_query(None);
+        let mut req = self.http.get(at);
+        if let Credential::Header { name, value } = &self.cred { req = req.header(name.as_str(), value.as_str()); }
+        let mut r = req.send().await.map_err(|e| e.to_string())?;
+        if !r.status().is_success() { return Err(format!("HTTP {}", r.status())); }
+        let mut out = Vec::new();
+        while let Some(c) = r.chunk().await.map_err(|e| e.to_string())? {
+            out.extend_from_slice(&c);
+            if out.len() as u64 > max { return Err("文件太大".into()); }
+        }
+        Ok(out)
+    }
+}
+
+/// A2A file part: bytes inline (or a url), with name, type, size and SHA-256 in metadata.
+pub fn file_part(f: &FilePart) -> Part {
+    let mut p = match &f.url { Some(u) if f.bytes.is_empty() => Part::url(u.clone()), _ => Part::raw(f.bytes.clone()) };
+    p.filename = Some(f.name.clone());
+    p.media_type = f.mime.clone();
+    p.metadata = Some([("sha256".to_owned(), f.sha256.clone().into()), ("size".to_owned(), f.size.into())].into_iter().collect());
+    p
+}
+
+/// The file in an A2A part, if it is one (raw bytes or a url).
+pub fn part_file(p: &Part) -> Option<FilePart> {
+    let (bytes, url) = match &p.content {
+        PartContent::Raw(b) => (b.clone(), None),
+        PartContent::Url(u) => (Vec::new(), Some(u.clone())),
+        _ => return None,
+    };
+    let meta = |k: &str| p.metadata.as_ref().and_then(|m| m.get(k).cloned());
+    Some(FilePart {
+        name: p.filename.clone().unwrap_or_else(|| "file".into()),
+        mime: p.media_type.clone(),
+        size: meta("size").and_then(|v| v.as_u64()).unwrap_or(bytes.len() as u64),
+        sha256: meta("sha256").and_then(|v| v.as_str().map(str::to_lowercase)).unwrap_or_default(),
+        url,
+        bytes,
+    })
 }
 
 fn phase(s: &TaskState) -> TaskPhase {
@@ -100,7 +157,7 @@ fn phase(s: &TaskState) -> TaskPhase {
 fn texts(parts: &[Part]) -> impl Iterator<Item = AgentEvent> + '_ {
     parts.iter().filter_map(|p| match &p.content {
         PartContent::Text(t) => Some(AgentEvent::TextChunk { text: t.clone() }),
-        _ => None,
+        _ => part_file(p).map(AgentEvent::File),
     })
 }
 
@@ -178,6 +235,24 @@ pub fn check_cred_target(base_url: &str, card: &serde_json::Value) -> Result<(),
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod file_tests {
+    use super::*;
+
+    #[test]
+    fn file_part_survives_the_wire() {
+        let f = FilePart { name: "a b.txt".into(), mime: Some("text/plain".into()), size: 5, sha256: "ab".repeat(32), url: None, bytes: b"hello".to_vec() };
+        let json = serde_json::to_string(&file_part(&f)).unwrap();
+        assert!(json.contains("\"raw\":\"aGVsbG8=\""), "{json}");
+        let back: Part = serde_json::from_str(&json).unwrap();
+        assert_eq!(part_file(&back), Some(f.clone()));
+        let by_url = FilePart { bytes: Vec::new(), url: Some("http://100.64.0.1:7480/a/x/f/k".into()), ..f };
+        let back: Part = serde_json::from_str(&serde_json::to_string(&file_part(&by_url)).unwrap()).unwrap();
+        assert_eq!(part_file(&back), Some(by_url));
+        assert_eq!(part_file(&Part::text("hi")), None);
+    }
 }
 
 #[cfg(test)]

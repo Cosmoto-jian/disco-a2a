@@ -118,7 +118,7 @@ pub fn start(core: Arc<Core>) {
 #[derive(serde::Deserialize)]
 struct Envelope { msg: Value }
 
-/// What a friend's session counts as: no tools.
+/// What a friend's session counts as: only `send_file` (back to the friend's device).
 const PEER: &str = "peer:";
 
 async fn handle(State(core): State<Arc<Core>>, headers: HeaderMap, body: String) -> Response {
@@ -142,7 +142,12 @@ async fn handle(State(core): State<Arc<Core>>, headers: HeaderMap, body: String)
             "instructions": "Disco 是你所在的多 agent 协作应用。用这些工具在群里发言、请教其他 agent、维护待办和群文档、保存长期记忆。不确定自己在哪时先调用 overview。",
         })),
         "ping" => Ok(json!({})),
-        "tools/list" if context.starts_with(PEER) => Ok(json!({ "tools": [] })),
+        "tools/list" if context.starts_with(PEER) => Ok(json!({ "tools": tools().as_array().into_iter().flatten().filter(|t| t["name"] == "send_file").map(|t| {
+            let mut t = t.clone();
+            t["description"] = json!("把一个文件直接发给正在和你对话的朋友（在另一台设备上，最多 20 MB）。对方的 Disco 会校验 SHA-256 后存进它的会话。");
+            if let Some(p) = t["inputSchema"]["properties"].as_object_mut() { p.remove("group"); }
+            t
+        }).collect::<Vec<_>>() })),
         "tools/list" => Ok(json!({ "tools": tools() })),
         "tools/call" => {
             let name = params.get("name").and_then(Value::as_str).unwrap_or("").to_owned();
@@ -186,7 +191,7 @@ fn tools() -> Value {
           "inputSchema": { "type": "object", "properties": { "content": { "type": "string" }, "mode": { "type": "string", "enum": ["append", "replace"] }, "group": group }, "required": ["content"] } },
         { "name": "remember", "description": "保存一条长期记忆，以后的新会话都会看到。scope：self 只给你自己（默认），group 给当前群的所有成员，all 给所有 agent。topic 是主题（如 code-style、user-prefs），同主题的记忆存在一起。只记持久的事实和偏好。",
           "inputSchema": { "type": "object", "properties": { "text": { "type": "string" }, "scope": { "type": "string", "enum": ["self", "group", "all"] }, "topic": { "type": "string" } }, "required": ["text"] } },
-        { "name": "send_file", "description": "把一个文件放进当前群或私聊的共享空间，并在会话里贴出路径和 SHA-256，群成员都能读到。",
+        { "name": "send_file", "description": "把一个文件发到当前群或私聊：放进共享空间并在会话里贴出路径和 SHA-256，群成员都能读到。会话里有其他设备上的 agent（通过邀请码共享来的）时，文件也会随下一条消息发给它（最多 20 MB）。",
           "inputSchema": { "type": "object", "properties": { "path": { "type": "string", "description": "文件的绝对路径" }, "note": { "type": "string", "description": "附言（可选）" }, "group": group }, "required": ["path"] } },
         { "name": "memory_read", "description": "读长期记忆：不给 topic 时返回该层的索引（MEMORY.md），给 topic 返回该主题的全部记忆。",
           "inputSchema": { "type": "object", "properties": { "scope": { "type": "string", "enum": ["self", "group", "all"] }, "topic": { "type": "string" } } } },
@@ -241,9 +246,14 @@ impl Call<'_> {
     }
 
     async fn run(&self, name: &str, args: &Value) -> Result<String, String> {
-        // A friend's session on a shared agent must never reach the owner's groups or notes.
+        // A friend's session on a shared agent must never reach the owner's groups or notes:
+        // the one tool there sends a file back to the friend.
         if self.context.starts_with(PEER) {
-            return Err("这是朋友通过共享访问的会话，Disco 工具在这里不可用".into());
+            return match (name, s(args, "path")) {
+                ("send_file", Some(path)) => self.core.peer_send_file(self.context, self.agent, path, s(args, "note").unwrap_or("")).await,
+                ("send_file", None) => Err("path 不能为空".into()),
+                _ => Err("这是朋友通过共享访问的会话，这里只能用 send_file 把文件发给对方".into()),
+            };
         }
         if name != "overview" && self.core.paused.load(std::sync::atomic::Ordering::Relaxed) {
             return Err("用户已全部停止，暂不执行".into());

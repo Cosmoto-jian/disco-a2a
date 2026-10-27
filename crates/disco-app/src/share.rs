@@ -3,9 +3,10 @@
 //! The owner's Disco serves each shared agent as an A2A endpoint at
 //! `http://<tailscale-host>:<port>/a/<share-id>`. Every share has its own random
 //! bearer token (kept in the vault) that the owner can revoke at any time. Only
-//! loopback and Tailscale peers may connect (the server listens only on
-//! 127.0.0.1 and this machine's own Tailscale addresses), only the two "send
-//! message" methods are accepted, and tool permissions are decided on the owner's machine.
+//! loopback and Tailscale peers may connect (checked per connection by `guard`),
+//! only the two "send message" methods are accepted (plus fetching a file the agent
+//! sent back), and tool permissions are decided on the owner's machine. Files go both
+//! ways as A2A file parts (at most 20 MB): inline from the guest, by url back to it.
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -20,18 +21,24 @@ use axum::http::{HeaderValue, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use disco_store::Store;
-use disco_types::{AgentEvent, PermissionDecision};
+use disco_types::{AgentEvent, FilePart, PermissionDecision};
 use tauri::Manager;
 use futures::stream::{self, BoxStream};
 use serde::{Deserialize, Serialize};
+use sha2::Digest;
 use tokio::sync::mpsc;
 
+use crate::files::{MAX_A2A, file_line, human_size, safe_name};
 use crate::{CmdResult, Core, St, err, secret_del, secret_get, secret_set, tailnet};
 
 pub const SHARE: &str = "share/";
 const PORTS: std::ops::RangeInclusive<u16> = 7480..=7489;
 const SHARE_HEADER: &str = "x-disco-share";
 const PEER_HEADER: &str = "x-disco-peer";
+/// Key of the files `guard` took out of a guest's message (see `take_files`).
+const FILES_HEADER: &str = "x-disco-files";
+/// A guest message may carry up to `MAX_A2A` of files, base64 inline.
+const BODY_MAX: usize = (MAX_A2A * 4 / 3) as usize + (1 << 20);
 const INVITE_PREFIX: &str = "disco1:";
 /// One answer for a bad token, an unknown share and a revoked one: nobody learns which ids exist.
 const GONE: &str = "邀请码无效或共享已被撤销，请让对方重新发一个";
@@ -89,18 +96,30 @@ fn refund_quota(db: &Store, key: &str) {
     let _ = db.set_setting(key, &if left == 0 { String::new() } else { left.to_string() });
 }
 
-/// Peer turns in flight: (ticket, share id, context). Revoking a share takes its
-/// entries out, which both cancels those turns and tells them they were revoked.
-static RUNNING: Mutex<Vec<(u64, String, String)>> = Mutex::new(Vec::new());
+type Out = mpsc::UnboundedSender<AgentEvent>;
+
+/// Peer turns in flight: (ticket, share id, context, where its events go back to the
+/// guest). Revoking a share takes its entries out, which both cancels those turns and
+/// tells them they were revoked.
+static RUNNING: Mutex<Vec<(u64, String, String, Option<Out>)>> = Mutex::new(Vec::new());
+
+/// Files taken out of guests' messages by `guard`, for `PeerExec` (key → files, when).
+static STAGED_IN: Mutex<Vec<(String, Vec<FilePart>, std::time::Instant)>> = Mutex::new(Vec::new());
+
+/// A file the shared agent sent back, until the guest fetches it (once, within an hour).
+struct Staged { key: String, share: String, path: std::path::PathBuf, sha256: String, at: std::time::Instant }
+static STAGED_OUT: Mutex<Vec<Staged>> = Mutex::new(Vec::new());
+
+fn key() -> String { uuid::Uuid::new_v4().simple().to_string() }
 
 /// A registered peer turn; unregisters on drop.
 struct Ticket(u64);
 
 impl Ticket {
-    fn new(id: &str, context: &str) -> Self {
+    fn new(id: &str, context: &str, out: Option<Out>) -> Self {
         static NEXT: AtomicU64 = AtomicU64::new(0);
         let t = NEXT.fetch_add(1, Ordering::Relaxed);
-        RUNNING.lock().unwrap_or_else(|p| p.into_inner()).push((t, id.to_owned(), context.to_owned()));
+        RUNNING.lock().unwrap_or_else(|p| p.into_inner()).push((t, id.to_owned(), context.to_owned(), out));
         Self(t)
     }
 }
@@ -206,10 +225,17 @@ impl Core {
 
     /// Run one guest message as a turn of the shared agent. The owner sees it live
     /// in the `peer:<id>` thread, where permission prompts also appear.
-    pub(crate) async fn peer_turn(&self, id: &str, device: &str, guest_ctx: &str, text: &str, out: mpsc::UnboundedSender<AgentEvent>) -> Result<String, String> {
+    pub(crate) async fn peer_turn(&self, id: &str, device: &str, guest_ctx: &str, text: &str, out: Out) -> Result<String, String> {
+        self.peer_turn_files(id, device, guest_ctx, text, Vec::new(), out).await
+    }
+
+    /// `peer_turn` with the files the guest's message carried: each is checked (size,
+    /// SHA-256), saved in the `peer:<id>` space, shown there, and its path and hash
+    /// added to the prompt.
+    pub(crate) async fn peer_turn_files(&self, id: &str, device: &str, guest_ctx: &str, text: &str, files: Vec<FilePart>, out: Out) -> Result<String, String> {
         let context = format!("peer:{id}|{guest_ctx}");
         // Register before reading the share: a revoke either comes first (no share) or finds the ticket.
-        let ticket = Ticket::new(id, &context);
+        let ticket = Ticket::new(id, &context, Some(out.clone()));
         let share = self.share(id).ok_or("这个共享已被撤销")?;
         if self.net_policy().quiet_now() { return Err("对方设置了免打扰，现在不处理消息，请稍后再试".into()); }
         let key = used_key(id);
@@ -233,7 +259,21 @@ impl Core {
                 if core.peer_check(&id).await != before { core.agents_changed(); }
             });
         }
-        self.post_message(&thread, &share.guest, text);
+        let mut prompt = text.to_owned();
+        if !files.is_empty() {
+            let dir = crate::mcp::space_dir(self, &thread).map(|d| d.join("files"));
+            for f in &files {
+                match dir.clone().and_then(|d| crate::files::save_incoming(&d, f)) {
+                    Ok((dst, size, hash)) => {
+                        let name = safe_name(&f.name);
+                        self.post_message(&thread, &share.guest, &file_line("", &name, size, &hash, &dst));
+                        prompt.push_str(&format!("\n\n[{} 从另一台设备发来文件] {name}（{}，SHA-256 {hash}）已保存在：{}", share.guest, human_size(size), dst.display()));
+                    }
+                    Err(e) => { refund_quota(&self.db(), &key); return Err(e); }
+                }
+            }
+        }
+        if !text.trim().is_empty() { self.post_message(&thread, &share.guest, text); }
         let deny = share.mode != "ask";
         let core = self.app.state::<Arc<Core>>().inner().clone();
         let agent = share.agent.clone();
@@ -242,7 +282,7 @@ impl Core {
         let (started, stopping) = (Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)));
         let seen = started.clone();
         // Returns false for events the owner's UI should not see (refused permission prompts).
-        let res = self.turn_with(&thread, &share.agent, &context, text, move |ev| {
+        let res = self.turn_with(&thread, &share.agent, &context, prompt.trim_start(), move |ev| {
             seen.store(true, Ordering::Relaxed);
             if !live(tk) {
                 // Revoked after the turn began: revoke's own cancel may have come too early.
@@ -274,6 +314,96 @@ impl Core {
             Err(e) => self.post_message(&thread, "system", &crate::fail_line(&share.agent, e)),
         }
         res
+    }
+}
+
+impl Core {
+    /// The shared agent sends a file back to the friend (MCP `send_file` in a `peer:`
+    /// session). It travels with the friend's running turn as an A2A file part whose url
+    /// the friend's Disco fetches once with its share token. "chat" shares may only send
+    /// files from the share's own space; "ask" shares ask the owner for anything else.
+    pub(crate) async fn peer_send_file(&self, context: &str, agent: &str, path: &str, note: &str) -> Result<String, String> {
+        let id = context.strip_prefix("peer:").and_then(|r| r.split('|').next()).filter(|i| !i.is_empty()).ok_or("这里不是朋友的共享会话")?;
+        let share = self.share(id).ok_or("这个共享已被撤销")?;
+        let (p, _) = crate::files::sendable(path, MAX_A2A)?;
+        let thread = format!("peer:{id}");
+        let space = crate::mcp::space_dir(self, &thread)?;
+        let inside = std::fs::canonicalize(&p).ok().zip(std::fs::canonicalize(&space).ok()).is_some_and(|(f, s)| f.starts_with(s));
+        if !inside {
+            if share.mode != "ask" {
+                return Err(format!("这个共享是「只聊天」：只能发回共享空间里的文件（{}）。其他文件要主人把共享改成「需要时问我」", space.display()));
+            }
+            let q = format!("{agent} 想把 {} 发给 {}，允许吗？", p.display(), share.guest);
+            let (qid, rx) = self.inbox_question(&thread, agent, &q, vec!["允许".into(), "拒绝".into()], false);
+            self.hub.yield_slot(agent, context);
+            match tokio::time::timeout(std::time::Duration::from_secs(300), rx).await {
+                Ok(Ok(a)) if a == "允许" => {}
+                Ok(_) => return Err("主人没有同意发送这个文件".into()),
+                Err(_) => { self.inbox_withdraw(&qid, "（已超时）"); return Err("主人 5 分钟内没有回应，文件没有发出".into()); }
+            }
+        }
+        let out = RUNNING.lock().unwrap_or_else(|p| p.into_inner()).iter().find(|e| e.2 == context).and_then(|e| e.3.clone())
+            .ok_or("对方这一轮已经结束：文件只能在对方发来消息的这一轮里发回去")?;
+        let src = p.clone();
+        let (size, sha256) = tokio::task::spawn_blocking(move || std::fs::read(&src).map(|b| (b.len() as u64, hex::encode(sha2::Sha256::digest(&b)))))
+            .await.map_err(err)?.map_err(|e| format!("读不了文件：{e}"))?;
+        if size > MAX_A2A { return Err(format!("文件超过 {}，不能发到其他设备", human_size(MAX_A2A))); }
+        let (k, name) = (key(), safe_name(&p.to_string_lossy()));
+        {
+            let mut st = STAGED_OUT.lock().unwrap_or_else(|p| p.into_inner());
+            st.retain(|s| s.at.elapsed().as_secs() < 3600);
+            st.push(Staged { key: k.clone(), share: id.to_owned(), path: p.clone(), sha256: sha256.clone(), at: std::time::Instant::now() });
+        }
+        let url = format!("{}/a/{id}/f/{k}", self.share_base().unwrap_or_default());
+        out.send(AgentEvent::File(FilePart { name: name.clone(), mime: None, size, sha256: sha256.clone(), url: Some(url), bytes: Vec::new() }))
+            .map_err(|_| "对方这一轮已经结束：文件只能在对方发来消息的这一轮里发回去")?;
+        self.post_message(&thread, agent, &format!("{}\n已发给 {}", file_line(note, &name, size, &sha256, &p), share.guest));
+        Ok(format!("已发给 {}（在另一台设备上）：{name}（{} · SHA-256 {}）", share.guest, human_size(size), &sha256[..12]))
+    }
+}
+
+/// Move the file parts out of a guest's JSON-RPC message (the A2A server only takes
+/// 10 MB bodies, and the files are verified and saved by `peer_turn_files` anyway).
+fn take_files(v: &mut serde_json::Value) -> Result<Vec<FilePart>, String> {
+    let Some(parts) = v.pointer_mut("/params/message/parts").and_then(|p| p.as_array_mut()) else { return Ok(Vec::new()) };
+    let (mut files, mut bad) = (Vec::new(), false);
+    parts.retain_mut(|p| {
+        if p.get("raw").is_none() { return true; }
+        match serde_json::from_value::<Part>(std::mem::take(p)).ok().and_then(|p| disco_a2a::part_file(&p)) {
+            Some(f) => files.push(f),
+            None => bad = true,
+        }
+        false
+    });
+    if bad { Err("文件格式不对".into()) } else { Ok(files) }
+}
+
+fn stage_in(files: Vec<FilePart>) -> String {
+    let k = key();
+    let mut st = STAGED_IN.lock().unwrap_or_else(|p| p.into_inner());
+    st.retain(|e| e.2.elapsed().as_secs() < 600);
+    st.push((k.clone(), files, std::time::Instant::now()));
+    k
+}
+
+fn take_staged(k: &str) -> Vec<FilePart> {
+    let mut st = STAGED_IN.lock().unwrap_or_else(|p| p.into_inner());
+    st.iter().position(|e| e.0 == k).map(|i| st.remove(i).1).unwrap_or_default()
+}
+
+/// The guest's Disco fetching a file the shared agent sent back: once, unchanged since.
+async fn file_out(axum::extract::Path((id, k)): axum::extract::Path<(String, String)>) -> Response {
+    let staged = {
+        let mut st = STAGED_OUT.lock().unwrap_or_else(|p| p.into_inner());
+        let i = st.iter().position(|s| s.key == k && s.share == id && s.at.elapsed().as_secs() < 3600);
+        i.map(|i| st.remove(i))
+    };
+    let Some(s) = staged else { return deny(StatusCode::NOT_FOUND, "文件已取走或已过期") };
+    let read = tauri::async_runtime::spawn_blocking(move || std::fs::read(&s.path).map(|b| (hex::encode(sha2::Sha256::digest(&b)) == s.sha256, b))).await;
+    match read {
+        Ok(Ok((true, b))) => ([(header::CONTENT_TYPE, "application/octet-stream")], b).into_response(),
+        Ok(Ok(_)) => deny(StatusCode::CONFLICT, "文件在发出后被改动了"),
+        _ => deny(StatusCode::NOT_FOUND, "文件不见了"),
     }
 }
 
@@ -352,6 +482,7 @@ fn router(core: Arc<Core>) -> axum::Router {
     let handler = Arc::new(DefaultRequestHandler::new(PeerExec(core.clone()), InMemoryTaskStore::new()));
     axum::Router::new()
         .route("/a/{id}/.well-known/agent-card.json", axum::routing::get(card))
+        .route("/a/{id}/f/{key}", axum::routing::get(file_out))
         .with_state(core.clone())
         .nest("/a/{id}/jsonrpc", a2a_server::jsonrpc::jsonrpc_router(handler))
         .layer(middleware::from_fn_with_state(core, guard))
@@ -393,11 +524,24 @@ async fn guard(State(core): State<Arc<Core>>, ConnectInfo(peer): ConnectInfo<Soc
         }
     }
     let (mut parts, body) = req.into_parts();
-    let Ok(bytes) = to_bytes(body, 1 << 20).await else { return deny(StatusCode::PAYLOAD_TOO_LARGE, "too large") };
-    let method = serde_json::from_slice::<serde_json::Value>(&bytes).ok().and_then(|v| v["method"].as_str().map(str::to_owned)).unwrap_or_default();
+    // A file the shared agent sent back (`peer_send_file`), fetched with the same token.
+    if parts.method == axum::http::Method::GET && tail.starts_with("f/") { return next.run(Request::from_parts(parts, body)).await; }
+    let Ok(bytes) = to_bytes(body, BODY_MAX).await else { return deny(StatusCode::PAYLOAD_TOO_LARGE, "消息太大：文件最多 20 MB") };
+    let mut v = serde_json::from_slice::<serde_json::Value>(&bytes).unwrap_or_default();
+    let method = v["method"].as_str().unwrap_or_default().to_owned();
     if method != methods::SEND_MESSAGE && method != methods::SEND_STREAMING_MESSAGE {
         return deny(StatusCode::FORBIDDEN, "method not allowed");
     }
+    parts.headers.remove(FILES_HEADER);
+    let bytes = match take_files(&mut v) {
+        Err(e) => return deny(StatusCode::BAD_REQUEST, &e),
+        Ok(files) if files.is_empty() => bytes,
+        Ok(files) if files.iter().map(|f| f.bytes.len() as u64).sum::<u64>() > MAX_A2A => return deny(StatusCode::PAYLOAD_TOO_LARGE, "文件超过 20 MB"),
+        Ok(files) => {
+            parts.headers.insert(FILES_HEADER, HeaderValue::from_str(&stage_in(files)).unwrap_or(HeaderValue::from_static("")));
+            serde_json::to_vec(&v).unwrap_or_default().into()
+        }
+    };
     parts.headers.insert(SHARE_HEADER, HeaderValue::from_str(&id).unwrap_or(HeaderValue::from_static("")));
     parts.headers.insert(PEER_HEADER, HeaderValue::from_str(&who).unwrap_or(HeaderValue::from_static("")));
     next.run(Request::from_parts(parts, Body::from(bytes))).await
@@ -435,6 +579,7 @@ impl AgentExecutor for PeerExec {
     fn execute(&self, ctx: ExecutorContext) -> BoxStream<'static, Result<StreamResponse, A2AError>> {
         let id = ctx.service_params.get(SHARE_HEADER).and_then(|v| v.first()).cloned().unwrap_or_default();
         let device = ctx.service_params.get(PEER_HEADER).and_then(|v| v.first()).cloned().unwrap_or_default();
+        let files = ctx.service_params.get(FILES_HEADER).and_then(|v| v.first()).map(|k| take_staged(k)).unwrap_or_default();
         let text: String = ctx.message.as_ref().map(|m| m.parts.iter().filter_map(|p| match &p.content {
             PartContent::Text(t) => Some(t.as_str()),
             _ => None,
@@ -447,20 +592,25 @@ impl AgentExecutor for PeerExec {
             let (etx, mut erx) = mpsc::unbounded_channel::<AgentEvent>();
             let (fwd_tx, tid, cid) = (tx.clone(), task_id.clone(), context_id.clone());
             let fwd = tauri::async_runtime::spawn(async move {
-                // The first chunk creates the artifact; later ones append to it.
-                let mut append = false;
+                // The first chunk creates the answer artifact; later ones append to it.
+                // Each file the agent sends back is an artifact of its own.
+                let (mut append, mut n) = (false, 0);
                 while let Some(ev) = erx.recv().await {
-                    if let AgentEvent::TextChunk { text } = ev {
-                        let _ = fwd_tx.send(Ok(StreamResponse::ArtifactUpdate(TaskArtifactUpdateEvent {
-                            task_id: tid.clone(), context_id: cid.clone(),
-                            artifact: Artifact { artifact_id: "answer".into(), name: None, description: None, parts: vec![Part::text(text)], metadata: None, extensions: None },
-                            append: Some(append), last_chunk: Some(false), metadata: None,
-                        })));
-                        append = true;
-                    }
+                    let (artifact_id, parts, more) = match ev {
+                        AgentEvent::TextChunk { text } => ("answer".to_owned(), vec![Part::text(text)], append),
+                        AgentEvent::File(f) => { n += 1; (format!("file-{n}"), vec![disco_a2a::file_part(&f)], false) }
+                        _ => continue,
+                    };
+                    let answer = artifact_id == "answer";
+                    let _ = fwd_tx.send(Ok(StreamResponse::ArtifactUpdate(TaskArtifactUpdateEvent {
+                        task_id: tid.clone(), context_id: cid.clone(),
+                        artifact: Artifact { artifact_id, name: None, description: None, parts, metadata: None, extensions: None },
+                        append: Some(more), last_chunk: Some(!answer), metadata: None,
+                    })));
+                    if answer { append = true; }
                 }
             });
-            let res = core.peer_turn(&id, &device, &context_id, &text, etx).await;
+            let res = core.peer_turn_files(&id, &device, &context_id, &text, files, etx).await;
             let _ = fwd.await;
             let _ = tx.send(Ok(match res {
                 Ok(_) => status(&task_id, &context_id, TaskState::Completed, None),
@@ -597,7 +747,7 @@ mod tests {
 
     #[test]
     fn revoke_takes_only_that_shares_turns() {
-        let (a, b) = (Ticket::new("rv-a", "peer:rv-a|x"), Ticket::new("rv-b", "peer:rv-b|y"));
+        let (a, b) = (Ticket::new("rv-a", "peer:rv-a|x", None), Ticket::new("rv-b", "peer:rv-b|y", None));
         assert!(live(a.0) && live(b.0));
         assert_eq!(take_running("rv-a"), vec!["peer:rv-a|x".to_owned()]);
         assert!(!live(a.0) && live(b.0));

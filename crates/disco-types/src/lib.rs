@@ -59,6 +59,23 @@ pub enum AgentEvent {
     Phase { phase: TaskPhase },
     /// Final event. `text` is the full concatenated answer when known.
     Done { phase: TaskPhase, stop_reason: Option<String> },
+    /// A file the agent sent back (a remote agent's A2A file part).
+    File(FilePart),
+}
+
+/// A file travelling between Discos as an A2A file part: inline `bytes`, or a `url` on
+/// the sender's share server that the receiver fetches with the same share token.
+/// The bytes never go to the UI.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct FilePart {
+    pub name: String,
+    pub mime: Option<String>,
+    pub size: u64,
+    /// Lowercase hex SHA-256 of the content, checked by the receiver.
+    pub sha256: String,
+    pub url: Option<String>,
+    #[serde(skip)]
+    pub bytes: Vec<u8>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

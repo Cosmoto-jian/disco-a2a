@@ -289,15 +289,14 @@ impl Hub {
     }
 
     /// The Disco MCP server for `agent`'s sessions: this same executable in `--mcp` mode.
-    /// Each session gets a token bound to its own context; a friend's (`peer:`) session
-    /// gets none, so it sees an empty server.
+    /// Each session gets a token bound to its own context; in a friend's (`peer:`) session
+    /// that token reaches only `send_file` (back to the friend's device).
     fn mcp_for(&self, agent: &str) -> Option<McpStdio> {
         let port = *self.mcp_port.get()?;
         let exe = std::env::current_exe().ok()?;
         self.mcp_tokens.revoke(agent);
         let (tokens, agent) = (self.mcp_tokens.clone(), agent.to_owned());
         let session_env = SessionEnv(Arc::new(move |ctx: &str| {
-            if ctx.starts_with("peer:") { return vec![("DISCO_MCP_PORT".into(), "0".into())]; }
             vec![("DISCO_MCP_PORT".into(), port.to_string()), ("DISCO_MCP_TOKEN".into(), tokens.mint(&agent, ctx))]
         }));
         Some(McpStdio { name: "disco".into(), command: exe, args: vec!["--mcp".into()], env: Vec::new(), session_env: Some(session_env) })
@@ -341,6 +340,7 @@ impl Hub {
         secret: &CredLookup,
         context: &str,
         text: &str,
+        files: &[disco_types::FilePart],
         on_event: impl Fn(&AgentEvent),
     ) -> Result<String, String> {
         // A delegated `ask:` turn runs while its caller holds a slot (and can't ask further),
@@ -367,9 +367,14 @@ impl Hub {
         };
         let outcome = match rt {
             Runtime::A2a(a) => {
-                let mut s = a.prompt(context, text).await.map_err(|e| e.to_string())?;
+                let mut s = a.prompt(context, text, files).await.map_err(|e| e.to_string())?;
                 let mut out = None;
-                while let Some(ev) = s.next().await {
+                while let Some(mut ev) = s.next().await {
+                    // A file sent back by url is fetched from the same share (same token) first;
+                    // a failed fetch arrives empty and the receiver reports it.
+                    if let AgentEvent::File(f) = &mut ev && f.bytes.is_empty() && let Some(u) = f.url.clone() {
+                        f.bytes = a.fetch(&u, crate::files::MAX_A2A).await.unwrap_or_default();
+                    }
                     if let Some(r) = finish(ev) { out = Some(r); break; }
                 }
                 out.unwrap_or(Ok(()))

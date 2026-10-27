@@ -52,6 +52,10 @@
       codex: "需要登录：运行 codex login",
     },
     messages: {
+      "dm:researcher": [
+        { author: "me", body: "把整理好的数据发我", ts: now - 300 },
+        { author: "researcher", body: "📎 data.csv（2.0 MB · SHA-256 9f86d081884c）\n/Users/x/Library/Application Support/dev.cosmoto.disco/spaces/dm-researcher/files/data.csv", ts: now - 290 },
+      ],
       "group:g1": [
         { author: "me", body: "@claude 帮忙看下登录 bug", ts: now - 600 },
         { author: "claude", body: "@jian 已定位，在 session.rs 第 42 行。@codex 你来写补丁", ts: now - 590 },

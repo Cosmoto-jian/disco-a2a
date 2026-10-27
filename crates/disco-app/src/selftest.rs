@@ -274,7 +274,8 @@ pub fn spawn(app: AppHandle, mock: String) {
             let (t, err) = text(&mcp_post(&core, &peer, call("doc_read", serde_json::json!({ "group": gid }))).await?);
             if !err || t.contains("目标") { return Err(format!("朋友会话读到了群文档：{t}")); }
             let list = mcp_post(&core, &peer, serde_json::json!({ "msg": { "jsonrpc": "2.0", "id": 2, "method": "tools/list" } })).await?;
-            if list["result"]["tools"].as_array().is_none_or(|a| !a.is_empty()) { return Err(format!("朋友会话有工具：{list}")); }
+            let names: Vec<&str> = list["result"]["tools"].as_array().into_iter().flatten().filter_map(|t| t["name"].as_str()).collect();
+            if names != ["send_file"] { return Err(format!("朋友会话应只有 send_file：{list}")); }
             if mcp_post(&core, "forged", call("doc_read", serde_json::json!({}))).await.is_ok() { return Err("假 token 通过了".into()); }
             let own = core.hub.mcp_tokens.mint("m1", &gt);
             let (t, err) = text(&mcp_post(&core, &own, call("doc_read", serde_json::json!({}))).await?);
@@ -652,6 +653,110 @@ pub fn spawn(app: AppHandle, mock: String) {
             let s = tool(&core, &mcp_gt, "send_file", json!({ "path": f.display().to_string() })).await?;
             if r.contains("m3") && s.starts_with("已放进共享空间") { Ok(String::new()) } else { Err(format!("{r} / {s}")) } });
         // end v1.6.5 baseline
+
+        // v1.8.0 cross-device files: guest and owner are this same app over a loopback share.
+        use sha2::Digest as _;
+        use disco_types::FilePart;
+        use crate::files::MAX_A2A;
+        let sha = |b: &[u8]| hex::encode(sha2::Sha256::digest(b));
+        let tmp = std::env::temp_dir().join(format!("disco-xfer-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&tmp);
+        let fshare = mk_share("m1", "文件友", "chat", 0).unwrap_or_default();
+        let owner_copy = crate::mcp::space_dir(&core, &format!("peer:{fshare}")).map(|d| d.join("files").join("报告.txt")).unwrap_or_default();
+        let _ = check!("跨设备文件 访客附件随下一条消息送达，主人校验 SHA 后存下并告诉 agent", {
+            let code = crate::share::share_invite(st(), fshare.clone())?;
+            within(20, crate::share::accept_invite(st(), code, Some("fg1".into()))).await??;
+            // 11 MB: more than the A2A server's own 10 MB body limit, so the guard must take it out.
+            let data: Vec<u8> = (0..11u32 << 20).map(|i| (i % 251) as u8).collect();
+            let f = tmp.join("报告.txt");
+            std::fs::write(&f, &data).map_err(|e| e.to_string())?;
+            let r = within(20, crate::send_file(st(), "dm:fg1".into(), f.display().to_string(), None)).await??;
+            if !r.contains("fg1") { return Err(r); }
+            let n = count(&core, "dm:fg1", "fg1");
+            crate::send(st(), "dm:fg1".into(), "__echo__ 看看".into())?;
+            let b = wait_msg(&core, "dm:fg1", "fg1", n, 60).await?;
+            if !b.contains(&sha(&data)) || !b.contains(&owner_copy.display().to_string()) { return Err(b.chars().take(300).collect()); }
+            if std::fs::read(&owner_copy).ok() != Some(data) { return Err("主人那边存的内容不对".into()); }
+            if !last_from(&core, &format!("peer:{fshare}"), "文件友").is_some_and(|l| l.contains("📎 报告.txt")) { return Err("主人的会话里没显示文件".into()); }
+            Ok(String::new()) });
+        let _ = check!("跨设备文件 主人的 agent 用 MCP send_file 发回访客（只聊天只能发共享空间里的）", {
+            let ctx = format!("peer:{fshare}|dm:fg1");
+            let n = count(&core, "dm:fg1", "fg1");
+            crate::send(st(), "dm:fg1".into(), "__hang__".into())?;
+            wait_busy(&core, "m1", true).await?;
+            tokio::time::sleep(Duration::from_millis(1500)).await; // the prompt must reach the agent first
+            let tok = core.hub.mcp_tokens.mint("m1", &ctx);
+            let outside = tmp.join("outside.txt");
+            std::fs::write(&outside, "no").map_err(|e| e.to_string())?;
+            let refused = tool(&core, &tok, "send_file", json!({ "path": outside.display().to_string() })).await;
+            let sent = tool(&core, &tok, "send_file", json!({ "path": owner_copy.display().to_string(), "note": "给你" })).await;
+            let line = within(30, async { loop {
+                let got = core.db().messages("dm:fg1", 50).ok().and_then(|v| v.into_iter().rev().find(|m| m.author == "fg1" && m.body.contains("📎")).map(|m| m.body));
+                if let Some(l) = got && count(&core, "dm:fg1", "fg1") > n { return l; }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            } }).await;
+            core.hub.cancel("m1", &ctx).await;
+            let _ = wait_busy(&core, "m1", false).await;
+            if !refused.as_ref().is_err_and(|e| e.contains("只聊天")) { return Err(format!("空间外的文件：{refused:?}")); }
+            let sent = sent?;
+            let line = line?;
+            let path = line.lines().last().unwrap_or_default().to_owned();
+            if std::fs::read(&path).ok() != std::fs::read(&owner_copy).ok() { return Err(format!("访客收到的不对：{line}")); }
+            Ok(sent) });
+        let _ = check!("跨设备文件 需要时问我：主人拒绝不发、同意后对方不在线也不发", {
+            let id = mk_share("m1", "问我", "ask", 0)?;
+            let tok = core.hub.mcp_tokens.mint("m1", &format!("peer:{id}|dm:x"));
+            let f = tmp.join("secret.txt");
+            std::fs::write(&f, "s").map_err(|e| e.to_string())?;
+            let mut got = Vec::new();
+            for pick in [1, 0] {
+                let (c, t, fp) = (core.clone(), tok.clone(), f.display().to_string());
+                let h = tokio::spawn(async move { tool(&c, &t, "send_file", json!({ "path": fp })).await });
+                let item = within(10, async { loop {
+                    if let Some(i) = core.inbox.list().into_iter().find(|i| i.title.contains("secret.txt")) { return i; }
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                } }).await?;
+                core.inbox_answer(&item.id, inbox::Answer { option: Some(item.options[pick].id.clone()), text: None }, "Disco").await?;
+                got.push(within(10, h).await?.map_err(|e| e.to_string())?);
+            }
+            crate::share::revoke_share(st(), id);
+            match (&got[0], &got[1]) {
+                (Err(a), Err(b)) if a.contains("没有同意") && b.contains("这一轮已经结束") => Ok(String::new()),
+                _ => Err(format!("{got:?}")),
+            } });
+        let _ = check!("跨设备文件 超过 20 MB 被拒（附件、MCP、接收）", {
+            let big = tmp.join("big.bin");
+            std::fs::File::create(&big).and_then(|f| f.set_len(MAX_A2A + 1)).map_err(|e| e.to_string())?;
+            let a = within(10, crate::send_file(st(), "dm:fg1".into(), big.display().to_string(), None)).await?;
+            let tok = core.hub.mcp_tokens.mint("m1", &format!("peer:{fshare}|dm:fg1"));
+            let b = tool(&core, &tok, "send_file", json!({ "path": big.display().to_string() })).await;
+            let c = crate::files::save_incoming(&tmp.join("in"), &FilePart { name: "x".into(), size: MAX_A2A + 1, bytes: vec![0; (MAX_A2A + 1) as usize], ..Default::default() });
+            let _ = std::fs::remove_file(&big);
+            let all = [a.err(), b.err(), c.err()];
+            if all.iter().all(|e| e.as_deref().is_some_and(|e| e.contains("20 MB"))) { Ok(String::new()) } else { Err(format!("{all:?}")) } });
+        let _ = check!("跨设备文件 SHA 不符或不完整就丢弃，文件名不能越界", {
+            let dir = tmp.join("in");
+            let good = FilePart { name: "../../etc/passwd".into(), size: 2, sha256: sha(b"hi"), bytes: b"hi".to_vec(), ..Default::default() };
+            let (p, ..) = crate::files::save_incoming(&dir, &good)?;
+            if p.parent() != Some(dir.as_path()) || p.file_name().and_then(|n| n.to_str()) != Some("passwd") { return Err(p.display().to_string()); }
+            let bad = crate::files::save_incoming(&dir, &FilePart { sha256: "00".repeat(32), ..good.clone() }).err().unwrap_or_default();
+            let short = crate::files::save_incoming(&dir, &FilePart { size: 3, ..good.clone() }).err().unwrap_or_default();
+            let n = std::fs::read_dir(&dir).map(|d| d.count()).unwrap_or(0);
+            if bad.contains("SHA-256") && short.contains("不完整") && n == 1 { Ok(String::new()) } else { Err(format!("{bad} / {short} / {n}")) } });
+        let _ = check!("跨设备文件 旁观中不能发、取回地址要共享 token 且只能取一次", {
+            let f = tmp.join("x.txt");
+            std::fs::write(&f, "x").map_err(|e| e.to_string())?;
+            let e = within(10, crate::send_file(st(), format!("peer:{fshare}"), f.display().to_string(), None)).await?.err().unwrap_or_default();
+            if !e.contains("旁观") { return Err(e); }
+            let (base, http) = (core.share_base()?, crate::openai::client(&[]));
+            let token = crate::secret_get(&format!("share/{fshare}")).ok_or("没有共享 token")?;
+            let url = format!("{base}/a/{fshare}/f/{}", "0".repeat(32));
+            let anon = within(10, http.get(&url).bearer_auth("wrong").send()).await?.map_err(|e| e.to_string())?.status();
+            let gone = within(10, http.get(&url).bearer_auth(&token).send()).await?.map_err(|e| e.to_string())?.status();
+            if anon == 401 && gone == 404 { Ok(String::new()) } else { Err(format!("{anon} {gone}")) } });
+        crate::share::revoke_share(st(), fshare);
+        let _ = within(10, crate::remove_agent(st(), "fg1".into(), Some(true))).await;
+        let _ = std::fs::remove_dir_all(&tmp);
         println!("SELFTEST {}", if fails == 0 { "OK".to_string() } else { format!("{fails} FAILED") });
         std::process::exit(if fails == 0 { 0 } else { 1 });
     });

@@ -554,6 +554,22 @@ class Audit:
         await pg.wait_for_function("S.thread === 'dm:helper2'")
         self.ok("C2 renamed chat reopens", await self.text(".head h2") == "helper2")
 
+    async def remote_files(self):
+        pg = self.pg
+        await self.open("dm:researcher")
+        title = await self.js("document.querySelector('#composer .attach')?.title ?? ''")
+        self.ok("C18 attach in a remote agent's chat says it goes to the other device", "其他设备" in title and "20 MB" in title, title)
+        self.ok("C18 file received from another device renders like a local one", await self.has("#log .b .clipi") and await self.has("#log a.path"))
+        m = await self.mark()
+        await self.step("reveal received", lambda: pg.click("#log a.path"))
+        await self.expect("C18 received file reveals in Finder", "reveal_path", m, lambda a: a.get("path", "").endswith("/spaces/dm-researcher/files/data.csv"))
+        m = await self.mark()
+        await self.step("attach remote", lambda: pg.click("#composer .attach"))
+        await self.expect("C18 attach to a remote agent uses send_file", "send_file", m, lambda a: a.get("thread") == "dm:researcher")
+        await self.open("dm:claude")
+        title = await self.js("document.querySelector('#composer .attach')?.title ?? ''")
+        self.ok("C18 local chat attach title unchanged", "其他设备" not in title and "共享空间" in title, title)
+
     async def group_chat(self):
         pg = self.pg
         await self.tab("groups")
@@ -1020,7 +1036,7 @@ addEventListener('DOMContentLoaded', () => setTimeout(() => { __L.message({ payl
 
     async def run(self):
         self.pg = await self.new_page()
-        for suite in [self.boot, self.rail, self.list_column, self.inbox_tab, self.dm_chat, self.dm_codex, self.composer, self.group_chat,
+        for suite in [self.boot, self.rail, self.list_column, self.inbox_tab, self.dm_chat, self.dm_codex, self.composer, self.remote_files, self.group_chat,
                       self.group_pages, self.peers, self.agents_tab, self.gallery, self.settings, self.events, self.clickrace, self.remove_agent]:
             if self.verbose:
                 print(f"[{self.label}] {suite.__name__}")

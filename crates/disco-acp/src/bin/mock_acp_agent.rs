@@ -1,7 +1,8 @@
 //! Deterministic ACP agent for tests and CI: streams two chunks, asks one
 //! permission, reports whether the parent's environment reached it, then ends the turn.
 //! A prompt containing `__hang__` waits until it is cancelled; `__die__` answers, then exits;
-//! `__plan__` reports a plan step in progress, waits 1.5 s, then answers.
+//! `__plan__` reports a plan step in progress, waits 1.5 s, then answers; `__echo__`
+//! answers with the whole prompt text.
 use agent_client_protocol::schema::v1::{
     AgentCapabilities, CancelNotification, ContentBlock, ContentChunk, InitializeRequest, InitializeResponse, NewSessionRequest,
     NewSessionResponse, PermissionOption, Plan, PlanEntry, PlanEntryPriority, PlanEntryStatus, PermissionOptionKind, PromptRequest, PromptResponse,
@@ -48,6 +49,7 @@ async fn main() -> agent_client_protocol::Result<()> {
                 let cx2 = cx.clone();
                 let has = |w: &str| r.prompt.iter().any(|b| matches!(b, ContentBlock::Text(t) if t.text.contains(w)));
                 let (hang, die, plan) = (has("__hang__"), has("__die__"), has("__plan__"));
+                let echo = has("__echo__").then(|| r.prompt.iter().filter_map(|b| match b { ContentBlock::Text(t) => Some(t.text.clone()), _ => None }).collect::<Vec<_>>().join("\n"));
                 cx.spawn(async move {
                     let s = r.session_id.clone();
                     if hang {
@@ -55,6 +57,10 @@ async fn main() -> agent_client_protocol::Result<()> {
                         while !CANCELLED.load(Ordering::Relaxed) { tokio::time::sleep(std::time::Duration::from_millis(20)).await; }
                         chunk(&cx2, &s, "late")?;
                         return responder.respond(PromptResponse::new(StopReason::Cancelled));
+                    }
+                    if let Some(all) = echo {
+                        chunk(&cx2, &s, &all)?;
+                        return responder.respond(PromptResponse::new(StopReason::EndTurn));
                     }
                     if die {
                         std::thread::spawn(|| { std::thread::sleep(std::time::Duration::from_millis(100)); std::process::exit(3) });
