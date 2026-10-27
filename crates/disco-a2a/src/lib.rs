@@ -134,7 +134,8 @@ pub fn part_file(p: &Part) -> Option<FilePart> {
     Some(FilePart {
         name: p.filename.clone().unwrap_or_else(|| "file".into()),
         mime: p.media_type.clone(),
-        size: meta("size").and_then(|v| v.as_u64()).unwrap_or(bytes.len() as u64),
+        // Protobuf-JSON hops may turn the number into a float.
+        size: meta("size").and_then(|v| v.as_u64().or_else(|| v.as_f64().map(|f| f as u64))).unwrap_or(bytes.len() as u64),
         sha256: meta("sha256").and_then(|v| v.as_str().map(str::to_lowercase)).unwrap_or_default(),
         url,
         bytes,
@@ -248,6 +249,9 @@ mod file_tests {
         assert!(json.contains("\"raw\":\"aGVsbG8=\""), "{json}");
         let back: Part = serde_json::from_str(&json).unwrap();
         assert_eq!(part_file(&back), Some(f.clone()));
+        let mut p = file_part(&f);
+        p.metadata.as_mut().unwrap().insert("size".into(), serde_json::json!(5.0));
+        assert_eq!(part_file(&p).map(|f| f.size), Some(5));
         let by_url = FilePart { bytes: Vec::new(), url: Some("http://100.64.0.1:7480/a/x/f/k".into()), ..f };
         let back: Part = serde_json::from_str(&serde_json::to_string(&file_part(&by_url)).unwrap()).unwrap();
         assert_eq!(part_file(&back), Some(by_url));
