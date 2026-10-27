@@ -143,6 +143,9 @@ pub fn spawn(app: AppHandle, mock: String) {
         let _ = check!("旧版模型接口 切换模型", { within(10, crate::set_agent_config(st(), "r1".into(), "model".into(), "m-smart".into())).await??;
             let n = count(&core, "dm:r1", "r1"); crate::send(st(), "dm:r1".into(), "hi".into())?;
             wait_msg(&core, "dm:r1", "r1", n, 20).await.and_then(|b| if b == "raw m-smart" { Ok(b) } else { Err(b) }) });
+        let _ = check!("模型选择被保存", {
+            let row = core.agent("r1")?;
+            if row.card_json.as_deref().is_some_and(|j| j.contains("m-smart")) { Ok(String::new()) } else { Err(format!("{:?}", row.card_json)) } });
         let _ = check!("需要登录 → 卡片", { within(20, crate::add_agent(st(), raw_spec("r2", "auth"))).await??;
             let n = count(&core, "dm:r2", "system"); crate::send(st(), "dm:r2".into(), "hi".into())?;
             let line = wait_msg(&core, "dm:r2", "system", n, 20).await?;
@@ -242,6 +245,11 @@ pub fn spawn(app: AppHandle, mock: String) {
                 if let Some(s) = core.team_state(&tt).filter(|s| s.stage == "done" || s.stage == "failed") { return s; }
                 tokio::time::sleep(Duration::from_millis(200)).await;
             } }).await.and_then(|s| if s.stage == "done" { Ok(format!("{} 人", s.roles.len())) } else { Err(s.stage.to_string()) }) });
+        let _ = check!("团队黑板文件", {
+            let groups = core.db().list_groups().map_err(|e| e.to_string())?;
+            let tid = groups.into_iter().find(|g| g.name == "team").map(|g| g.id).ok_or("没有 team 群")?;
+            let names: Vec<String> = crate::team_files(st(), format!("group:{tid}")).into_iter().map(|(n, _)| n).collect();
+            if names.iter().any(|n| n == "context.md") && names.iter().any(|n| n == "summary.md") { Ok(names.join(",")) } else { Err(format!("{names:?}")) } });
         let bad = crate::NewAgent { command: Some("/nonexistent/agent --acp".into()), ..spec("bad") };
         let _ = check!("自检提示", { within(10, crate::add_agent(st(), bad)).await??; wait_msg(&core, "dm:bad", "system", 0, 10).await });
         let _ = check!("remove_agent", within(10, crate::remove_agent(st(), "bad".into(), Some(true))).await.and_then(|r| r).map(|_| String::new()));
@@ -374,6 +382,276 @@ pub fn spawn(app: AppHandle, mock: String) {
             Ok(seen) });
         let _ = within(10, crate::remove_agent(st(), "c1".into(), Some(true))).await;
         // end v1.6.2
+        // v1.6.5 baseline (docs/features.md): the backend features nothing above covered.
+        use serde_json::json;
+        async fn tool(core: &Core, token: &str, name: &str, args: serde_json::Value) -> Result<String, String> {
+            let v = mcp_post(core, token, serde_json::json!({ "msg": { "jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": { "name": name, "arguments": args } } })).await?;
+            let t = v["result"]["content"][0]["text"].as_str().unwrap_or_default().to_owned();
+            if v["result"]["isError"] == true { Err(t) } else { Ok(t) }
+        }
+        async fn wait_busy(core: &Core, agent: &str, busy: bool) -> Result<(), String> {
+            within(20, async { while core.hub.activity(agent).0.is_some() != busy { tokio::time::sleep(Duration::from_millis(100)).await; } }).await
+        }
+        let _ = check!("权限卡片 允许后执行", {
+            let n = count(&core, "dm:m1", "m1"); crate::send(st(), "dm:m1".into(), "hi".into())?;
+            wait_msg(&core, "dm:m1", "m1", n, 30).await.and_then(|b| if b.ends_with(" ran") { Ok(b) } else { Err(b) }) });
+        let _ = check!("权限 这一轮已结束时作答报错并撤卡", {
+            let opt = disco_types::PermissionChoice { id: "allow".into(), label: "允许".into(), allow: true, always: false };
+            core.inbox_permission("dm:m1", "m1", "no-such-request", "过期的请求", &[opt]);
+            let id = core.inbox.list().into_iter().find(|i| i.title == "过期的请求").map(|i| i.id);
+            // The approver may get there first; either way nobody may get a success.
+            if let Some(id) = id && core.inbox_answer(&id, inbox::Answer { option: Some("allow".into()), text: None }, "selftest").await.is_ok() {
+                return Err("过期的请求也报成功".into());
+            }
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            if core.inbox.list().iter().any(|i| i.title == "过期的请求") { Err("卡片还在".into()) } else { Ok(String::new()) } });
+        let mcp_gt = core.hub.mcp_tokens.mint("m1", &gt);
+        let _ = check!("ask_user 先答者生效", {
+            let (c, tok) = (core.clone(), mcp_gt.clone());
+            let h = tokio::spawn(async move { tool(&c, &tok, "ask_user", json!({ "question": "选哪个？", "options": ["A", "B"] })).await });
+            let item = within(10, async { loop {
+                if let Some(i) = core.inbox.list().into_iter().find(|i| i.kind == "question" && i.title == "选哪个？") { return i; }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            } }).await?;
+            let first = core.inbox_answer(&item.id, inbox::Answer { option: Some(item.options[1].id.clone()), text: None }, "Discord").await?;
+            if core.inbox_answer(&item.id, inbox::Answer { option: Some(item.options[0].id.clone()), text: None }, "Disco").await.is_ok() { return Err("第二个回答也成功了".into()); }
+            let t = within(10, h).await?.map_err(|e| e.to_string())??;
+            if first != "B" || t != "用户回答：B" { return Err(format!("{first} / {t}")); }
+            if last_from(&core, &gt, "me").as_deref() != Some("回答 m1：B") { return Err("聊天里没有回答记录".into()); }
+            Ok(t) });
+        let _ = check!("提问 空回答不算、自由回答、全部停止撤回", {
+            let (id, rx) = core.inbox_question("dm:m1", "m1", "随便说点", vec![], true);
+            if crate::inbox(st()).iter().all(|i| i.id != id) { return Err("inbox 命令里看不到".into()); }
+            if crate::inbox_answer(st(), id.clone(), None, Some("  ".into())).await.is_ok() { return Err("空回答被接受".into()); }
+            if !core.inbox.list().iter().any(|i| i.id == id) { return Err("空回答后问题丢了".into()); }
+            let line = crate::inbox_answer(st(), id.clone(), None, Some(" 自由回答 ".into())).await?;
+            let got = within(5, rx).await?.map_err(|e| e.to_string())?;
+            if line != "自由回答" || got != "自由回答" { return Err(format!("{line} / {got}")); }
+            let (_, rx) = core.inbox_question("dm:m1", "m1", "会被撤回", vec!["好".into()], false);
+            core.inbox_clear();
+            if within(5, rx).await?.is_ok() { return Err("全部停止后还在等回答".into()); }
+            Ok(String::new()) });
+        let _ = check!("stop_reply 停止私聊里的回复", {
+            within(20, crate::add_agent(st(), spec("h1"))).await??;
+            crate::send(st(), "dm:h1".into(), "__hang__".into())?;
+            wait_busy(&core, "h1", true).await?;
+            tokio::time::sleep(Duration::from_millis(1500)).await; // the prompt must reach the agent first
+            within(10, crate::stop_reply(st(), "dm:h1".into(), "h1".into())).await??;
+            wait_busy(&core, "h1", false).await.map(|_| String::new()) });
+        let _ = check!("群 /stop 停止回复", {
+            let sid = within(10, crate::save_group(st(), None, None, "stop".into(), vec!["h1".into()], Some("h1".into()))).await??;
+            let sg = format!("group:{sid}");
+            crate::send(st(), sg.clone(), "__hang__".into())?;
+            wait_busy(&core, "h1", true).await?;
+            tokio::time::sleep(Duration::from_millis(1500)).await; // the prompt must reach the agent first
+            crate::send(st(), sg.clone(), "/stop".into())?;
+            wait_busy(&core, "h1", false).await?;
+            within(10, async { loop {
+                let said = core.db().messages(&sg, 50).map(|v| v.into_iter().find(|m| m.author == "system" && m.body.starts_with("已停止")).map(|m| m.body)).unwrap_or_default();
+                if let Some(b) = said { return b; }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            } }).await });
+        let groups = core.db().list_groups().unwrap_or_default();
+        if let Some(g) = groups.into_iter().find(|g| g.name == "stop") { let _ = crate::delete_group(st(), g.id); }
+        let _ = within(10, crate::remove_agent(st(), "h1".into(), Some(true))).await;
+
+        // Sharing: peer turns called the way the A2A server calls them.
+        let (etx, _erx) = tokio::sync::mpsc::unbounded_channel();
+        let mk_share = |agent: &str, guest: &str, mode: &str, limit: u32| -> Result<String, String> {
+            crate::share::create_share(st(), agent.into(), guest.into(), mode.into(), limit)?;
+            core.shares().into_iter().find(|(_, s)| s.guest == guest).map(|(id, _)| id).ok_or_else(|| "找不到共享".to_string())
+        };
+        let _ = check!("共享 每日额度用完即拒、没开始的失败退回额度", {
+            let id = mk_share("m1", "额度", "chat", 1)?;
+            within(40, core.peer_turn(&id, "local", "dm:g", "hi", etx.clone())).await??;
+            let used = core.used_today(&id);
+            if used != 1 { return Err(format!("用了 {used}")); }
+            let e = within(10, core.peer_turn(&id, "local", "dm:g", "hi", etx.clone())).await?.err().unwrap_or_default();
+            let used = core.used_today(&id);
+            crate::share::revoke_share(st(), id);
+            if !e.contains("额度已用完") || used != 1 { return Err(format!("{e} used={used}")); }
+            within(20, crate::add_agent(st(), crate::NewAgent { command: Some("/nonexistent/agent --acp".into()), ..spec("bad2") })).await??;
+            let id = mk_share("bad2", "退回", "chat", 1)?;
+            let r = within(30, core.peer_turn(&id, "local", "dm:g", "hi", etx.clone())).await?;
+            let used = core.used_today(&id);
+            crate::share::revoke_share(st(), id);
+            let _ = within(10, crate::remove_agent(st(), "bad2".into(), Some(true))).await;
+            if r.is_ok() { return Err("坏 agent 也成功了".into()); }
+            if used == 0 { Ok(e) } else { Err(format!("失败的消息算了额度：{used}")) } });
+        let _ = check!("共享 chat 模式拒绝需审批的操作，ask 模式由主人审批", {
+            let chat = mk_share("m1", "模式chat", "chat", 0)?;
+            let a = within(40, core.peer_turn(&chat, "local", "dm:g", "hi", etx.clone())).await?;
+            let none = within(10, crate::share::peer_check(st(), chat.clone())).await??;
+            crate::share::revoke_share(st(), chat);
+            let ask = mk_share("m1", "模式ask", "ask", 0)?;
+            let b = within(40, core.peer_turn(&ask, "local", "dm:g", "hi", etx.clone())).await?;
+            crate::share::revoke_share(st(), ask);
+            let (a, b) = (a?, b?);
+            if none.is_some() { return Err(format!("没有群却有对方群状态：{none:?}")); }
+            if a.trim_end().ends_with("skipped") && b.trim_end().ends_with("ran") { Ok(String::new()) } else { Err(format!("{a} | {b}")) } });
+        let _ = check!("免打扰 net_policy_set 往返，期间拒绝且不扣额度", {
+            use chrono::Timelike;
+            let now = chrono::Local::now();
+            let m = now.hour() * 60 + now.minute();
+            let hm = |x: u32| format!("{:02}:{:02}", (x % 1440) / 60, x % 60);
+            // Quiet around the clock except the minute after next.
+            let p = crate::tailnet::Policy { quiet_start: hm(m + 2), quiet_end: hm(m + 1), allow: vec!["Box.Tail1.ts.net".into()], ..Default::default() };
+            let saved = crate::net_policy_set(st(), p)?;
+            if crate::net_policy(st()) != saved || saved.allow != ["box.tail1.ts.net"] { return Err(format!("{saved:?}")); }
+            if crate::net_policy_set(st(), crate::tailnet::Policy { deny: vec!["bad rule".into()], ..Default::default() }).is_ok() { return Err("无效规则被接受".into()); }
+            if crate::net_policy(st()) != saved { return Err("无效规则覆盖了已保存的规则".into()); }
+            let id = mk_share("m1", "免打扰", "chat", 0)?;
+            let e = within(10, core.peer_turn(&id, "local", "dm:g", "hi", etx.clone())).await?.err().unwrap_or_default();
+            let used = core.used_today(&id);
+            crate::share::revoke_share(st(), id);
+            crate::net_policy_set(st(), crate::tailnet::Policy::default())?;
+            if e.contains("免打扰") && used == 0 { Ok(e) } else { Err(format!("{e} used={used}")) } });
+        let _ = check!("对方群 peer_turn 记下候选群（team:/ask: 形式），私聊不覆盖，换群重新确认", {
+            let id = mk_share("m1", "群候选", "chat", 0)?;
+            let ctx = |id: &str| core.db().setting(&format!("{}{id}", crate::share::PEER_CTX));
+            within(40, core.peer_turn(&id, "local", "team:group:777:m1", "hi", etx.clone())).await??;
+            let c1 = ctx(&id);
+            within(40, core.peer_turn(&id, "local", "dm:g", "hi", etx.clone())).await??;
+            let c2 = ctx(&id);
+            let _ = core.db().set_setting(&format!("{}{id}", crate::share::PEER_OK), ""); // as if confirmed
+            within(40, core.peer_turn(&id, "local", "ask:m9:group:888", "hi", etx.clone())).await??;
+            let c3 = ctx(&id);
+            let missing = core.peer_missing(&id).unwrap_or_default();
+            let checked = within(10, crate::share::peer_check(st(), id.clone())).await??.unwrap_or_default();
+            let view = within(5, crate::overview(st())).await??.peers.into_iter().find(|p| p.thread == format!("peer:{id}")).map(|p| (p.group, p.talk));
+            crate::share::revoke_share(st(), id);
+            if c1.as_deref() != Some("group:777") || c2 != c1 || c3.as_deref() != Some("group:888") { return Err(format!("{c1:?} {c2:?} {c3:?}")); }
+            if missing.is_empty() || checked.is_empty() { return Err("换群后仍当作可以说话".into()); }
+            if view != Some((true, false)) { return Err(format!("{view:?}")); }
+            Ok(checked) });
+        let _ = check!("共享状态、重发邀请码、坏邀请码", {
+            let id = mk_share("m1", "状态", "ask", 3)?;
+            let v = serde_json::to_value(crate::share::share_status(st())).map_err(|e| e.to_string())?;
+            let code = crate::share::share_invite(st(), id.clone());
+            crate::share::revoke_share(st(), id.clone());
+            let row = v["shares"].as_array().and_then(|a| a.iter().find(|r| r["id"] == id.as_str()).cloned()).ok_or("状态里没有这个共享")?;
+            if row["mode"] != "ask" || row["limit"] != 3 || row["used_today"] != 0 || v["base"].as_str().is_none_or(|b| !b.starts_with("http://")) { return Err(v.to_string()); }
+            if !code?.starts_with("disco1:") { return Err("邀请码格式不对".into()); }
+            if crate::share::share_invite(st(), id).is_ok() { return Err("撤销后还能拿到邀请码".into()); }
+            for bad in ["hello", "disco1:!!!", "disco1:e30"] {
+                if within(10, crate::share::accept_invite(st(), bad.into(), None)).await?.is_ok() { return Err(format!("{bad} 被接受")); }
+            }
+            Ok(String::new()) });
+
+        // Disco MCP tools an agent uses in a group.
+        let _ = check!("MCP 待办 增/列/完成", {
+            let r = tool(&core, &mcp_gt, "todo_add", json!({ "text": "MCP 待办", "assignee": "me" })).await?;
+            let id = r.rsplit(' ').next().unwrap_or_default().to_owned();
+            let l = tool(&core, &mcp_gt, "todo_list", json!({})).await?;
+            if !l.contains("MCP 待办") || !l.contains(&id) { return Err(l); }
+            tool(&core, &mcp_gt, "todo_done", json!({ "id": id })).await?;
+            if !crate::mcp::todos(&core, &gt).iter().any(|t| t.text == "MCP 待办" && t.done) { return Err("没标记完成".into()); }
+            let l = tool(&core, &mcp_gt, "todo_list", json!({})).await?;
+            if l.contains("MCP 待办") { return Err(format!("默认列表里还有已完成的：{l}")); }
+            Ok(id) });
+        let _ = check!("MCP 群文档 追加/替换/读取", {
+            tool(&core, &mcp_gt, "doc_write", json!({ "content": "MCP 追加" })).await?;
+            let d = tool(&core, &mcp_gt, "doc_read", json!({})).await?;
+            if !d.contains("目标") || !d.contains("MCP 追加") { return Err(d); }
+            tool(&core, &mcp_gt, "doc_write", json!({ "content": "# 重写", "mode": "replace" })).await?;
+            let d = crate::space(st(), gt.clone())?.doc;
+            if d == "# 重写\n" { Ok(String::new()) } else { Err(d) } });
+        let _ = check!("分层记忆 self/group/all 各归其层，新会话按层拿到", {
+            for (text, scope) in [("基线-自己", "self"), ("基线-本群", "group"), ("基线-所有", "all")] {
+                tool(&core, &mcp_gt, "remember", json!({ "text": text, "scope": scope, "topic": "baseline" })).await?;
+            }
+            // Scope folders are slugs (at most 40 chars), and a local group id is longer.
+            let g = crate::memory::slug(&crate::memory::group_of(&gt).ok_or("没有群层")?);
+            let notes = crate::memories(st());
+            let scope_of = |t: &str| notes.iter().find(|m| m.text == t).map(|m| (m.scope.clone(), m.topic.clone()));
+            let want = |s: &str| Some((s.to_owned(), "baseline".to_owned()));
+            if scope_of("基线-自己") != want("m1") || scope_of("基线-本群") != want(&g) || scope_of("基线-所有") != want("all") {
+                return Err(format!("{:?} {:?} {:?}", scope_of("基线-自己"), scope_of("基线-本群"), scope_of("基线-所有")));
+            }
+            let r = tool(&core, &mcp_gt, "memory_read", json!({ "scope": "group", "topic": "baseline" })).await?;
+            if !r.contains("基线-本群") { return Err(r); }
+            let in_group = core.memory_preamble("m1", &gt);
+            if !["基线-自己", "基线-本群", "基线-所有"].iter().all(|t| in_group.contains(t)) { return Err(in_group); }
+            let in_dm = core.memory_preamble("m3", "dm:m3");
+            if !in_dm.contains("基线-所有") || in_dm.contains("基线-本群") || in_dm.contains("基线-自己") { return Err(in_dm); }
+            let dm_tok = core.hub.mcp_tokens.mint("m1", "dm:m1");
+            if tool(&core, &dm_tok, "remember", json!({ "text": "私聊里的群记忆", "scope": "group" })).await.is_ok() { return Err("私聊里存进了群层".into()); }
+            crate::set_memory(st(), gt.clone(), false)?;
+            let off = tool(&core, &mcp_gt, "remember", json!({ "text": "关了也存" })).await;
+            crate::set_memory(st(), gt.clone(), true)?;
+            if off.is_ok() { return Err("记忆关闭时 MCP 还能存".into()); }
+            for m in core.memory_list().into_iter().filter(|m| m.topic == "baseline") { let _ = crate::forget(st(), m.key); }
+            Ok(String::new()) });
+
+        // Settings, diagnostics and the guards around them.
+        let _ = check!("一键诊断返回检查项", {
+            let items = within(30, crate::diagnose(st())).await??;
+            let names: Vec<&str> = items.iter().map(|c| c.name.as_str()).collect();
+            let want = ["网络代理", "Discord Bot token", "Tailscale", "Node.js / npx"];
+            if want.iter().all(|w| names.contains(w)) && items.iter().all(|c| !c.detail.is_empty()) { Ok(format!("{} 项", items.len())) } else { Err(format!("{names:?}")) } });
+        let _ = check!("没连 Discord 时设置页不崩、给出原因", {
+            let s = within(10, crate::discord_settings(st(), None, Some("123, abc，456".into()))).await??;
+            let _ = within(10, crate::discord_settings(st(), None, Some(String::new()))).await?;
+            if s.problem.as_deref().is_none_or(str::is_empty) || !s.guilds.is_empty() || s.invite_url.is_some() || s.allow != "123, 456" {
+                return Err(format!("{:?} {}", s.problem, s.allow));
+            }
+            if within(10, crate::save_discord_token(st(), "short".into())).await?.is_ok() { return Err("不完整的 token 被接受".into()); }
+            if within(10, crate::discord_channels(st())).await?.is_ok() || within(10, crate::discord_sync(st())).await?.is_ok() { return Err("没连 Discord 却成功了".into()); }
+            let saved = core.db().setting(crate::SET_TOKEN_SAVED).is_some();
+            if !saved && crate::discord_connect(st()).is_ok() { return Err("没有 token 也能连".into()); }
+            Ok(s.problem.unwrap_or_default()) });
+        let _ = check!("set_look 校验并出现在 overview", {
+            crate::set_look(st(), "m1".into(), "orbit.brand".into())?;
+            let look = within(5, crate::overview(st())).await??.agents.into_iter().find(|a| a.name == "m1").map(|a| a.look);
+            let bad = crate::set_look(st(), "m1".into(), "a b".into()).is_ok() || crate::set_look(st(), "nobody".into(), "x".into()).is_ok();
+            crate::set_look(st(), "m1".into(), String::new())?;
+            if look.as_deref() == Some("orbit.brand") && !bad { Ok(String::new()) } else { Err(format!("{look:?} bad={bad}")) } });
+        let _ = check!("只打开白名单链接、只显示数据目录里的文件", {
+            if crate::open_url("https://evil.example/".into()).is_ok() || crate::open_url("file:///etc/passwd".into()).is_ok() { return Err("白名单外的链接被打开".into()); }
+            let base = app.path().app_data_dir().map_err(|e| e.to_string())?;
+            for p in ["/etc/passwd".to_owned(), base.join("..").join("x").display().to_string(), base.join("no-such-file").display().to_string()] {
+                if crate::reveal_path(st(), p.clone()).is_ok() { return Err(format!("{p} 被显示")); }
+            }
+            Ok(String::new()) });
+        let _ = check!("检测已安装的 agent 和 conda 环境", {
+            let d = crate::detect_agents(st());
+            let n = crate::conda_envs().len();
+            if d.is_empty() { Err("没有已知 agent".into()) } else { Ok(format!("{} 种已知，{n} 个 conda 环境", d.len())) } });
+        let _ = check!("一次添加多个实例", {
+            let names = within(20, crate::add_agent(st(), crate::NewAgent { count: Some(2), worktree: Some(false), ..spec("k") })).await??;
+            for n in &names { let _ = within(10, crate::remove_agent(st(), n.clone(), Some(true))).await; }
+            if names == ["k", "k-2"] { Ok(String::new()) } else { Err(format!("{names:?}")) } });
+        let _ = check!("群里 记住 存进本群记忆", {
+            let n = count(&core, &gt, "system");
+            crate::send(st(), gt.clone(), "记住 群里的约定".into())?;
+            let b = wait_msg(&core, &gt, "system", n, 5).await?;
+            let g = crate::memory::slug(&crate::memory::group_of(&gt).unwrap_or_default());
+            let note = core.memory_list().into_iter().find(|m| m.text == "群里的约定");
+            let ok = note.as_ref().is_some_and(|m| m.scope == g);
+            if let Some(m) = note { let _ = crate::forget(st(), m.key); }
+            if ok && b.contains("本群") { Ok(b) } else { Err(b) } });
+        let _ = check!("Discord 朋友不能用改状态的命令", {
+            let n = count(&core, "group:chan1", "system");
+            core.on_incoming(msg("chan1", "u9", "Bob", "@m1 /model opus"));
+            wait_msg(&core, "group:chan1", "system", n, 10).await.and_then(|b| if b.contains("只有它的主人能用") { Ok(b) } else { Err(b) }) });
+        let _ = check!("别的 Disco 的 agent 接力限流", {
+            let ok: Vec<bool> = (0..7).map(|_| core.foreign_turn_ok("chan-rate")).collect();
+            if ok[..6].iter().all(|b| *b) && !ok[6] { Ok(String::new()) } else { Err(format!("{ok:?}")) } });
+        let _ = check!("回答里的【记住】存进记忆", {
+            core.remember_from("m1", "dm:m1", &format!("好的\n{}来自回答", crate::MEM_TAG));
+            let note = crate::memories(st()).into_iter().find(|m| m.text == "来自回答");
+            let ok = note.as_ref().is_some_and(|m| m.scope == "m1");
+            if let Some(m) = note { let _ = crate::forget(st(), m.key); }
+            if ok { Ok(String::new()) } else { Err("没存上".into()) } });
+        let _ = check!("MCP post 叫来被 @ 的成员、send_file 放进空间", {
+            let n = count(&core, &gt, "m3");
+            let r = tool(&core, &mcp_gt, "post", json!({ "text": "@m3 看一下" })).await?;
+            wait_msg(&core, &gt, "m3", n, 30).await?;
+            let f = std::env::temp_dir().join("disco-selftest-mcp.txt");
+            std::fs::write(&f, "hi").map_err(|e| e.to_string())?;
+            let s = tool(&core, &mcp_gt, "send_file", json!({ "path": f.display().to_string() })).await?;
+            if r.contains("m3") && s.starts_with("已放进共享空间") { Ok(String::new()) } else { Err(format!("{r} / {s}")) } });
+        // end v1.6.5 baseline
         println!("SELFTEST {}", if fails == 0 { "OK".to_string() } else { format!("{fails} FAILED") });
         std::process::exit(if fails == 0 { 0 } else { 1 });
     });

@@ -46,3 +46,19 @@ jobs:
       - timeout-minutes: 6
         shell: bash
         run: DISCO_SELFTEST="$(cygpath -w "$PWD/target/debug/mock-acp-agent.exe")" target/debug/disco-app.exe
+  # UI regression gate: the real crates/disco-app/ui files against a Tauri stub (ui-test/stub.js), in headless
+  # Chromium, light + dark, macOS + Windows. Fails on any page error, stray null/undefined text or missing invoke.
+  ui-audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - run: pip install playwright
+      - run: python -m playwright install --with-deps chromium
+      - name: UI audit
+        run: |
+          python -m http.server 8765 --bind 127.0.0.1 --directory . >/dev/null 2>&1 &
+          for i in $(seq 1 30); do curl -sf http://127.0.0.1:8765/ui-test/index.html >/dev/null && break; sleep 0.2; done
+          python ui-test/audit.py --base http://127.0.0.1:8765

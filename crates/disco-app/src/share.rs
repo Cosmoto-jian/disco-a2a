@@ -132,7 +132,7 @@ impl Core {
         serde_json::from_str(&self.db().setting(&format!("{SHARE}{id}"))?).ok()
     }
 
-    fn used_today(&self, id: &str) -> u32 {
+    pub(crate) fn used_today(&self, id: &str) -> u32 {
         self.db().setting(&used_key(id)).and_then(|v| v.parse().ok()).unwrap_or(0)
     }
 
@@ -206,7 +206,7 @@ impl Core {
 
     /// Run one guest message as a turn of the shared agent. The owner sees it live
     /// in the `peer:<id>` thread, where permission prompts also appear.
-    async fn peer_turn(&self, id: &str, device: &str, guest_ctx: &str, text: &str, out: mpsc::UnboundedSender<AgentEvent>) -> Result<String, String> {
+    pub(crate) async fn peer_turn(&self, id: &str, device: &str, guest_ctx: &str, text: &str, out: mpsc::UnboundedSender<AgentEvent>) -> Result<String, String> {
         let context = format!("peer:{id}|{guest_ctx}");
         // Register before reading the share: a revoke either comes first (no share) or finds the ticket.
         let ticket = Ticket::new(id, &context);
@@ -279,7 +279,7 @@ impl Core {
 
 pub(crate) const PEER_CTX: &str = "peer_ctx/";
 /// Result of the last talk check per share: "" = ready, else what is still missing.
-const PEER_OK: &str = "peer_ok/";
+pub(crate) const PEER_OK: &str = "peer_ok/";
 const CHECKING: &str = "正在确认你和你的 Bot 是否都在对方的服务器里…";
 
 impl Core {

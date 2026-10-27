@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>Disco UI audit</title>
+<!-- Loads the real UI from crates/disco-app/ui (no copies): every relative URL, including logo.png, resolves there. -->
+<base href="../crates/disco-app/ui/">
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<script>
+// Pull the shell markup from the real index.html so the harness never drifts from it.
+(() => {
+const x = new XMLHttpRequest(); x.open("GET", "index.html", false); x.send();
+const doc = new DOMParser().parseFromString(x.responseText, "text/html");
+for (const s of doc.body.querySelectorAll("script")) s.remove();
+document.write(doc.body.innerHTML + ["../../../ui-test/stub.js", "icons.js", "logos.js", "app.js"].map((src) => `<script src="${src}"><\/script>`).join(""));
+})();
+</script>
+</body>
+</html>
