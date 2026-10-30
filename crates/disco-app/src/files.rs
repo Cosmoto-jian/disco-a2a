@@ -85,6 +85,15 @@ pub(crate) fn save_incoming(dir: &Path, f: &FilePart) -> Result<(PathBuf, u64, S
     Ok((dst, n, hash))
 }
 
+/// Save a file that came in from a chat app (a QQ attachment) into `dir` under its safe
+/// base name, never overwriting.
+pub(crate) fn save_new(dir: &Path, name: &str, bytes: &[u8]) -> Result<(PathBuf, u64), String> {
+    use std::io::Write;
+    let (mut to, dst) = claim(dir, &safe_name(name))?;
+    if let Err(e) = to.write_all(bytes).and_then(|()| to.flush()) { drop(to); let _ = std::fs::remove_file(&dst); return Err(crate::err(e)); }
+    Ok((dst, bytes.len() as u64))
+}
+
 pub fn safe_name(name: &str) -> String {
     let base = name.replace('\\', "/");
     let base = base.rsplit('/').next().unwrap_or("");
@@ -180,6 +189,13 @@ impl Core {
             tokio::task::spawn_blocking(move || copy_in(&p, &dir, &name)).await.map_err(crate::err)??
         };
         let line = file_line(note, &name, size, &hash, &dst);
+        // A group tied to a QQ group gets the file itself there too.
+        if let Some((rest, openid)) = crate::qq::target(self, thread) {
+            let (path, name) = (dst.clone(), name.clone());
+            tauri::async_runtime::spawn(async move {
+                if let Ok(bytes) = tokio::fs::read(&path).await { let _ = crate::qq::post_file(&rest, &openid, &name, &bytes).await; }
+            });
+        }
         {
             let mut q = PENDING.lock().unwrap_or_else(|p| p.into_inner());
             q.extend(remote.iter().map(|a| Pending { agent: a.clone(), thread: thread.to_owned(), path: dst.clone(), name: name.clone(), size, sha256: hash.clone() }));

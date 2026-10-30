@@ -79,6 +79,7 @@ impl Core {
     fn inbox_add_once(&self, item: Item, reply: Reply, once: bool) -> bool {
         let id = item.id.clone();
         let discord = self.discord_rest().zip(self.thread_channel(&item.thread));
+        let qq = crate::qq::target(self, &item.thread);
         let card = format!("{} **{}** {}：{}", if item.kind == "permission" { "🔐" } else { "❓" }, item.agent,
             if item.kind == "permission" { "请求执行" } else { "问你" }, item.title);
         let mut buttons: Vec<(String, String, bool)> = item.options.iter().enumerate()
@@ -91,6 +92,11 @@ impl Core {
             items.insert(id.clone(), Entry { item, reply, discord: None });
         }
         self.inbox_changed();
+        // QQ can't edit a sent card: its buttons grey out once one is pressed.
+        if let Some((rest, openid)) = qq {
+            let (text, buttons) = (format!("{card}{note}"), buttons.clone());
+            tauri::async_runtime::spawn(async move { let _ = crate::qq::post_card(&rest, &openid, &text, &buttons).await; });
+        }
         if let Some((rest, ch)) = discord {
             let inbox = self.inbox.clone();
             tauri::async_runtime::spawn(async move {
@@ -217,6 +223,11 @@ impl Core {
         Ok(line)
     }
 
+    /// The option a button picked (`pick` = its index; `x` or anything else = none, i.e. deny).
+    pub(crate) fn inbox_option(&self, id: &str, pick: &str) -> Option<String> {
+        lock(&self.inbox.items).get(id).and_then(|e| pick.parse::<usize>().ok().and_then(|i| e.item.options.get(i)).map(|o| o.id.clone()))
+    }
+
     /// A button press from Discord (`custom_id` = `disco:<item>:<option index | x>`).
     pub(crate) async fn inbox_press(&self, author_id: &str, author: &str, interaction: (String, String, String)) {
         let (iid, token, custom) = interaction;
@@ -227,7 +238,7 @@ impl Core {
             let _ = rest.interaction_reply(&iid, &token, false, "你没有权限操作这个 Disco。").await;
             return;
         }
-        let option = lock(&self.inbox.items).get(id).and_then(|e| pick.parse::<usize>().ok().and_then(|i| e.item.options.get(i)).map(|o| o.id.clone()));
+        let option = self.inbox_option(id, pick);
         let title = lock(&self.inbox.items).get(id).map(|e| e.item.title.clone()).unwrap_or_default();
         match self.inbox_answer(id, Answer { option, text: None }, "Discord").await {
             Ok(line) => { let _ = rest.interaction_reply(&iid, &token, true, &format!("~~{title}~~ → {line}（{author}）")).await; }

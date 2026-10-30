@@ -39,6 +39,10 @@
     ],
     discord_token: true,
     discord_status: "在线 · MyBot#0001",
+    qq_status: "",
+    // QQ bot: not bound; `qq_bind` shows a QR code, `STUB.qq_scan()` simulates the scan in mobile QQ.
+    qq: { bound: false, status: "", name: "", qr: null, url: null },
+    qq_codes: [],
     paused: false,
     inbox: [
       { id: "a1", kind: "permission", thread: "group:g1", agent: "codex", title: "Run: cargo test -p disco-app",
@@ -97,7 +101,7 @@
   };
   Object.assign(STUB, window.STUB_INIT || {});
   const clone = (v) => (v === undefined ? null : JSON.parse(JSON.stringify(v)));
-  const OV_KEYS = ["agents", "groups", "memory_off", "heads", "peers", "discord_token", "discord_status", "paused"];
+  const OV_KEYS = ["agents", "groups", "memory_off", "heads", "peers", "discord_token", "discord_status", "qq_status", "paused"];
   const H = {
     overview: () => Object.fromEntries(OV_KEYS.map((k) => [k, clone(STUB[k])])),
     inbox: () => clone(STUB.inbox),
@@ -141,7 +145,18 @@
     create_share: () => "disco1:eyJ1cmwiOiJodHRwOi8vbWFjLnRhaWwxLnRzLm5ldDo3NDgwL2EvYWJjIiwidG9rZW4iOiIxMjMifQ",
     share_invite: () => "disco1:invite",
     revoke_share: (a) => { STUB.shares = STUB.shares.filter((s) => s.id !== a.id); return null; },
-    save_group: (a) => { const id = "g" + (STUB.groups.length + 1); STUB.groups.push({ id: `local-${id}`, name: a.name, guild_id: "", lead: a.lead, members: a.members, people: [], guests: [] }); return `local-${id}`; },
+    save_group: (a) => { const id = "g" + (STUB.groups.length + 1); STUB.groups.push({ id: `local-${id}`, name: a.name, guild_id: "", lead: a.lead, members: a.members, people: [], guests: [], qq: false }); return `local-${id}`; },
+    qq_status: () => clone(STUB.qq),
+    qq_bind: () => { STUB.qq.qr = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 21 21"><rect width="21" height="21" fill="#fff"/><path d="M1 1h7v7H1z" fill="#000"/></svg>'; STUB.qq.url = "https://q.qq.com/qqbot/openclaw/connect.html?task_id=T1"; STUB.qq.status = ""; return clone(STUB.qq); },
+    qq_bind_cancel: () => { STUB.qq.qr = null; STUB.qq.url = null; return clone(STUB.qq); },
+    qq_unbind: () => { Object.assign(STUB.qq, { bound: false, status: "", name: "" }); STUB.qq_status = ""; return clone(STUB.qq); },
+    qq_group_code: (a) => {
+      const g = STUB.groups.find((x) => x.id === a.group); if (!g) throw "没有这个群聊";
+      if (a.unbind) { g.qq = false; return ""; }
+      if (!g.id.startsWith("local-")) throw "这个群聊已经同步到 Discord 频道，QQ 群请新建一个群聊绑定";
+      if (!STUB.qq.bound) throw "先在设置里扫码绑定 QQ 机器人";
+      const code = String(1234 + STUB.qq_codes.length); STUB.qq_codes.push([code, g.id]); return code;
+    },
     delete_group: (a) => { STUB.groups = STUB.groups.filter((g) => g.id !== a.id); return null; },
     restore_group: (a) => { STUB.groups.push({ id: a.id, name: a.name, guild_id: a.guildId, lead: a.lead, members: a.members, people: [], guests: [] }); return null; },
     discord_channels: () => [{ guild_id: "1", guild: "My Server", id: "c9", name: "general" }],
@@ -159,6 +174,8 @@
     install_update: () => null,
     open_url: () => null,
   };
+  // The user scanned and confirmed in mobile QQ: the bot is saved and connects.
+  STUB.qq_scan = () => { Object.assign(STUB.qq, { bound: true, qr: null, url: null, name: "DiscoBot", status: "在线 · DiscoBot" }); STUB.qq_status = "在线 · DiscoBot"; };
   window.STUB = STUB; window.CALLS = []; window.UNKNOWN = []; window.STUB_FAIL = {};
   window.__TAURI__ = {
     core: { invoke: async (c, a) => {

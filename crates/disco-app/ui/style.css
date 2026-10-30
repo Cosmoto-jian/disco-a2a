@@ -542,3 +542,11 @@ dialog[open] { animation:dlgin .18s var(--ease); }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation-duration:.01ms !important; animation-iteration-count:1 !important; transition-duration:.01ms !important; }
 }
+
+/* QQ: scan-to-bind card and group bind code */
+.qq-scan { align-items:center; text-align:center; gap:6px; padding-top:16px; padding-bottom:16px; }
+.qq-qr { width:184px; height:184px; padding:8px; border-radius:14px; background:#fff; box-shadow:0 0 0 0.5px var(--line2); }
+.qq-qr svg { display:block; width:100%; height:100%; }
+.qq-scan b { margin-top:6px; }
+.qq-scan .foot { max-width:300px; }
+.qq-code { font:600 15px/1 ui-monospace, "SF Mono", Menlo, monospace; letter-spacing:.5px; padding:6px 10px; border-radius:8px; background:var(--fill2); -webkit-user-select:text; user-select:text; }

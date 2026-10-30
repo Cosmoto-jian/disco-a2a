@@ -220,7 +220,7 @@ const agentSub = (a) => [...new Set([KIND[a.kind] ?? "A2A", a.kind === "acp" ? s
 // The git branch of a local agent's folder, as a tiny grey tag after a subtitle (nothing when there is none).
 const branchTag = (a) => a?.branch ? h("span", { class: "branch", title: `git 分支 ${a.branch}` }, ic("git-branch"), a.branch) : null;
 const withBranch = (sub, a) => a?.branch ? [sub, sub ? " · " : "", branchTag(a)] : sub;
-const SETTINGS_SECS = [["dc", "Discord", "discord-logo:fill"], ["net", "共享与 Tailscale", "share-network"], ["cf", "Cloudflare 隧道", "globe"], ["mem", "记忆", "brain"], ["run", "运行", "power"], ["gen", "通用与更新", "gear-six"]];
+const SETTINGS_SECS = [["dc", "Discord", "discord-logo:fill"], ["qq", "QQ", "chat-teardrop-dots"], ["net", "共享与 Tailscale", "share-network"], ["cf", "Cloudflare 隧道", "globe"], ["mem", "记忆", "brain"], ["run", "运行", "power"], ["gen", "通用与更新", "gear-six"]];
 const runLabel = () => (S.ov?.paused ? "已全部停止" : busyAgents().size ? `${busyAgents().size} 个 agent 正在回复` : "运行中");
 function drawList() {
   if (!S.ov) return;
@@ -261,7 +261,7 @@ function drawList() {
     rows = SETTINGS_SECS.map(([id, label, icon]) => h("li", { class: `nav${S.setSec === id ? " on" : ""}`, onclick: () => gotoSetting(id) },
       h("span", { class: "navic" }, ic(icon)),
       h("div", { class: "meta" }, h("div", { class: "name" }, label),
-        id === "dc" ? h("div", { class: "sub" }, S.ov.discord_status) : id === "run" ? h("div", { class: "sub" }, runLabel()) : null)));
+        id === "dc" ? h("div", { class: "sub" }, S.ov.discord_status) : id === "qq" ? h("div", { class: "sub" }, S.ov.qq_status || "未接入") : id === "run" ? h("div", { class: "sub" }, runLabel()) : null)));
   }
   rows = rows.filter((li) => !q || li.textContent.toLowerCase().includes(q));
   if (!rows.length) rows = [q ? h("li", { class: "empty" }, `没有和「${S.q}」相关的`)
@@ -621,9 +621,10 @@ function drawInfo(t) {
     body.replaceChildren(
       isec("AGENT", agents, g.guests.map((m) => irow(avatar(m, { small: true }), m, "朋友的 agent")),
         irow(lic("plus"), "添加 agent", null, null, () => groupDialog(g), "add")),
-      isec("人", irow(avatar("我", { person: true, small: true }), "我", "你 · 群主"), g.people.map((p) => irow(avatar(p, { person: true, small: true }), p, "Discord"))),
+      isec("人", irow(avatar("我", { person: true, small: true }), "我", "你 · 群主"), g.people.map((p) => irow(avatar(p, { person: true, small: true }), p, g.qq ? "QQ" : "Discord"))),
       isec("本群", memorySwitch(t),
-        irow(null, local ? "仅本地" : "镜像到 Discord", local ? "不同步到 Discord" : ch ? `#${ch}` : "已绑定 Discord 频道", chev(), () => groupDialog(g)),
+        g.qq ? irow(null, "同步到 QQ 群", "QQ 群里 @机器人 就能叫 agent", chev(), () => groupDialog(g))
+          : irow(null, local ? "仅本地" : "镜像到 Discord", local ? "不同步到 Discord" : ch ? `#${ch}` : "已绑定 Discord 频道", chev(), () => groupDialog(g)),
         irow(null, "群设置", "群名、成员、组长、删除", chev(), () => groupDialog(g))));
     return;
   }
@@ -1386,24 +1387,57 @@ async function groupDialog(g) {
   draw();
   const where = [];
   const discordOn = /^在线/.test(S.ov.discord_status || "");
+  const qqOn = !!S.ov.qq_status;
   let foot = null;
-  if (g) where.push(grow("Discord", h("span", { class: "val" }, g.id.startsWith("local-") ? "仅在 Disco 内" : "已绑定 Discord 频道")));
+  // QQ: a new group can be made for a QQ group (it stays local and is tied with a bind code);
+  // an existing local group can be tied or untied here.
+  const qqRow = (() => {
+    if (!qqOn || (g && !g.id.startsWith("local-"))) return null;
+    if (!g) {
+      const t = toggle(false);
+      t.onchange = () => { st.qq = t.checked; for (const el of dcRows) el.hidden = t.checked; };
+      return grow("同步到 QQ 群", t, h("small", { class: "foot" }, "创建后给你一个绑定码，在 QQ 群里发一下就连上"));
+    }
+    const slot = h("div", { class: "gc" });
+    const draw = (code) => {
+      if (g.qq) slot.replaceChildren(h("span", { class: "status ok" }, h("i"), "已连上 QQ 群"),
+        h("button", { type: "button", class: "btn sm danger", onclick: async () => {
+          if (!await ask("和 QQ 群断开？QQ 群里不会再收到这个群聊的消息。", "断开")) return;
+          try { await invoke("qq_group_code", { group: g.id, unbind: true }); g.qq = false; await load(); draw(); toast("已断开 QQ 群"); } catch (e) { toast(e); }
+        } }, "断开"));
+      else if (code) slot.replaceChildren(h("span", { class: "qq-code" }, `绑定 ${code}`),
+        h("small", { class: "foot" }, "10 分钟内在 QQ 群里 @机器人 发送这句"));
+      else slot.replaceChildren(h("button", { type: "button", class: "btn sm pri", onclick: async () => {
+        try { draw(await invoke("qq_group_code", { group: g.id })); } catch (e) { toast(e); }
+      } }, "获取绑定码"));
+    };
+    draw();
+    return h("div", { class: "grow-row" }, h("span", { class: "gl" }, "QQ 群"), slot);
+  })();
+  const dcRows = [];
+  if (g) { if (!g.qq) where.push(grow("Discord", h("span", { class: "val" }, g.id.startsWith("local-") ? "仅在 Disco 内" : "已绑定 Discord 频道"))); }
   else if (discordOn) {
     const slot = h("span");
     const drawCh = (cs) => slot.replaceChildren(choice([["", "自动新建同名频道"], ...cs.map((c) => [`${c.guild_id}|${c.id}`, `用已有 #${c.name} · ${c.guild}`])], st.channel, (v) => { st.channel = v; }));
     drawCh([]);
-    where.push(grow("Discord 频道", slot));
+    dcRows.push(grow("Discord 频道", slot));
     invoke("discord_channels").then(drawCh).catch(() => {});
     foot = "想把 agent 带进朋友的群？先在 设置 → Discord 复制邀请链接发给朋友，他把你的 Bot 加进他的服务器后，这里就能选他的频道。频道里的每个人都能 @ 你的 agent，需要批准的操作只会问你。";
-  } else where.push(grow("Discord", h("span", { class: "val" }, "未连接，群聊先只在 Disco 内进行")));
+  } else dcRows.push(grow("Discord", h("span", { class: "val" }, "未连接，群聊先只在 Disco 内进行")));
+  where.push(...dcRows);
+  if (qqRow) where.push(qqRow);
   const err = h("div", { class: "err" });
   const go = h("button", { type: "button", class: "btn pri" }, g ? "保存" : "创建群聊");
   go.onclick = async () => {
     go.disabled = true; err.textContent = "";
     try {
       const [guildId, channelId] = st.channel ? st.channel.split("|") : [null, null];
-      const id = await invoke("save_group", { channelId, guildId, name: name.value, members: st.members, lead: st.lead ?? st.members[0] ?? null });
+      const qq = !g && st.qq ? true : null;
+      const id = await invoke("save_group", { channelId: qq ? null : channelId, guildId: qq ? null : guildId, name: name.value, members: st.members, lead: st.lead ?? st.members[0] ?? null, qq });
+      // The bind code also lands in the chat as a note, so it can't get lost.
+      const code = qq ? await invoke("qq_group_code", { group: id }).catch((e) => { toast(e, 8000); return null; }) : null;
       await load(); setTab("groups"); openThread(`group:${id}`);
+      if (code) toast(`在 QQ 群里 @机器人 发送：绑定 ${code}`, 12000);
     } catch (e) { err.textContent = String(e); go.disabled = false; }
   };
   const del = g ? h("button", { type: "button", class: "btn danger", onclick: async () => {
@@ -1461,6 +1495,8 @@ function renderSettings() {
   loadNet(netBox);
   const cfBox = h("section", { class: "gsec", id: "set-cf" });
   loadTunnel(cfBox);
+  const qqBox = h("section", { class: "gsec", id: "set-qq" });
+  loadQQ(qqBox);
   const mems = h("div", { class: "glist" }); loadMemories(mems);
   const upLine = h("span", { class: "val" }, "正在检查…");
   const upBtn = h("button", { class: "btn pri sm", type: "button", hidden: true, onclick: installUpdate }, "更新并重启");
@@ -1486,6 +1522,7 @@ function renderSettings() {
       S.ov.discord_token ? grow("连接", h("button", { class: "btn sm", type: "button", onclick: async () => { try { await invoke("discord_connect"); } catch (e) { toast(e); } } }, "重新连接")) : null,
     ], keys, "set-dc"),
     discordBox,
+    qqBox,
     netBox,
     cfBox,
     gsec("记忆", null, [mems], `在私聊里说「记住 …」存给这个 agent，在群聊里说存给本群；agent 也能用 remember 工具按主题记下东西。记忆是普通的 Markdown 文件，每次新会话自动带上，只发给这台${IS_WIN ? "电脑" : " Mac "}上的 agent。每个对话顶部的记忆按钮可以单独关掉。`, "set-mem"),
@@ -1521,6 +1558,57 @@ async function loadNet(sec) {
     grow("", save)),
     h("p", { class: "foot" }, "朋友通过邀请码使用你共享的 agent 时，Disco 会向 Tailscale 确认对方是哪台设备，再按这里的规则放行；免打扰时段不接共享消息。"));
 }
+// QQ: one scan with mobile QQ binds an official QQ bot (no AppID / AppSecret to paste).
+let qqPoll = 0;
+async function loadQQ(sec, q) {
+  const head = h("div", { class: "gsec-h" }, h("span", {}, "QQ"));
+  try { q = q ?? await invoke("qq_status"); } catch (e) { sec.replaceChildren(head, h("div", { class: "glist" }, h("div", { class: "grow-row" }, h("span", { class: "err" }, String(e))))); return; }
+  clearInterval(qqPoll);
+  const redo = (p) => p.then((s) => loadQQ(sec, s)).catch((e) => { toast(e, 8000); loadQQ(sec); });
+  const rows = [];
+  let foot = "把你的 QQ 机器人接进 Disco：手机 QQ 扫一次码，选一个机器人（没有就当场新建），确认后自动接入，密钥只存在本机。";
+  if (q.qr) {
+    // While the code is on screen, watch for the scan (the backend also swaps in a fresh code when one expires).
+    let n = 0;
+    qqPoll = setInterval(async () => {
+      if (++n > 450 || !sec.isConnected) { clearInterval(qqPoll); return; }
+      const s = await invoke("qq_status").catch(() => null);
+      if (!s) return;
+      if (s.bound) { clearInterval(qqPoll); S.ov.qq_status = S.ov.qq_status || s.status || "连接中…"; loadQQ(sec, s); renderList(); toast("QQ 机器人已接入"); }
+      else if (s.qr !== q.qr) { clearInterval(qqPoll); loadQQ(sec, s); }
+    }, 2000);
+    rows.push(h("div", { class: "grow-row col qq-scan" },
+      h("div", { class: "qq-qr", html: q.qr }),
+      h("b", {}, "用手机 QQ 扫一扫"),
+      h("small", { class: "foot" }, "在手机上选择或新建一个 QQ 机器人并确认，这里会自动完成接入。"),
+      h("button", { type: "button", class: "btn sm", onclick: () => redo(invoke("qq_bind_cancel")) }, "取消")));
+  } else if (!q.bound) {
+    const b = h("button", { type: "button", class: "btn sm pri" }, ic("qr-code"), "扫码接入");
+    b.onclick = () => { b.disabled = true; redo(invoke("qq_bind")); };
+    rows.push(grow("QQ 机器人", h("span", { class: "val" }, "未接入"), b));
+    if (q.status) rows.push(grow("上次结果", h("span", { class: "val err", title: q.status }, q.status)));
+  } else {
+    const online = /^在线/.test(q.status || "");
+    rows.push(grow("状态", h("span", { id: "qq-status", class: `status${online ? " ok" : ""}` }, h("i"), q.status || "连接中…")));
+    rows.push(grow("机器人", h("span", { class: "val" }, q.name || "QQ 机器人")));
+    rows.push(grow("解绑", h("button", { type: "button", class: "btn sm danger", onclick: async () => {
+      if (await ask("解绑 QQ 机器人？已连上的 QQ 群会停止同步，重新扫码接入后自动恢复。", "解绑")) { await redo(invoke("qq_unbind")); S.ov.qq_status = ""; renderList(); }
+    } }, "解绑")));
+    foot = "把机器人拉进 QQ 群，再到 群聊 → 新建群聊 打开「同步到 QQ 群」，按提示在群里发绑定码。QQ 群里 @机器人 说话，写 @agent 名字可以点名；没点名就交给组长。";
+  }
+  sec.replaceChildren(head, h("div", { class: "glist" }, ...rows), h("p", { class: "foot" }, foot));
+}
+// Gateway status changes, a refreshed QR code, or a failed scan: re-read the real state.
+listen("qq", async ({ payload }) => {
+  if (!S.ov) return;
+  const q = await invoke("qq_status").catch(() => null);
+  if (!q) return;
+  S.ov.qq_status = q.bound ? q.status || "连接中…" : "";
+  const el = $("#qq-status");
+  if (el && q.bound && payload) { el.className = `status${/^在线/.test(q.status) ? " ok" : ""}`; el.replaceChildren(h("i"), S.ov.qq_status); }
+  else { const sec = $("#set-qq"); if (sec) loadQQ(sec, q); }
+  if (S.tab === "settings") renderList();
+});
 // Cloudflare named tunnel: the other way (besides Tailscale) for friends to reach shared agents.
 let tunnelPoll = 0;
 async function loadTunnel(sec, t) {

@@ -15,6 +15,7 @@ mod files;
 mod git;
 mod tailnet;
 mod tunnel;
+mod qq;
 mod templates;
 #[cfg(debug_assertions)]
 mod selftest;
@@ -532,6 +533,11 @@ impl Core {
                 };
             });
         }
+        // A group tied to a QQ group: the bot says it there (`**name**：text`).
+        if !from_discord && let Some((rest, openid)) = qq::target(self, &thread) {
+            let (who, body) = (if owner { share::owner_name() } else { display(&author) }, text.clone());
+            tauri::async_runtime::spawn(async move { let _ = qq::post(&rest, &openid, &who, &body).await; });
+        }
         if owner && let Some(task) = team::command(&text) {
             self.team(&g, task).await;
             return;
@@ -584,6 +590,11 @@ impl Core {
                             {
                                 self.post_message(thread, "system", &format!("Discord 发送失败：{e}"));
                             }
+                            if let Some((rest, openid)) = qq::target(self, thread)
+                                && let Err(e) = qq::post(&rest, &openid, agent, &answer).await
+                            {
+                                self.post_message(thread, "system", &format!("QQ 发送失败：{e}"));
+                            }
                             // The opening `@caller` is the reply's address, not a hand-off back.
                             mentions(after_address(&answer, &display(by)), &g.members, Some(agent)).into_iter().map(|m| (m, agent.clone())).collect()
                         }
@@ -618,6 +629,9 @@ impl Core {
                     let ch = g.id.clone();
                     tauri::async_runtime::spawn(async move { let _ = d.post(&ch, help).await; });
                 }
+                if let Some((rest, openid)) = qq::target(self, thread) {
+                    tauri::async_runtime::spawn(async move { let _ = qq::post(&rest, &openid, "", help).await; });
+                }
                 true
             }
             _ => false,
@@ -632,7 +646,7 @@ impl Core {
         for m in history {
             let a = m.author;
             if a == "me" || a == "system" || g.members.contains(&a) || owner.contains(&a) { continue; }
-            let list = if a.ends_with(HUMAN_TAG) { &mut r.people } else { &mut r.agents };
+            let list = if is_human(&a) { &mut r.people } else { &mut r.agents };
             let name = display(&a);
             if !list.contains(&name) { list.push(name); }
         }
@@ -786,17 +800,19 @@ pub(crate) const HUMAN_TAG: &str = " (Discord)";
 /// Other Discos' agents (their webhooks) are stored as `Name (Disco)`, so they never pass
 /// for the owner or one of our agents and always count as foreign hand-offs.
 pub(crate) const FOREIGN_TAG: &str = " (Disco)";
+/// People in a QQ group are stored as `Name (QQ)` (the owner, recognised by the bind code, as `me`).
+pub(crate) const QQ_TAG: &str = " (QQ)";
 /// Hand-offs from other Discos' agents allowed per channel per 10 minutes.
 const FOREIGN_TURNS: usize = 6;
 /// Agent commands that change its state: only the agent's owner may run them from a group.
 const RESTRICTED: &[&str] = &["clear", "compact", "model", "config", "login", "logout", "permissions", "init", "mcp", "resume", "reset", "new", "exit"];
 
-fn is_human(author: &str) -> bool { author == "me" || author.ends_with(HUMAN_TAG) }
+fn is_human(author: &str) -> bool { author == "me" || author.ends_with(HUMAN_TAG) || author.ends_with(QQ_TAG) }
 
 /// The name people see: `me` is the owner, `Name (Discord)` / `Name (Disco)` is `Name`.
 fn display(author: &str) -> String {
     if author == "me" { return share::owner_name(); }
-    author.strip_suffix(HUMAN_TAG).or_else(|| author.strip_suffix(FOREIGN_TAG)).unwrap_or(author).to_owned()
+    author.strip_suffix(HUMAN_TAG).or_else(|| author.strip_suffix(QQ_TAG)).or_else(|| author.strip_suffix(FOREIGN_TAG)).unwrap_or(author).to_owned()
 }
 
 /// Other people and other Discos' agents seen in a group.
@@ -913,7 +929,7 @@ struct AgentView {
     busy_since: Option<i64>,
 }
 #[derive(Serialize)]
-struct GroupView { id: String, name: String, guild_id: String, lead: Option<String>, members: Vec<String>, people: Vec<String>, guests: Vec<String> }
+struct GroupView { id: String, name: String, guild_id: String, lead: Option<String>, members: Vec<String>, people: Vec<String>, guests: Vec<String>, qq: bool }
 #[derive(Serialize)]
 struct Head { thread: String, author: String, body: String, ts: i64 }
 #[derive(Serialize)]
@@ -926,6 +942,8 @@ struct Overview {
     heads: Vec<Head>,
     discord_token: bool,
     discord_status: String,
+    /// The QQ bot's state ("" = no bot bound).
+    qq_status: String,
     paused: bool,
     /// Chats with memory switched off.
     memory_off: Vec<String>,
@@ -962,7 +980,8 @@ async fn overview(core: St<'_>) -> CmdResult<Overview> {
     // `db()` in it (roster, the switches) would then deadlock the whole app.
     let groups: Vec<GroupView> = groups.into_iter().map(|g| {
         let r = core.roster(&g, &format!("group:{}", g.id));
-        GroupView { id: g.id, name: g.name, guild_id: g.guild_id, lead: g.lead_agent, members: g.members, people: r.people, guests: r.agents }
+        let qq = qq::openid_of(&core, &g.id).is_some();
+        GroupView { id: g.id, name: g.name, guild_id: g.guild_id, lead: g.lead_agent, members: g.members, people: r.people, guests: r.agents, qq }
     }).collect();
     let discord_token = core.db().setting(SET_TOKEN_SAVED).is_some();
     let memory_off: Vec<String> = core.db().settings_with_prefix(memory::MEM_OFF).unwrap_or_default().into_iter()
@@ -974,6 +993,7 @@ async fn overview(core: St<'_>) -> CmdResult<Overview> {
         heads: heads.into_iter().map(|(t, m)| Head { thread: t, author: m.author, body: m.body, ts: m.ts }).collect(),
         discord_token,
         discord_status: core.discord_status(),
+        qq_status: qq::overview_status(&core),
         paused: core.paused.load(Ordering::Relaxed),
         memory_off,
     })
@@ -1571,13 +1591,15 @@ async fn discord_channels(core: St<'_>) -> CmdResult<Vec<Channel>> {
 }
 
 #[tauri::command]
-async fn save_group(core: St<'_>, channel_id: Option<String>, guild_id: Option<String>, name: String, members: Vec<String>, lead: Option<String>) -> CmdResult<String> {
+async fn save_group(core: St<'_>, channel_id: Option<String>, guild_id: Option<String>, name: String, members: Vec<String>, lead: Option<String>, qq: Option<bool>) -> CmdResult<String> {
     if members.is_empty() { return Err("至少选一个 agent".into()); }
     let name = name.trim();
     if name.is_empty() { return Err("给群起个名字".into()); }
     let rest = core.discord_rest();
     let home = core.db().setting(SET_HOME_GUILD);
     // No channel given: make one in the home guild, or keep the group local when Discord isn't set up.
+    // A group for a QQ group stays local (QQ is tied afterwards with a bind code).
+    let rest = if qq == Some(true) { None } else { rest };
     let (channel_id, guild_id) = match (channel_id.filter(|c| !c.is_empty()), &rest) {
         (Some(c), _) => (c, guild_id.unwrap_or_default()),
         (None, Some(r)) if let Some(guild) = home => {
@@ -1737,6 +1759,7 @@ pub fn run() {
             core.warm(None);
             if !core.shares().is_empty() { core.serve_shares(); }
             tunnel::resume(&core);
+            qq::connect(&core);
             app.manage(core);
             #[cfg(debug_assertions)]
             if let Ok(mock) = std::env::var("DISCO_SELFTEST") { selftest::spawn(app.handle().clone(), mock); }
@@ -1754,7 +1777,8 @@ pub fn run() {
             overview, detect_agents, conda_envs, choose_path, memories, forget, add_agent, remove_agent, rename_agent, restart_agent, set_look, set_avatar, stop_reply, messages, send, inbox, inbox_answer, net_policy, net_policy_set, send_file, team_state, team_files, agent_configs, set_agent_config,
             stop_all, resume, save_discord_token, discord_connect, discord_settings, discord_sync, diagnose, open_url, reveal_path, discord_channels, save_group, delete_group, restore_group, memory_restore, set_memory, agent_commands,
             check_update, install_update, space, todo_new, todo_set, todo_remove, doc_save, reveal_doc, share::share_status, share::peer_check, share::create_share, share::share_invite, share::revoke_share, share::accept_invite,
-            tunnel::tunnel_status, tunnel::tunnel_install, tunnel::tunnel_login, tunnel::tunnel_setup, tunnel::tunnel_set
+            tunnel::tunnel_status, tunnel::tunnel_install, tunnel::tunnel_login, tunnel::tunnel_setup, tunnel::tunnel_set,
+            qq::qq_status, qq::qq_bind, qq::qq_bind_cancel, qq::qq_unbind, qq::qq_group_code
         ])
         .build(tauri::generate_context!())
         .expect("error while running Disco")

@@ -8,7 +8,7 @@
 - `手动验证` = 无法离线确定性测试（真实 Discord 网关、Tailscale、系统对话框、更新服务器），后面写手动步骤。
 - `UI` = 纯界面行为，由 ui-test/ 与 `notes/ui-feature-inventory.md` 守护，本文件只登记。
 
-v1.6.5 基线新增的 selftest 检查在下表中用 ★ 标出；v1.8.0 跨设备传文件新增的用 ◆ 标出；v1.9.0 Cloudflare 隧道新增的用 ▲ 标出。
+v1.6.5 基线新增的 selftest 检查在下表中用 ★ 标出；v1.8.0 跨设备传文件新增的用 ◆ 标出；v1.9.0 Cloudflare 隧道新增的用 ▲ 标出；v1.10.0 QQ 官方机器人新增的用 ● 标出。
 
 ## 私聊
 
@@ -34,7 +34,7 @@ v1.6.5 基线新增的 selftest 检查在下表中用 ★ 标出；v1.8.0 跨设
 
 | 功能 | 行为契约 | 覆盖 |
 |---|---|---|
-| 建群 `save_group` | 至少一个成员、要有名字；无 Discord 时建本地群 `local-…`；组长不在成员里则取第一个 | ST:save_group |
+| 建群 `save_group` | 至少一个成员、要有名字；无 Discord 时或 `qq: true` 时建本地群 `local-…`；组长不在成员里则取第一个 | ST:save_group |
 | 删群/撤销 `delete_group` `restore_group` | 删除保留历史和 webhook，撤销后群恢复 | ST:delete+restore group |
 | 不 @ → 组长答 | 只有主人一个人时，不 @ 的消息由组长回答 | ST:群 不@ → 组长, ST:Discord 群 主人不@ → 组长 |
 | @ 成员 | 被 @ 的成员回答；同时 @ 多个并发回答；`@all` 叫全部；中文紧跟 ASCII 名也算 | ST:群 @m2, ST:群 @m1 @m2 并发, ST:Discord @m1中文 也能叫到, UT:lib::mention_order_and_self_exclusion, UT:lib::routing_v1_5_12, UT:lib::kelvin_sign_mentions |
@@ -122,6 +122,17 @@ v1.6.5 基线新增的 selftest 检查在下表中用 ★ 标出；v1.8.0 跨设
 | Cloudflare 隧道 邀请与传文件 | 邀请码指向 `https://<域名>/a/<id>`，访客不需要 Tailscale；开了 Access 时邀请码带 CF-Access-Client-Id/Secret，访客 Disco 每个请求（含名片、取文件）都带上；共享 agent 回复中每 25 秒发一次「仍在处理」，避开 Cloudflare 100 秒无响应断开；20 MB 文件照常走隧道 | ▲ST:隧道 文件随消息经隧道送达, UI:T6；手动验证：两台不在同一 Tailscale 的电脑，主人开隧道发邀请码，访客接入后聊天、互发 10 MB 文件；agent 跑一个 >2 分钟的工具也不断 |
 | 对方群回话 `peer_check` | 只有 Bot 能看到频道且主人账号在该服务器时才能说话；否则只读并说明缺什么 | ST:对方群需你和 Bot 都在, ★ST:对方群 peer_turn …（peer_check 返回原因）；手动验证：朋友把你的 Bot 和你拉进他的服务器，你的 agent 被 @ 后，peer 会话出现输入框 |
 
+## QQ 群（官方 QQ 机器人）
+
+| 功能 | 行为契约 | 覆盖 |
+|---|---|---|
+| 扫码接入 `qq_status` `qq_bind` `qq_bind_cancel` | 设置 → QQ 只有一个「扫码接入」：Disco 向 q.qq.com 建绑定任务（随机 32 字节 key），在 app 里显示二维码；手机 QQ 扫一次、选择或新建机器人并确认后，AppID 和 AES-256-GCM 加密的 AppSecret 回来，本机解密、用 `/users/@me` 验证后存进钥匙串/凭据管理器并连网关；二维码过期自动换新的；任何地方都没有粘贴 AppID / AppSecret 的输入框 | ●ST:QQ 扫码绑定：显示二维码，扫码确认后保存机器人, UT:disco-qq（解密、分段、事件解析）, UI:Q1–Q4；手动验证：mac / Windows 各一台，设置 → QQ → 扫码接入，用手机 QQ 扫码确认，状态变「在线 · 机器人名」 |
+| QQ 群绑定 `qq_group_code` | 新建群聊时打开「同步到 QQ 群」（群保持本地，不建 Discord 频道），或在已有本地群的群设置里「获取绑定码」：4 位码 10 分钟有效，同时写进会话；在 QQ 群里 @机器人 发「绑定 1234」即连上，发码的人被认作主人本人；Discord 群聊不能再绑 QQ；可断开 | ●ST:QQ 绑定码把 QQ 群连上，发码的人算本人, ●ST:QQ 解绑群和机器人, UI:Q5–Q8；手动验证：把机器人拉进真实 QQ 群，发绑定码，会话出现「已和 QQ 群连上」 |
+| QQ 群收发 | QQ 群里 @机器人 没点名 → 组长；写 @agent 名字点名；其他人记为「名字 (QQ)」；本地和 agent 的消息以 `**名字**：内容` 发到 QQ 群（5 分钟内对最新消息被动回复、最多 5 条，超出走主动消息）；图片/文件附件存进群共享空间并把路径给 agent；agent `send_file` 的文件也发到 QQ 群；重复投递的消息只处理一次；Discord 群聊的行为不变 | ●ST:QQ @机器人 交给组长；回复是对那条消息的被动回复，带名字前缀, ●ST:QQ 群里其他人 @agent：提及改写、附件存进共享空间、名字带 (QQ), ●ST:QQ agent 发文件到 QQ 群，Discord 群聊路径不变 |
+| 其他 Disco 的 QQ 机器人 | 另一个 Disco 的机器人以 `**名字**：` 说话时记为「名字 (Disco)」，可接力（同 Discord 限流）；其他机器人与未绑定的群忽略 | ●ST:QQ 其他 Disco 的机器人按「**名字**：」识别，别的机器人和重复消息忽略；手动验证：两个 Disco 的机器人在同一个 QQ 群里，确认 QQ 是否把一个机器人的消息推给另一个（官方 API 默认只推 @机器人 的消息） |
+| 待处理卡片 | 需要批准/提问时，QQ 群里发带按钮的卡片；只有主人（发绑定码的人）点按钮才算，其他人点了无效 | ●ST:QQ 待处理卡片带按钮，只有本人点了才算；手动验证：真实 QQ 群里点按钮 |
+| 解绑机器人 `qq_unbind` | 断开网关、删除钥匙串里的凭据；已绑定的 QQ 群保留，重新扫码后恢复 | ●ST:QQ 解绑群和机器人, UI:Q9 |
+
 ## Agent 接入（ACP / OpenAI / A2A / 邀请码）
 
 | 功能 | 行为契约 | 覆盖 |
@@ -187,7 +198,7 @@ v1.6.5 基线新增的 selftest 检查在下表中用 ★ 标出；v1.8.0 跨设
 
 侧栏标签与快捷键、列表搜索与折叠、聊天头部（头像上传裁剪、双击改名、模型胶囊、记忆/待办/信息按钮）、Inspector（成员/待办/文档/黑板）、@ 与 / 选择器、团队开关、通知卡片、撤销提示、更新条、首次运行导入、Windows/macOS 外观差异。完整清单与验证见 `notes/ui-feature-inventory.md`（项目笔记，64 项）。
 
-## Tauri 命令覆盖总表（invoke_handler 共 54 个）
+## Tauri 命令覆盖总表（invoke_handler 共 64 个）
 
 | 命令 | 覆盖 |
 |---|---|
@@ -219,6 +230,7 @@ v1.6.5 基线新增的 selftest 检查在下表中用 ★ 标出；v1.8.0 跨设
 | peer_check | ★ST:共享 chat 模式…（无群返回空）, ★ST:对方群 peer_turn … |
 | create_share, revoke_share, accept_invite | ST:共享 邀请码接入后能聊, ST:共享 撤销后被拒, ▲ST:隧道 邀请过期即拒（`days`） |
 | tunnel_status, tunnel_install, tunnel_login, tunnel_setup, tunnel_set | ▲ST:隧道 邀请码带 Access 令牌，设置往返；安装/登录/建隧道手动验证（真实 Cloudflare 账号） |
+| qq_status, qq_bind, qq_bind_cancel, qq_unbind, qq_group_code | ●ST:QQ 扫码绑定…, ●ST:QQ 绑定码把 QQ 群连上…, ●ST:QQ 解绑群和机器人；真实扫码与 QQ 群手动验证 |
 
 ## 维护规则
 

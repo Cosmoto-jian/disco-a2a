@@ -18,6 +18,7 @@ disco-types.workspace = true
 disco-store = { path = "../disco-store" }
 disco-a2a = { path = "../disco-a2a" }
 disco-discord = { path = "../disco-discord" }
+disco-qq = { path = "../disco-qq" }
 disco-acp = { path = "../disco-acp" }
 tauri = { version = "2", features = [] }
 tauri-plugin-updater = "2"

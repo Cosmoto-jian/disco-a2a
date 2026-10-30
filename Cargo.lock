@@ -1050,6 +1050,7 @@ dependencies = [
  "disco-a2a",
  "disco-acp",
  "disco-discord",
+ "disco-qq",
  "disco-store",
  "disco-types",
  "futures",
@@ -1074,6 +1075,21 @@ dependencies = [
  "futures",
  "reqwest",
  "rustls",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-tungstenite",
+]
+
+[[package]]
+name = "disco-qq"
+version = "0.0.1"
+dependencies = [
+ "base64 0.22.1",
+ "futures",
+ "qrcode",
+ "reqwest",
+ "ring",
  "serde",
  "serde_json",
  "tokio",
@@ -3483,6 +3499,12 @@ checksum = "84bbb29c624230c4bd1047bbdb2aa47e41c860e9665ce62ba9504eebe91bf867"
 dependencies = [
  "pulldown-cmark",
 ]
+
+[[package]]
+name = "qrcode"
+version = "0.14.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d68782463e408eb1e668cf6152704bd856c78c5b6417adaee3203d8f4c1fc9ec"
 
 [[package]]
 name = "quick-xml"

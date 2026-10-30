@@ -195,7 +195,7 @@ class Audit:
     async def boot(self):
         win = self.plat == "win"
         listeners = await self.js("Object.keys(__L).sort()")
-        want = sorted(["agents", "message", "typing", "stream", "inbox", "team", "space", "update-available", "discord-status"])
+        want = sorted(["agents", "message", "typing", "stream", "inbox", "team", "space", "update-available", "discord-status", "qq"])
         self.ok("E1 every backend event has a listener", listeners == want, listeners)
         self.ok("K2 html.win only on Windows", await self.js("document.documentElement.classList.contains('win')") == win)
         rail = await self.js("getComputedStyle(document.documentElement).getPropertyValue('--rail-w').trim()")
@@ -869,9 +869,9 @@ class Audit:
         pg = self.pg
         m0 = await self.mark()
         await self.tab("settings")
-        self.ok("G sections", all([await self.has(f"#set-{s}") for s in ["dc", "net", "cf", "mem", "run", "gen"]]))
+        self.ok("G sections", all([await self.has(f"#set-{s}") for s in ["dc", "qq", "net", "cf", "mem", "run", "gen"]]))
         navs = await self.js("[...document.querySelectorAll('#items li.nav .name')].map((n) => n.textContent)")
-        self.ok("L10 settings nav rows", navs == ["Discord", "共享与 Tailscale", "Cloudflare 隧道", "记忆", "运行", "通用与更新"], navs)
+        self.ok("L10 settings nav rows", navs == ["Discord", "QQ", "共享与 Tailscale", "Cloudflare 隧道", "记忆", "运行", "通用与更新"], navs)
         self.ok("L10 Discord row shows live status", "在线 · MyBot#0001" in await self.text("#items li.nav >> nth=0"))
         await self.step("nav mem", lambda: pg.click("#items li.nav:has-text('记忆')"))
         self.ok("L10 nav selects + scrolls", await self.js("S.setSec") == "mem" and await self.has("#items li.nav.on:has-text('记忆')"))
@@ -996,6 +996,85 @@ class Audit:
         await self.step("close", lambda: pg.click("#dlg .actions .btn:text-is('关闭')"))
         await self.js("Object.assign(STUB.tunnel, { via: 'tailscale' })")
 
+    async def qq(self):
+        """QQ: one-scan bind in Settings (no AppID/AppSecret field anywhere), status, unbind; QQ in the group editor."""
+        pg = self.pg
+        await self.js("document.querySelector('#dlg').open && document.querySelector('#dlg').close()")
+        await self.tab("settings")
+        sec = "#set-qq"
+        await pg.wait_for_selector(f"{sec} .glist .grow-row")
+        self.ok("Q1 not bound: one scan button", await self.has(f"{sec} button:has-text('扫码接入')") and "未接入" in await self.text(sec))
+        self.ok("Q1 nav row says 未接入", "未接入" in await self.text("#items li.nav:has-text('QQ')"))
+        self.ok("Q1 sits right after Discord", await self.js("(() => { const a = document.querySelector('#set-dc'); let n = a.nextElementSibling; while (n && !n.id) n = n.nextElementSibling; return n && n.id; })()") == "set-qq")
+        no_paste = await self.js("""(() => { const t = document.querySelector('#pane').innerText + [...document.querySelectorAll('#pane input')].map((i) => i.placeholder).join(' ');
+          return !/AppSecret|AppID|App ID|App Secret/i.test(t) && !document.querySelector('#set-qq input'); })()""")
+        self.ok("Q1 no AppID / AppSecret paste field", no_paste)
+        m = await self.mark()
+        await self.step("qq scan", lambda: pg.click(f"{sec} button:has-text('扫码接入')"))
+        await self.expect("Q2 扫码接入", "qq_bind", m)
+        self.ok("Q2 QR code shown in the app", await self.wait(f"{sec} .qq-qr svg") and "用手机 QQ 扫一扫" in await self.text(sec))
+        self.ok("Q2 still no paste field while scanning", not await self.has(f"{sec} input"))
+        await self.step("qq cancel", lambda: pg.click(f"{sec} button:text-is('取消')"))
+        await self.expect("Q2 取消", "qq_bind_cancel", m)
+        self.ok("Q2 back to the scan button", await self.wait(f"{sec} button:has-text('扫码接入')") and not await self.has(f"{sec} .qq-qr"))
+        await self.step("qq scan again", lambda: pg.click(f"{sec} button:has-text('扫码接入')"))
+        await pg.wait_for_selector(f"{sec} .qq-qr svg")
+        await self.js("STUB.qq_scan()")
+        self.ok("Q3 scan noticed by polling", await self.wait(f"{sec} #qq-status.ok", timeout=6000) and "在线 · DiscoBot" in await self.text("#qq-status"))
+        self.ok("Q3 bot name + unbind", "DiscoBot" in await self.text(f"{sec} .grow-row:has(.gl:text-is('机器人'))") and await self.has(f"{sec} button:text-is('解绑')"))
+        self.ok("Q3 nav row follows", "在线 · DiscoBot" in await self.text("#items li.nav:has-text('QQ')"))
+        self.ok("Q3 group how-to", "绑定码" in await self.text(f"{sec} > p.foot"))
+        await self.js("STUB.qq.status = '连接中…'")
+        await self.step("qq event", lambda: self.fire("qq", "连接中…"))
+        await pg.wait_for_function("document.querySelector('#qq-status')?.textContent === '连接中…'")
+        self.ok("Q4 live status patch", not await self.has("#qq-status.ok"))
+        await self.js("STUB.qq.status = '在线 · DiscoBot'")
+        await self.fire("qq", "在线 · DiscoBot")
+        self.ok("Q4 no button inside a label", await self.js("document.querySelectorAll('#set-qq label button').length") == 0)
+        # group editor: new group for a QQ group
+        await self.tab("groups")
+        m = await self.mark()
+        await self.step("new qq group", lambda: self.js("groupDialog()"))
+        row = ".gpage .grow-row:has(.gl:text-is('同步到 QQ 群'))"
+        self.ok("Q5 QQ option in the group editor", await self.wait(row))
+        await pg.fill(".gname", "QQ 群聊")
+        await self.step("pick claude", lambda: pg.click(".ptile:has-text('claude')"))
+        await self.step("qq toggle", lambda: pg.click(f"{row} input.tgl"))
+        self.ok("Q5 Discord channel hidden for a QQ group", not await pg.locator(".gpage .grow-row:has(.gl:text-is('Discord 频道'))").is_visible())
+        await self.step("create qq group", lambda: pg.click(".gpage .factions .btn.pri"))
+        await self.expect("Q5 save_group as a QQ group", "save_group", m, lambda a: a.get("qq") is True and a.get("channelId") is None and a.get("name") == "QQ 群聊")
+        hits = await self.expect("Q5 bind code requested", "qq_group_code", m, lambda a: str(a.get("group", "")).startswith("local-") and not a.get("unbind"))
+        self.ok("Q5 bind code shown", await self.wait(".toast:has-text('绑定 1234')"))
+        gid = hits[0]["group"] if hits else ""
+        # existing local group: get a code, then (once tied) untie
+        await self.step("edit qq group", lambda: self.js("(id) => groupDialog(S.ov.groups.find((g) => g.id === id))", gid))
+        await self.step("get code", lambda: pg.click(".gpage button:text-is('获取绑定码')"))
+        await self.expect("Q6 获取绑定码", "qq_group_code", m, lambda a: a == {"group": gid})
+        self.ok("Q6 code in the editor", await self.wait(".gpage .qq-code:has-text('绑定 1235')"))
+        await self.js("(id) => { STUB.groups.find((g) => g.id === id).qq = true; }", gid)
+        await self.js("load()")
+        await self.open(f"group:{gid}")
+        self.ok("Q7 inspector shows QQ sync", await self.js("(() => { S.insp || toggleInspector(S.thread); return true; })()") and await self.wait("text=同步到 QQ 群"))
+        await self.step("edit tied group", lambda: self.js("(id) => groupDialog(S.ov.groups.find((g) => g.id === id))", gid))
+        self.ok("Q7 tied state", await self.wait(".gpage .status.ok:has-text('已连上 QQ 群')"))
+        m = await self.mark()
+        await self.step("untie", lambda: pg.click(".gpage .btn.danger:text-is('断开')"))
+        self.ok("Q7 asks first", await self.wait("#dlg[open]") and "QQ 群" in await self.text("#dlg h3"))
+        await self.step("confirm untie", lambda: pg.click("#dlg .btn.pri"))
+        await self.expect("Q7 断开", "qq_group_code", m, lambda a: a == {"group": gid, "unbind": True})
+        # a Discord-synced group has no QQ option
+        await self.step("edit discord group", lambda: self.js("groupDialog(S.ov.groups.find((g) => !g.id.startsWith('local-')))"))
+        self.ok("Q8 no QQ option for a Discord group", not await self.has(".gpage .grow-row:has(.gl:text-is('QQ 群'))") and not await self.has(".gpage .grow-row:has(.gl:text-is('同步到 QQ 群'))"))
+        # unbind the bot
+        await self.tab("settings")
+        await pg.wait_for_selector(f"{sec} button:text-is('解绑')")
+        m = await self.mark()
+        await self.step("unbind", lambda: pg.click(f"{sec} button:text-is('解绑')"))
+        self.ok("Q9 asks before unbinding", await self.wait("#dlg[open]") and "解绑 QQ 机器人" in await self.text("#dlg h3"))
+        await self.step("confirm unbind", lambda: pg.click("#dlg .btn.pri"))
+        await self.expect("Q9 qq_unbind", "qq_unbind", m)
+        self.ok("Q9 back to scan", await self.wait(f"{sec} button:has-text('扫码接入')") and "未接入" in await self.text("#items li.nav:has-text('QQ')"))
+
     async def events(self):
         pg = self.pg
         await self.tab("chats")
@@ -1094,7 +1173,7 @@ addEventListener('DOMContentLoaded', () => setTimeout(() => { __L.message({ payl
     async def run(self):
         self.pg = await self.new_page()
         for suite in [self.boot, self.rail, self.list_column, self.inbox_tab, self.dm_chat, self.dm_codex, self.composer, self.remote_files, self.group_chat,
-                      self.group_pages, self.peers, self.agents_tab, self.gallery, self.settings, self.tunnel, self.events, self.clickrace, self.remove_agent]:
+                      self.group_pages, self.peers, self.agents_tab, self.gallery, self.settings, self.tunnel, self.qq, self.events, self.clickrace, self.remove_agent]:
             if self.verbose:
                 print(f"[{self.label}] {suite.__name__}")
             try:
