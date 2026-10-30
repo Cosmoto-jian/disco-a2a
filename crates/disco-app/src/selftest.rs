@@ -876,15 +876,22 @@ pub fn spawn(app: AppHandle, mock: String) {
             feed("GROUP_AT_MESSAGE_CREATE", serde_json::json!({ "id": "q2", "group_openid": "G1", "content": "帮我看下", "author": { "member_openid": "U1" } }))?;
             wait_msg(&core, &qthread, "m1", n, 30).await?;
             if last_from(&core, &qthread, "me").as_deref() != Some("@m1 帮我看下") { return Err(format!("{:?}", last_from(&core, &qthread, "me"))); }
-            until(10, || qlog("msg:G1").iter().any(|b| b["msg_id"] == "q2")).await?;
-            let r = qlog("msg:G1").into_iter().find(|b| b["msg_id"] == "q2").unwrap_or_default();
-            if r["markdown"]["content"].as_str().unwrap_or_default().starts_with("**m1**：") && r["msg_seq"] == 1 { Ok(String::new()) } else { Err(r.to_string()) } });
+            // The mock asks a permission first: that card is reply 1 to q2, the answer comes after it.
+            let said = |b: &serde_json::Value| b["msg_id"] == "q2" && b["markdown"]["content"].as_str().unwrap_or_default().starts_with("**m1**：");
+            until(10, || qlog("msg:G1").iter().any(said)).await?;
+            let to_q2: Vec<_> = qlog("msg:G1").into_iter().filter(|b| b["msg_id"] == "q2").collect();
+            let seqs: Vec<u64> = to_q2.iter().filter_map(|b| b["msg_seq"].as_u64()).collect();
+            let unique = seqs.iter().all(|s| seqs.iter().filter(|x| *x == s).count() == 1);
+            if unique && seqs.iter().all(|s| (1..=5).contains(s)) { Ok(String::new()) } else { Err(format!("{seqs:?} {to_q2:?}")) } });
         let _ = check!("QQ 群里其他人 @agent：提及改写、附件存进共享空间、名字带 (QQ)", {
             let n = count(&core, &qthread, "m2");
             feed("GROUP_MESSAGE_CREATE", serde_json::json!({ "id": "q3", "group_openid": "G1", "content": "<@BOT> @m2 收下这个 <@U1>",
                 "author": { "member_openid": "U2", "username": "阿杰" }, "mentions": [{ "member_openid": "BOT", "is_you": true }, { "member_openid": "U1", "username": "我" }],
                 "attachments": [{ "url": format!("{qbase}/file.txt"), "filename": "a b.txt", "size": 7 }] }))?;
-            wait_msg(&core, &qthread, "m2", n, 30).await?;
+            wait_msg(&core, &qthread, "m2", n, 30).await.map_err(|e| {
+                let tail: Vec<_> = core.db().messages(&qthread, 500).unwrap_or_default().into_iter().rev().take(4).map(|m| format!("{}: {}", m.author, m.body)).collect();
+                format!("{e} {tail:?}")
+            })?;
             let said = last_from(&core, &qthread, "阿杰 (QQ)").unwrap_or_default();
             let saved = crate::mcp::space_dir(&core, &qthread).map(|d| d.join("files").join("a b.txt")).ok().and_then(|p| std::fs::read_to_string(p).ok());
             let ov = within(5, crate::overview(st())).await??;
