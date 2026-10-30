@@ -165,13 +165,32 @@ impl Core {
         rows.into_iter().filter(|r| r.transport == "a2a" && members.contains(&r.name)).map(|r| r.name).collect()
     }
 
-    /// A file a remote agent sent back: verify it, save it in the thread's space, show it.
+    /// A file a remote agent sent back: verify it, save it in the thread's space, show it
+    /// (and send it to QQ, when this thread is a QQ group or a QQ-synced private chat).
     pub(crate) fn receive_file(&self, thread: &str, agent: &str, f: &FilePart) {
         let dir = crate::mcp::space_dir(self, thread).map(|d| d.join("files"));
         match dir.and_then(|d| save_incoming(&d, f)) {
-            Ok((dst, size, hash)) => self.post_message(thread, agent, &file_line("", &safe_name(&f.name), size, &hash, &dst)),
+            Ok((dst, size, hash)) => {
+                let name = safe_name(&f.name);
+                self.post_message(thread, agent, &file_line("", &name, size, &hash, &dst));
+                self.qq_file(thread, &dst, &name);
+            }
             Err(e) => self.post_message(thread, "system", &format!("{agent} 发来的{e}")),
         }
+    }
+
+    /// Send a file of `thread` to the QQ group / private chat it syncs with, in the
+    /// background (QQ's one-shot upload limit is 20 MB; a bigger one is reported in
+    /// Settings → QQ「发送失败」, never dropped silently).
+    fn qq_file(&self, thread: &str, path: &std::path::Path, name: &str) {
+        let Some((rest, to)) = crate::qq::target(self, thread) else { return };
+        let (path, name) = (path.to_path_buf(), name.to_owned());
+        tauri::async_runtime::spawn(async move {
+            match tokio::fs::read(&path).await {
+                Ok(bytes) => if let Err(e) = crate::qq::post_file(&rest, &to, &name, &bytes).await { crate::qq::note_send_error(&e); },
+                Err(e) => crate::qq::note_send_error(&format!("读文件失败：{e}")),
+            }
+        });
     }
 
     /// Copy `path` into the thread's shared space and post it there. An agent's
@@ -189,13 +208,8 @@ impl Core {
             tokio::task::spawn_blocking(move || copy_in(&p, &dir, &name)).await.map_err(crate::err)??
         };
         let line = file_line(note, &name, size, &hash, &dst);
-        // A group tied to a QQ group gets the file itself there too.
-        if let Some((rest, openid)) = crate::qq::target(self, thread) {
-            let (path, name) = (dst.clone(), name.clone());
-            tauri::async_runtime::spawn(async move {
-                if let Ok(bytes) = tokio::fs::read(&path).await { let _ = crate::qq::post_file(&rest, &openid, &name, &bytes).await; }
-            });
-        }
+        // A group tied to a QQ group (or a QQ-synced private chat) gets the file itself.
+        self.qq_file(thread, &dst, &name);
         {
             let mut q = PENDING.lock().unwrap_or_else(|p| p.into_inner());
             q.extend(remote.iter().map(|a| Pending { agent: a.clone(), thread: thread.to_owned(), path: dst.clone(), name: name.clone(), size, sha256: hash.clone() }));

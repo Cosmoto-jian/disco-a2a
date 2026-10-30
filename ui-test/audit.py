@@ -1060,6 +1060,14 @@ class Audit:
         await self.fire("qq", "")
         await pg.wait_for_function("document.querySelector('#qq-event')?.textContent.includes('GROUP_AT_MESSAGE_CREATE')")
         self.ok("Q10 group @ message shown as received", "共 7 个" in await self.text("#qq-event"))
+        # v1.12: only the answer is mirrored unless「显示工具过程」is on (default off).
+        self.ok("Q12 tool trace hidden by default", await self.has("#qq-show-tools") and not await self.js("document.querySelector('#qq-show-tools').checked"))
+        m = await self.mark()
+        await self.step("show tool trace", lambda: pg.click("#qq-show-tools"))
+        await self.expect("Q12 qq_set", "qq_set", m, lambda a: a.get("showTools") is True)
+        self.ok("Q12 toggle on", await self.js("document.querySelector('#qq-show-tools').checked"))
+        await self.step("hide again", lambda: pg.click("#qq-show-tools"))
+        self.ok("Q12 toggle off", await self.wait("#qq-show-tools:not(:checked)") or not await self.js("document.querySelector('#qq-show-tools').checked"))
         # GROUP_MSG_REJECT / GROUP_MSG_RECEIVE come through as a row too
         await self.js("Object.assign(STUB.qq.diag, { gate: 'QQ 已拒收本机器人在该群的消息 · QQ 群 …G9ABCD', gate_at: Date.now() - 30000 })")
         await self.fire("qq", "")

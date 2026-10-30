@@ -49,6 +49,7 @@ async fn main() -> agent_client_protocol::Result<()> {
                 let cx2 = cx.clone();
                 let has = |w: &str| r.prompt.iter().any(|b| matches!(b, ContentBlock::Text(t) if t.text.contains(w)));
                 let (hang, die, plan) = (has("__hang__"), has("__die__"), has("__plan__"));
+                let tools = has("__tools__");
                 let echo = has("__echo__").then(|| r.prompt.iter().filter_map(|b| match b { ContentBlock::Text(t) => Some(t.text.clone()), _ => None }).collect::<Vec<_>>().join("\n"));
                 cx.spawn(async move {
                     let s = r.session_id.clone();
@@ -76,6 +77,13 @@ async fn main() -> agent_client_protocol::Result<()> {
                         return responder.respond(PromptResponse::new(StopReason::EndTurn));
                     }
                     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                    if tools {
+                        // Some ACP adapters write their tool calls as message text: the app
+                        // keeps it, a chat mirroring out does not.
+                        chunk(&cx2, &s, "调用工具 rm -rf build\n")?;
+                        cx2.send_notification(SessionNotification::new(s.clone(), SessionUpdate::ToolCallUpdate(
+                            ToolCallUpdate::new("tc0", ToolCallUpdateFields::new().title("rm -rf build").kind(ToolKind::Execute).status(ToolCallStatus::Pending)))))?;
+                    }
                     chunk(&cx2, &s, "hello ")?;
                     chunk(&cx2, &s, "from mock")?;
                     let seen = std::env::var("DISCO_ENV_PROBE").is_ok();

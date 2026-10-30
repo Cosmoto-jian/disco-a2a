@@ -41,6 +41,9 @@ const UNSEEN: &str = "qq_seen/";
 const OWNER: &str = "qq_owner";
 /// The agent the owner's private QQ messages go to when they name none.
 const CUR: &str = "qq_cur";
+/// "1": an agent's answer goes to QQ and Discord exactly as it came, tool trace and all
+/// (unset, the default: only its final answer is mirrored).
+const SHOW_TOOLS: &str = "qq_show_tools";
 /// Per agent: where its 1:1 chat syncs, "qq" or "discord" (unset = Discord, as before v1.11).
 pub(crate) const SYNC: &str = "sync/";
 /// The last choice made when importing (the next import's default).
@@ -114,7 +117,7 @@ fn now_ms() -> u64 { std::time::SystemTime::now().duration_since(std::time::UNIX
 fn tail(id: &str) -> String { id.chars().rev().take(6).collect::<Vec<_>>().into_iter().rev().collect() }
 
 /// A message could not be sent to QQ: keep the reason for the status page.
-fn note_send_error(e: &str) {
+pub(crate) fn note_send_error(e: &str) {
     let mut d = lock(&DIAG);
     d.send_error = e.to_owned();
     d.send_error_at = now_ms();
@@ -275,41 +278,77 @@ pub(crate) fn target(core: &Core, thread: &str) -> Option<(Rest, To)> {
     Some((rest()?, To::User(owner)))
 }
 
-/// Reserve `n` passive replies to the newest message there, if QQ still allows them.
+/// Reserve up to `n` passive replies to the newest message there: (the message id, how
+/// many QQ will still take). None = the window is over (send an active message).
 fn reply_slot(to: &To, n: u32) -> Option<(String, u32)> {
     let mut g = lock(&REPLY);
     let e = g.get_or_insert_with(HashMap::new).get_mut(to)?;
-    if e.1.elapsed() > to.reply_window() || e.2 + n > REPLY_MAX + 1 { return None; }
-    let seq = e.2;
-    e.2 += n;
-    Some((e.0.clone(), seq))
+    if e.1.elapsed() > to.reply_window() { return None; }
+    let left = REPLY_MAX + 1 - e.2.min(REPLY_MAX + 1);
+    let take = n.min(left);
+    e.2 += take;
+    Some((e.0.clone(), take))
 }
 
 /// Send with a passive reply when one is left; a refused passive reply (the message got
 /// too old on QQ's clock, or its replies are used up) is sent again as an active
 /// message. A failure is kept for Settings → QQ and the diagnostics.
 async fn deliver<F, Fut>(to: &To, n: u32, send: F) -> Result<(), String>
-where F: Fn(Option<String>) -> Fut, Fut: std::future::Future<Output = Result<(), String>> {
-    let slot = reply_slot(to, n).map(|s| s.0);
+where F: Fn(Option<String>, u32) -> Fut, Fut: std::future::Future<Output = Result<(), String>> {
+    let (slot, allowed) = reply_slot(to, n).map(|(id, k)| (Some(id), k)).unwrap_or((None, 0));
     let passive = slot.is_some();
-    let r = match send(slot).await {
-        Err(e) if passive => send(None).await.map_err(|e2| format!("{e2}（被动回复：{e}）")),
+    let r = match send(slot, allowed).await {
+        Err(e) if passive => send(None, 0).await.map_err(|e2| format!("{e2}（被动回复：{e}）")),
         r => r,
     };
     if let Err(e) = &r { note_send_error(e); }
     r
 }
 
+/// Whether an agent's tool trace is mirrored to QQ and Discord too (Setting → QQ
+/// 「显示工具过程」; off by default, so a chat shows only the answer).
+pub(crate) fn show_tools(core: &Core) -> bool {
+    core.db().setting(SHOW_TOOLS).as_deref() == Some("1")
+}
+
+/// Lines an ACP adapter may put in the agent's own text that are really its tool trace
+/// (some send tool calls and thinking as message chunks): dropped from what a chat
+/// mirrors out, while the app keeps every one of them.
+const TRACE_HEADS: [&str; 10] = ["调用工具", "正在调用", "工具调用", "工具结果", "执行工具", "运行工具", "思考中", "Thinking", "计划：", "Plan:"];
+/// Claude Code writes its transcript lines with these.
+const TRACE_MARKS: [char; 2] = ['\u{23fa}', '\u{23bf}'];
+
+/// Is this line the agent's tool trace rather than its answer?
+fn trace_line(line: &str) -> bool {
+    let t = line.trim_start();
+    TRACE_MARKS.iter().any(|m| t.starts_with(*m))
+        || (TRACE_HEADS.iter().any(|h| t.starts_with(h)) && t.chars().count() <= 120)
+}
+
+/// `text` without its tool-trace lines (a heading is kept when it is long enough to be
+/// prose). Nothing else is touched: code blocks and markdown stay as they are.
+pub(crate) fn trace_filtered(text: &str) -> String {
+    let out: String = text.split_inclusive('\n').filter(|l| !trace_line(l)).collect();
+    let out = out.trim_matches('\n').to_owned();
+    if out.trim().is_empty() { text.to_owned() } else { out }
+}
+
+/// What a chat sends to QQ and Discord: the agent's answer, without the tool trace
+/// unless the user asked for it (the app itself always keeps the whole answer).
+pub(crate) fn mirror_text(core: &Core, text: &str) -> String {
+    if show_tools(core) { text.to_owned() } else { trace_filtered(text) }
+}
+
 /// Post as `**who**：text` (or just `text` when `who` is empty).
 pub(crate) async fn post(rest: &Rest, to: &To, who: &str, text: &str) -> Result<(), String> {
     let body = if who.is_empty() { text.to_owned() } else { format!("**{who}**：{text}") };
     let n = disco_qq::chunk(&body).len() as u32;
-    deliver(to, n, |slot| { let body = &body; async move { rest.send(to, body, slot.as_deref(), &[]).await } }).await
+    deliver(to, n, |slot, allowed| { let body = &body; async move { rest.send_split(to, body, slot.as_deref(), &[], allowed as usize).await } }).await
 }
 
 /// A file.
 pub(crate) async fn post_file(rest: &Rest, to: &To, name: &str, bytes: &[u8]) -> Result<(), String> {
-    deliver(to, 1, |slot| async move { rest.send_file(to, name, bytes, slot.as_deref()).await }).await
+    deliver(to, 1, |slot, _| async move { rest.send_file(to, name, bytes, slot.as_deref()).await }).await
 }
 
 /// An event-triggered message (QQ allows one per event, e.g. after GROUP_ADD_ROBOT):
@@ -326,7 +365,83 @@ pub(crate) async fn post_event(rest: &Rest, to: &To, text: &str, event_id: &str)
 /// A card with buttons (an inbox item).
 pub(crate) async fn post_card(rest: &Rest, to: &To, text: &str, buttons: &[disco_qq::Button]) -> Result<(), String> {
     let n = disco_qq::chunk(text).len() as u32;
-    deliver(to, n, |slot| async move { rest.send(to, text, slot.as_deref(), buttons).await }).await
+    deliver(to, n, |slot, allowed| async move { rest.send_split(to, text, slot.as_deref(), buttons, allowed as usize).await }).await
+}
+
+/// A `/command` typed in QQ (a group or the bot's private chat): the text QQ gets back,
+/// or None when Disco does not own the command — anything else (`/compact`, `/model` …)
+/// goes to the agent unchanged, since Claude Code and friends have their own.
+/// `names` are the agents of this chat, `cur` the one a bare `/cmd` applies to, `ctx` the
+/// session a `/new` or `/stop` acts on. Text arrives with the bot's `<@!…>` markers and
+/// leading spaces already stripped (`strip_markers`).
+pub(crate) async fn slash(core: &Arc<Core>, names: &[String], cur: &str, ctx: &str, text: &str) -> Option<String> {
+    let (cmd, arg, named) = cmd_parts(text, names)?;
+    let agent = named.clone().unwrap_or_else(|| cur.to_owned());
+    match cmd.as_str() {
+        "/help" | "/帮助" | "/?" => Some(help(names, &agent)),
+        "/agents" | "/agent" | "/list" => Some(if names.is_empty() { "这里还没有 agent。".into() }
+            else { format!("这里的 agent：{}\n以 @名字 开头就点名它（@名字 /命令 是它的命令）。", names.join("、")) }),
+        "/tools" | "/工具" | "/mcp" => Some(tools_of(core, names, &agent).await),
+        "/new" | "/reset" | "/新会话" | "/重新开始" => {
+            if !names.iter().any(|n| n == &agent) { return Some(format!("这里没有叫 {agent} 的 agent。")); }
+            core.hub.new_session(&agent, ctx).await;
+            core.forget_sessions(Some(&agent));
+            Some(format!("已给 **{agent}** 开一个新会话，之前的对话不再带上。"))
+        }
+        "/stop" | "/停止" | "/取消" => {
+            // No agent named: stop everyone in this chat (as in a Discord group).
+            let all: Vec<String> = match &named { Some(a) => vec![a.clone()], None => names.to_vec() };
+            let mut n = 0;
+            for a in &all { if core.hub.cancel(a, ctx).await { n += 1; } }
+            Some(if n > 0 { format!("已停止 {n} 个 agent 的回复") } else { "现在没有 agent 在回复".into() })
+        }
+        // `arg` is only used by `/tools agent` above; a command Disco does not know goes
+        // to the agent as it was typed.
+        _ => { let _ = arg; None }
+    }
+}
+
+/// (`/cmd`, its argument, the agent named by `@name /cmd` or `/cmd name`).
+fn cmd_parts(text: &str, names: &[String]) -> Option<(String, String, Option<String>)> {
+    let t = text.trim();
+    let (head, named) = match pick(t, names) { Some((a, rest)) => (rest, Some(a)), None => (t, None) };
+    if !head.starts_with('/') { return None; }
+    let (cmd, arg) = head.split_once(char::is_whitespace).map(|(c, a)| (c, a.trim())).unwrap_or((head, ""));
+    let (arg, named) = match named {
+        Some(a) => (arg.to_owned(), Some(a)),
+        // `/tools agent`: an argument that names an agent picks it.
+        None => pick(&format!("@{arg}"), names).map(|(a, rest)| (rest.to_owned(), Some(a))).unwrap_or_else(|| (arg.to_owned(), None)),
+    };
+    Some((cmd.to_ascii_lowercase(), arg, named))
+}
+
+/// `/help` in QQ: what you can type, and who is here.
+fn help(names: &[String], cur: &str) -> String {
+    format!("在 QQ 里 @机器人 就能说话（私聊直接发）：\n\
+     · @agent 内容 → 点名某个 agent；不点名交给组长\n\
+     · /help 这段说明 · /agents 这里的 agent · /tools agent 它能用什么\n\
+     · /new（或 /reset）开一个新会话 · /stop 停止正在进行的回复\n\
+     · 其他 /xxx 原样交给 agent（Claude Code、Codex 有自己的命令）\n\
+     这里的 agent：{}\n现在和 **{}** 说话（@名字 可换）。",
+        if names.is_empty() { "（还没有）".to_owned() } else { names.join("、") }, cur)
+}
+
+/// What `agent` can use: Disco's own tools (the MCP ones every agent gets) and the slash
+/// commands the agent itself advertises (only while it is running).
+async fn tools_of(core: &Arc<Core>, names: &[String], agent: &str) -> String {
+    if !names.iter().any(|n| n == agent) {
+        return format!("这里没有叫 {agent} 的 agent。这里的 agent：{}", if names.is_empty() { "（还没有）".to_owned() } else { names.join("、") });
+    }
+    let mine: Vec<String> = crate::mcp::tool_names().into_iter().map(|t| format!("{t}（Disco 工具）")).collect();
+    let own = core.hub.commands(agent).await;
+    let mut out = format!("**{agent}** 能用的工具：");
+    if mine.is_empty() && own.is_empty() { return format!("{out}还不知道（agent 没在运行，也没声明命令）。"); }
+    if !own.is_empty() {
+        out.push_str("\n它自己的命令：");
+        for (c, d) in own.iter().take(20) { out.push_str(&format!("\n· {c}{}", if d.is_empty() { String::new() } else { format!(" — {d}") })); }
+    }
+    if !mine.is_empty() { out.push_str(&format!("\nDisco 工具：{}", crate::mcp::tool_names().join("、"))); }
+    out
 }
 
 /// `@name rest` naming one of `agents` (the longest that fits; ASCII case ignored) → (agent, rest).
@@ -600,8 +715,16 @@ impl Core {
         if text.trim().is_empty() { return; }
         // @ the bot without naming an agent = ask the lead.
         let group = self.db().list_groups().ok().and_then(|gs| gs.into_iter().find(|g| g.id == gid));
+        let lead = group.as_ref().and_then(|g| g.lead_agent.clone().or_else(|| g.members.first().cloned())).unwrap_or_default();
+        // A `/command` in the QQ group: Disco answers /help /agents /tools /new /stop
+        // itself; anything else goes to the agent as typed.
+        if !m.bot && let Some(g) = &group && let Some(reply) = slash(self, &g.members, &lead, &format!("group:{gid}"), &text).await {
+            self.post_message(&format!("group:{gid}"), "system", &reply);
+            if let Some(rest) = rest() { let to = To::Group(m.group.clone()); let _ = post(&rest, &to, "", &reply).await; }
+            return;
+        }
         if m.at_me && !m.bot && let Some(g) = &group && crate::mentions(&text, &g.members, None).is_empty()
-            && let Some(lead) = g.lead_agent.clone().or_else(|| g.members.first().cloned()) && !text.trim_start().starts_with('/')
+            && !lead.is_empty() && !text.trim_start().starts_with('/')
         {
             text = format!("@{lead} {text}");
         }
@@ -664,8 +787,10 @@ impl Core {
         }
         let saved = self.db().setting(CUR).filter(|c| agents.contains(c));
         let current = saved.unwrap_or_else(|| agents[0].clone());
-        if matches!(m.content.trim(), "/help" | "/帮助" | "/agents") {
-            say(format!("同步到这里的 agent：{}\n现在在和 **{current}** 说话。以 @名字 开头就换成它，之后的消息都发给它。", agents.join("、"))).await;
+        // A `/command` in the private chat: `@name /cmd` or `/cmd name` names the agent.
+        let cmd_agent = pick(&m.content, &agents).map(|(a, _)| a).unwrap_or_else(|| current.clone());
+        if let Some(reply) = slash(self, &agents, &current, &format!("dm:{cmd_agent}"), &m.content).await {
+            say(reply).await;
             return;
         }
         let (agent, mut text, named) = match pick(&m.content, &agents) {
@@ -727,6 +852,8 @@ pub struct QqStatus {
     groups: usize,
     /// QQ groups the bot is in that are not tied to one (Settings → QQ lists them).
     unbound: Vec<QqSeen>,
+    /// "1": an agent's tool trace is mirrored to QQ and Discord too.
+    show_tools: bool,
     diag: Diag,
 }
 
@@ -753,7 +880,8 @@ fn status(core: &Core) -> QqStatus {
     let status = lock(&STATUS).clone();
     let diag = lock(&DIAG).clone();
     let unbound = unbound(core);
-    QqStatus { bound, status, name, url: qr.as_ref().map(|q| q.1.clone()), qr: qr.map(|q| q.0), owner, groups, unbound, diag }
+    let show_tools = show_tools(core);
+    QqStatus { bound, status, name, url: qr.as_ref().map(|q| q.1.clone()), qr: qr.map(|q| q.0), owner, groups, unbound, show_tools, diag }
 }
 
 /// For the overview: "" when no bot is bound.
@@ -915,6 +1043,15 @@ pub fn qq_bind_group(core: St<'_>, openid: String, group: Option<String>) -> Cmd
     Ok(status(&core))
 }
 
+/// Settings → QQ「显示工具过程」: send an agent's tool calls, results and thinking to
+/// QQ and Discord as well (off by default: only the answer is mirrored).
+#[tauri::command]
+pub fn qq_set(core: St<'_>, show_tools: Option<bool>) -> CmdResult<QqStatus> {
+    let on = show_tools.unwrap_or(false);
+    core.db().set_setting(SHOW_TOOLS, if on { "1" } else { "" }).map_err(err)?;
+    Ok(status(&core))
+}
+
 /// Drop the connection and connect again (fresh token, fresh session).
 #[tauri::command]
 pub fn qq_reconnect(core: St<'_>) -> CmdResult<QqStatus> {
@@ -999,14 +1136,17 @@ mod tests {
         assert_eq!(relayed("claude：x"), None);
         let g = To::Group("G-test".into());
         lock(&REPLY).get_or_insert_with(HashMap::new).insert(g.clone(), ("m1".into(), Instant::now(), 1));
-        assert_eq!(reply_slot(&g, 2), Some(("m1".into(), 1)));
+        assert_eq!(reply_slot(&g, 2), Some(("m1".into(), 2)));
         assert_eq!(reply_slot(&g, 3), Some(("m1".into(), 3)));
-        assert_eq!(reply_slot(&g, 1), None, "a sixth reply must be an active message");
+        assert_eq!(reply_slot(&g, 1), Some(("m1".into(), 0)), "the quota is used up: an active message");
+        assert_eq!(reply_slot(&g, 4), Some(("m1".into(), 0)));
+        assert!(reply_slot(&g, 4).is_some(), "a used-up window still answers with the id, but nothing passive");
         assert_eq!(reply_slot(&To::Group("nope".into()), 1), None);
         // Private chats: same five, a longer window; an old message gets none.
         let u = To::User("O-test".into());
         lock(&REPLY).get_or_insert_with(HashMap::new).insert(u.clone(), ("c1".into(), Instant::now() - Duration::from_secs(600), 1));
         assert_eq!(reply_slot(&u, 1), Some(("c1".into(), 1)), "10 minutes is still inside the private-chat window");
+        assert_eq!(reply_slot(&u, 9), Some(("c1".into(), 4)), "only what is left of the quota");
         lock(&REPLY).get_or_insert_with(HashMap::new).insert(u.clone(), ("c1".into(), Instant::now() - Duration::from_secs(3600), 1));
         assert_eq!(reply_slot(&u, 1), None);
         assert!(first_time("x-1") && !first_time("x-1") && first_time(""));
@@ -1031,6 +1171,35 @@ mod tests {
         let n = { let mut codes = lock(&CODES); let n = new_code(&codes); codes.push((n.clone(), "g:local-1".into(), Instant::now())); n };
         assert_eq!(take_code(&n, |t| t.starts_with("g:")), Some("g:local-1".to_owned()));
         assert_eq!(take_code(&n, |t| t.is_empty()), None);
+    }
+
+    /// An agent's answer goes out with its tool trace stripped (Settings → QQ「显示工具
+    /// 过程」puts it back); the app's own copy is never touched.
+    #[test]
+    fn tool_trace_stays_out_of_the_mirror() {
+        let text = "调用工具 rm -rf build\n\u{23fa} Bash(ls)\n答案是 42\n\n```rust\nfn main() {}\n```\n计划：\n真的计划：我们先写一个文件，然后运行它。";
+        let out = trace_filtered(text);
+        assert_eq!(out, "答案是 42\n\n```rust\nfn main() {}\n```\n真的计划：我们先写一个文件，然后运行它。", "{out:?}");
+        assert_eq!(trace_filtered("只有正文"), "只有正文");
+        assert_eq!(trace_filtered("调用工具"), "调用工具", "never leave an empty answer");
+    }
+
+    /// `/commands` in QQ: `@agent /cmd` and `/cmd agent` both name the agent, anything
+    /// else goes to the agent as typed, markers and spaces already stripped.
+    #[test]
+    fn slash_commands_pick_their_agent() {
+        let names = vec!["claude".to_owned(), "写手".to_owned()];
+        let parts = |t: &str| cmd_parts(t, &names);
+        assert_eq!(parts("/tools"), Some(("/tools".into(), String::new(), None)));
+        assert_eq!(parts("  /STOP "), Some(("/stop".into(), String::new(), None)));
+        assert_eq!(parts("@claude /tools"), Some(("/tools".into(), String::new(), Some("claude".into()))));
+        assert_eq!(parts("<@!102> /new"), None, "markers are stripped before this");
+        assert_eq!(parts("/tools claude"), Some(("/tools".into(), String::new(), Some("claude".into()))));
+        assert_eq!(parts("/tools 写手 更多"), Some(("/tools".into(), "更多".into(), Some("写手".into()))));
+        assert_eq!(parts("/compact"), Some(("/compact".into(), String::new(), None)), "an agent's own command passes through");
+        assert_eq!(parts("普通消息"), None);
+        assert_eq!(parts("@claude 你好"), None);
+        assert!(help(&names, "claude").contains("/tools agent") && help(&names, "claude").contains("claude、写手"));
     }
 
     #[test]

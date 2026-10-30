@@ -188,6 +188,8 @@ enum Cmd {
     Warm { key: String, ready: Option<oneshot::Sender<()>> },
     /// Stop the turn running in the session for `key`.
     Cancel { key: String },
+    /// Drop the session for `key`: the next prompt there opens a new one.
+    Forget { key: String, done: oneshot::Sender<()> },
     /// Change a session setting in every open session (and every later one).
     Set { id: String, value: String, done: oneshot::Sender<Result<(), String>> },
     /// ACP `authenticate` with one of the advertised methods.
@@ -259,6 +261,14 @@ impl AcpAgent {
     /// Start the session for `key` now so the first real prompt doesn't pay for it.
     pub async fn warm(&self, key: impl Into<String>) -> Result<(), AcpError> {
         self.cmd.send(Cmd::Warm { key: key.into(), ready: None }).await.map_err(|_| AcpError::Gone)
+    }
+
+    /// A fresh session in `key`: what it has seen no longer counts (its next prompt opens
+    /// a new ACP session).
+    pub async fn forget(&self, key: impl Into<String>) -> Result<(), AcpError> {
+        let (tx, rx) = oneshot::channel();
+        self.cmd.send(Cmd::Forget { key: key.into(), done: tx }).await.map_err(|_| AcpError::Gone)?;
+        rx.await.map_err(|_| AcpError::Gone)
     }
 
     /// The settings the agent offers, once the session for `key` exists. When the session
@@ -555,6 +565,11 @@ async fn run_connection<W, R>(
                     Cmd::Warm { key, ready } => (key, None, ready),
                     Cmd::Cancel { key } => {
                         if let Some((sid, _)) = sessions.get(&key) { cancel_turn(&conn, &pending, sid); }
+                        continue;
+                    }
+                    Cmd::Forget { key, done } => {
+                        sessions.remove(&key);
+                        let _ = done.send(());
                         continue;
                     }
                     Cmd::Login { id, done } => {

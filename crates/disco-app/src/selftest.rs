@@ -902,6 +902,31 @@ pub fn spawn(app: AppHandle, mock: String) {
             let seqs: Vec<u64> = to_q2.iter().filter_map(|b| b["msg_seq"].as_u64()).collect();
             let unique = seqs.iter().all(|s| seqs.iter().filter(|x| *x == s).count() == 1);
             if unique && !seqs.is_empty() && seqs.iter().all(|s| (1..=65535).contains(s)) { Ok(String::new()) } else { Err(format!("{seqs:?} {to_q2:?}")) } });
+        let _ = check!("QQ 只收到最终答案：agent 的工具过程不外发（显示工具过程 可打开）", {
+            let n = count(&core, &qthread, "m1");
+            feed("GROUP_AT_MESSAGE_CREATE", serde_json::json!({ "id": "qt1", "group_openid": "G1", "content": "@m1 __tools__ 看下", "author": { "member_openid": "U1" } }))?;
+            wait_msg(&core, &qthread, "m1", n, 30).await?;
+            // The app keeps the whole answer, tool trace included …
+            let mine = last_from(&core, &qthread, "m1").unwrap_or_default();
+            if !mine.contains("调用工具") { return Err(format!("Disco 里应保留工具过程：{mine:?}")); }
+            let said = |b: &serde_json::Value| b["msg_id"] == "qt1" && b["markdown"]["content"].as_str().unwrap_or_default().contains("**m1**");
+            until(10, || qlog("msg:G1").iter().any(said)).await?;
+            let out: Vec<String> = qlog("msg:G1").into_iter().filter(|b| b["msg_id"] == "qt1")
+                .map(|b| b["markdown"]["content"].as_str().unwrap_or_default().to_owned()).collect();
+            // … QQ only gets the answer: no 调用工具 line, no tool title.
+            if out.iter().any(|t| t.contains("调用工具") || t.contains("rm -rf build")) { return Err(format!("QQ 不该收到工具过程：{out:?}")); }
+            if !out.iter().any(|t| t.contains("hello from mock")) { return Err(format!("QQ 没收到答案：{out:?}")); }
+            // 显示工具过程 = on: the same answer goes out as it came.
+            crate::qq::qq_set(st(), Some(true))?;
+            let n = count(&core, &qthread, "m1");
+            feed("GROUP_AT_MESSAGE_CREATE", serde_json::json!({ "id": "qt2", "group_openid": "G1", "content": "@m1 __tools__ 再看下", "author": { "member_openid": "U1" } }))?;
+            wait_msg(&core, &qthread, "m1", n, 30).await?;
+            until(10, || qlog("msg:G1").iter().any(|b| b["msg_id"] == "qt2" && b["markdown"]["content"].as_str().unwrap_or_default().contains("**m1**"))).await?;
+            let out: Vec<String> = qlog("msg:G1").into_iter().filter(|b| b["msg_id"] == "qt2")
+                .map(|b| b["markdown"]["content"].as_str().unwrap_or_default().to_owned()).collect();
+            let on = out.iter().any(|t| t.contains("调用工具"));
+            crate::qq::qq_set(st(), Some(false))?;
+            if on { Ok(String::new()) } else { Err(format!("打开后应连工具过程一起发：{out:?}")) } });
         let _ = check!("QQ 群：被动回复被拒（消息过期）时改发主动消息，不丢", {
             // A message whose passive window QQ already closed (the mock refuses msg_id "expired").
             feed("GROUP_MESSAGE_CREATE", serde_json::json!({ "id": "expired", "group_openid": "G1", "content": "hello", "author": { "member_openid": "B3", "bot": true } }))?;
@@ -909,6 +934,34 @@ pub fn spawn(app: AppHandle, mock: String) {
             crate::send(st(), qthread.clone(), "本地说一句".into())?;
             let sent = |b: &serde_json::Value| b.get("msg_id").is_none() && b["markdown"]["content"].as_str().unwrap_or_default().contains("本地说一句");
             until(10, || qlog("msg:G1").iter().any(sent)).await.map_err(|e| format!("{e} {:?}", qlog("msg:G1").iter().rev().take(3).collect::<Vec<_>>()))?;
+            Ok(String::new()) });
+        let _ = check!("QQ 群里的斜杠命令：/help /agents /tools /new /stop，其他 /xxx 交给 agent", {
+            let said = |id: &str, want: &str| qlog("msg:G1").iter().any(|b| b["msg_id"] == id && b["markdown"]["content"].as_str().unwrap_or_default().contains(want));
+            let ask = |id: &str, text: &str| feed("GROUP_AT_MESSAGE_CREATE", serde_json::json!({ "id": id, "group_openid": "G1",
+                "content": format!("<@!102> {text}"), "author": { "member_openid": "U1" } }));
+            ask("k1", "/help")?;
+            until(10, || said("k1", "/tools agent")).await.map_err(|e| format!("/help：{e}"))?;
+            ask("k2", "/agents")?;
+            until(10, || said("k2", "m1")).await.map_err(|e| format!("/agents：{e}"))?;
+            ask("k3", "/tools m1")?;
+            until(10, || said("k3", "send_file")).await.map_err(|e| format!("/tools：{e}"))?;
+            ask("k4", "/new m1")?;
+            until(10, || said("k4", "新会话")).await.map_err(|e| format!("/new：{e}"))?;
+            ask("k5", "/stop")?;
+            until(10, || said("k5", "agent")).await.map_err(|e| format!("/stop：{e}"))?;
+            // A command Disco does not know goes to the agent unchanged (it answers).
+            ask("k6", "/compact")?;
+            until(20, || said("k6", "hello from mock")).await.map_err(|e| format!("/compact 应交给 agent：{e}"))?;
+            Ok(String::new()) });
+        let _ = check!("QQ 重复投递的事件只处理一次（网关 resume 会重发）", {
+            let n = count(&core, &qthread, "me");
+            let ev = serde_json::json!({ "id": "dup1", "group_openid": "G1", "content": "只该处理一次", "author": { "member_openid": "U1" } });
+            feed("GROUP_AT_MESSAGE_CREATE", ev.clone())?;
+            feed("GROUP_AT_MESSAGE_CREATE", ev)?;
+            tokio::time::sleep(Duration::from_millis(600)).await;
+            let seen = count(&core, &qthread, "me");
+            if seen != n + 1 { return Err(format!("重复投递处理了两次：{seen} 条（应是 {} 条）", n + 1)); }
+            if qlog("msg:G1").iter().filter(|b| b["msg_id"] == "dup1").count() > 1 { return Err("重复投递回了两条".into()); }
             Ok(String::new()) });
         let _ = check!("QQ 群里其他人 @agent：提及改写、附件存进共享空间、名字带 (QQ)", {
             let n = count(&core, &qthread, "m3");
@@ -1200,6 +1253,9 @@ async fn mock_qq_gateway() -> Result<String, String> {
     Ok(format!("ws://127.0.0.1:{port}/websocket/"))
 }
 
+/// Trouble the mock QQ API answers with next: (HTTP status, body), one per message sent.
+static QQ_FAIL: std::sync::Mutex<std::collections::VecDeque<(u16, serde_json::Value)>> = std::sync::Mutex::new(std::collections::VecDeque::new());
+
 /// What the mock QQ open platform received: ("msg:<group>" / "file:<group>" / "c2c:<user>" / "c2cfile:<user>" / "ack:<id>", body).
 static QQ_LOG: std::sync::Mutex<Vec<(String, serde_json::Value)>> = std::sync::Mutex::new(Vec::new());
 
@@ -1237,7 +1293,13 @@ async fn mock_qq() -> Result<String, String> {
             if !authed(&h) { return denied(); }
             // A passive reply to a message QQ no longer accepts replies to.
             if b["msg_id"] == "expired" { return (axum::http::StatusCode::BAD_REQUEST, Json(json!({ "code": 304027, "message": "消息已过期，不能被动回复" }))).into_response(); }
-            log(format!("msg:{g}"), b);
+            log(format!("msg:{g}"), b.clone());
+            // Scripted trouble: (status, body) pairs, then the normal answer.
+            let fail = QQ_FAIL.lock().unwrap_or_else(|p| p.into_inner()).pop_front();
+            if let Some((code, body)) = fail {
+                let code = axum::http::StatusCode::from_u16(code).unwrap_or(axum::http::StatusCode::INTERNAL_SERVER_ERROR);
+                return (code, Json(body)).into_response();
+            }
             Json(json!({ "id": "sent", "timestamp": 0 })).into_response() }))
         .route("/v2/groups/{g}/files", post(move |h: HeaderMap, Path(g): Path<String>, Json(b): Json<Value>| async move { if !authed(&h) { return denied(); } log(format!("file:{g}"), b); Json(json!({ "file_info": "FI" })).into_response() }))
         .route("/v2/users/{u}/messages", post(move |h: HeaderMap, Path(u): Path<String>, Json(b): Json<Value>| async move { if !authed(&h) { return denied(); } log(format!("c2c:{u}"), b); Json(json!({ "id": "sent" })).into_response() }))

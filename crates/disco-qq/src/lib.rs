@@ -25,10 +25,58 @@ const TOKEN_URL: &str = "https://bots.qq.com/app/getAppAccessToken";
 /// GROUP_AND_C2C_EVENT (group @ messages, private chats, bot added/removed) | INTERACTION
 /// (button presses). The official SDK also asks for guild intents; Disco has no use for them.
 pub const INTENTS: u64 = (1 << 25) | (1 << 26);
-/// Longest text we put in one QQ message.
+/// Longest text we put in one QQ message. The platform's own limit is 5000
+/// (`TEXT_CHUNK_LIMIT` in the official SDK); a markdown message has been refused well
+/// below that on real bots, so Disco stays conservative.
 const CHUNK: usize = 1800;
+/// The platform's one-shot upload limit (`MAX_UPLOAD_SIZE` in the official SDK).
+pub const MAX_UPLOAD: usize = 20 * 1024 * 1024;
+/// How often a transient failure is retried (the official SDK retries uploads twice).
+const RETRIES: u32 = 3;
+/// Wait between retries (doubling): 400 ms, 800 ms, 1600 ms.
+const BACKOFF_MS: u64 = 400;
+/// QQ business codes that are worth another try (busy / rate limited / still working).
+const RETRY_CODES: [i64; 1] = [40093001];
+/// Words QQ puts in `message` when the failure is only temporary.
+const RETRY_WORDS: [&str; 6] = ["限流", "频率", "繁忙", "稍后", "rate limit", "too many"];
 
 fn b64() -> base64::engine::GeneralPurpose { base64::engine::general_purpose::STANDARD }
+
+/// Why a request to QQ failed, and whether another try can still succeed.
+#[derive(Clone, Debug)]
+pub struct Fail {
+    /// HTTP status (0 = QQ never answered: DNS, TCP, TLS, timeout).
+    pub status: u16,
+    /// QQ's own `code` when it answered with one.
+    pub code: Option<i64>,
+    pub msg: String,
+}
+
+impl Fail {
+    fn net(msg: impl Into<String>) -> Self { Self { status: 0, code: None, msg: msg.into() } }
+
+    /// The same request may still get through: QQ was busy, rate-limiting us, or broken
+    /// (a refused message, a missing permission or a bad token never is).
+    pub fn transient(&self) -> bool {
+        self.status == 0 || self.status == 429 || self.status >= 500
+            || self.code.is_some_and(|c| RETRY_CODES.contains(&c))
+            || RETRY_WORDS.iter().any(|w| self.msg.contains(w))
+    }
+}
+
+impl From<Fail> for String {
+    fn from(f: Fail) -> Self { f.to_string() }
+}
+
+impl std::fmt::Display for Fail {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.code {
+            Some(c) => write!(f, "QQ 返回 {c}：{}", self.msg),
+            None if self.status == 0 => f.write_str(&self.msg),
+            None => write!(f, "QQ 返回 HTTP {}：{}", self.status, self.msg),
+        }
+    }
+}
 
 /// A bot's credentials.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -208,19 +256,19 @@ impl Rest {
 
     /// Send on the preferred route; when it cannot connect, try the other one once and
     /// remember the one that worked.
-    async fn route(&self, build: impl Fn(&reqwest::Client) -> reqwest::RequestBuilder) -> Result<reqwest::Response, String> {
+    async fn route(&self, build: impl Fn(&reqwest::Client) -> reqwest::RequestBuilder) -> Result<reqwest::Response, Fail> {
         let first_proxy = self.via_proxy();
         let first = if first_proxy { self.via.as_ref().unwrap_or(&self.http) } else { &self.http };
         match build(first).send().await {
             Ok(r) => Ok(r),
             Err(e) if e.is_connect() || e.is_timeout() => {
                 let other = if first_proxy { Some(&self.http) } else { self.via.as_ref() };
-                let Some(other) = other else { return Err(format!("连不上 QQ（{}）：{e}", if first_proxy { "经代理" } else { "直连" })) };
-                let r = build(other).send().await.map_err(|e2| format!("连不上 QQ：直连和经系统代理都失败（{e} / {e2}）"))?;
+                let Some(other) = other else { return Err(Fail::net(format!("连不上 QQ（{}）：{e}", if first_proxy { "经代理" } else { "直连" }))) };
+                let r = build(other).send().await.map_err(|e2| Fail::net(format!("连不上 QQ：直连和经系统代理都失败（{e} / {e2}）")))?;
                 self.proxied.store(!first_proxy, Ordering::Relaxed);
                 Ok(r)
             }
-            Err(e) => Err(format!("连不上 QQ：{e}")),
+            Err(e) => Err(Fail::net(format!("连不上 QQ：{e}"))),
         }
     }
 
@@ -228,7 +276,7 @@ impl Rest {
     pub async fn token(&self) -> Result<String, String> {
         if let Some((t, until)) = self.token.lock().unwrap_or_else(|p| p.into_inner()).clone() && Instant::now() < until { return Ok(t); }
         let body = json!({ "appId": self.creds.app_id, "clientSecret": self.creds.secret });
-        let r = self.route(|c| c.post(&self.at.token).json(&body).timeout(Duration::from_secs(15))).await?;
+        let r = self.route(|c| c.post(&self.at.token).json(&body).timeout(Duration::from_secs(15))).await.map_err(|f| f.to_string())?;
         let status = r.status();
         let text = r.text().await.unwrap_or_default();
         let v: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
@@ -246,8 +294,14 @@ impl Rest {
     pub fn forget_token(&self) { *self.token.lock().unwrap_or_else(|p| p.into_inner()) = None; }
 
     async fn call(&self, method: reqwest::Method, path: &str, body: Option<Value>) -> Result<Value, String> {
+        self.call_raw(method, path, body).await.map_err(|f| f.to_string())
+    }
+
+    /// One request, with the reason it failed (so the caller can decide whether to try
+    /// again). An expired / revoked token is fetched once more.
+    async fn call_raw(&self, method: reqwest::Method, path: &str, body: Option<Value>) -> Result<Value, Fail> {
         for attempt in 0..2 {
-            let token = self.token().await?;
+            let token = self.token().await.map_err(Fail::net)?;
             let url = format!("{}{path}", self.at.api);
             let r = self.route(|c| {
                 let mut req = c.request(method.clone(), &url).header("Authorization", format!("QQBot {token}"))
@@ -255,19 +309,37 @@ impl Rest {
                 if let Some(b) = &body { req = req.json(b); }
                 req
             }).await?;
-            let status = r.status();
+            let status = r.status().as_u16();
             let text = r.text().await.unwrap_or_default();
             let v: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
             // An expired / revoked token: fetch a new one and try once more.
-            if status.as_u16() == 401 && attempt == 0 { self.forget_token(); continue; }
-            if !status.is_success() || v.get("code").and_then(Value::as_i64).is_some_and(|c| c != 0) {
+            if status == 401 && attempt == 0 { self.forget_token(); continue; }
+            if !(200..300).contains(&status) || v.get("code").and_then(Value::as_i64).is_some_and(|c| c != 0) {
                 let msg = v["message"].as_str().map(str::to_owned).unwrap_or_else(|| text.chars().take(200).collect());
-                let code = v["code"].as_i64().or_else(|| v["err_code"].as_i64()).map_or(status.as_u16().to_string(), |c| c.to_string());
-                return Err(format!("QQ 返回 {code}：{msg}"));
+                let code = v["code"].as_i64().or_else(|| v["err_code"].as_i64());
+                return Err(Fail { status, code, msg });
             }
             return Ok(v);
         }
-        Err("QQ 拒绝了 access_token（401）".into())
+        Err(Fail { status: 401, code: None, msg: "QQ 拒绝了 access_token".into() })
+    }
+
+    /// [`Rest::call_raw`] with retries: a 5xx, a rate limit or a network failure is tried
+    /// again (at most [`RETRIES`] times, backing off). The caller's `msg_seq` stays the
+    /// same, so QQ's dedup makes a retry that did arrive harmless.
+    async fn call_trying(&self, method: reqwest::Method, path: &str, body: Value) -> Result<Value, Fail> {
+        let mut last = None;
+        for attempt in 0..=RETRIES {
+            match self.call_raw(method.clone(), path, Some(body.clone())).await {
+                Ok(v) => return Ok(v),
+                Err(f) if f.transient() && attempt < RETRIES => {
+                    tokio::time::sleep(Duration::from_millis(BACKOFF_MS * (1 << attempt))).await;
+                    last = Some(f);
+                }
+                Err(f) => return Err(f),
+            }
+        }
+        Err(last.unwrap_or_else(|| Fail::net("QQ 没有回应")))
     }
 
     /// The bot's name (`/users/@me`; not every bot type may call it, so callers treat a failure as "no name").
@@ -288,30 +360,48 @@ impl Rest {
 
     /// Like [`Rest::send_group`], to a group or to one user's private (C2C) chat with the bot.
     pub async fn send(&self, to: &To, text: &str, reply: Option<&str>, buttons: &[Button]) -> Result<(), String> {
-        self.say(to, text, reply.map(Ref::Msg), buttons).await
+        self.send_split(to, text, reply, buttons, usize::MAX).await
+    }
+
+    /// Like [`Rest::send`], but only the first `passive` pieces answer `reply`: QQ allows
+    /// just a handful of replies to one message, so the rest go out as active ones
+    /// instead of being refused.
+    pub async fn send_split(&self, to: &To, text: &str, reply: Option<&str>, buttons: &[Button], passive: usize) -> Result<(), String> {
+        self.say(to, text, reply.map(Ref::Msg), buttons, passive).await
     }
 
     /// A message QQ asked for by event (GROUP_ADD_ROBOT and friends): `event_id` instead of
     /// the replied-to `msg_id`. QQ allows one such message per event.
     pub async fn send_event(&self, to: &To, text: &str, event_id: &str) -> Result<(), String> {
-        self.say(to, text, Some(Ref::Event(event_id)), &[]).await
+        self.say(to, text, Some(Ref::Event(event_id)), &[], usize::MAX).await
     }
 
-    async fn say(&self, to: &To, text: &str, reply: Option<Ref<'_>>, buttons: &[Button]) -> Result<(), String> {
+    async fn say(&self, to: &To, text: &str, reply: Option<Ref<'_>>, buttons: &[Button], passive: usize) -> Result<(), String> {
         let parts = chunk(text);
         let n = parts.len();
         let path = to.path("messages");
         for (i, part) in parts.into_iter().enumerate() {
-            let mut body = json!({ "msg_type": 2, "markdown": { "content": part }, "msg_seq": next_seq() });
-            if let Some(Ref::Msg(id)) = reply { body["msg_id"] = json!(id); }
-            if let Some(Ref::Event(id)) = reply { body["event_id"] = json!(id); }
+            // Split over several messages: number them, so their order is clear in QQ.
+            let part = if n > 1 { format!("（{}/{}）\n{}", i + 1, n, part) } else { part };
+            // One sequence number per message: a retry keeps it, so QQ's dedup drops a
+            // message that did arrive twice instead of showing it twice.
+            let seq = next_seq();
+            let mut body = json!({ "msg_type": 2, "markdown": { "content": part }, "msg_seq": seq });
+            // Only while QQ still accepts replies to that message; the rest are active.
+            if i < passive {
+                if let Some(Ref::Msg(id)) = reply { body["msg_id"] = json!(id); }
+                if let Some(Ref::Event(id)) = reply { body["event_id"] = json!(id); }
+            }
             if i + 1 == n && !buttons.is_empty() { body["keyboard"] = keyboard(buttons); }
-            if let Err(e) = self.call(reqwest::Method::POST, &path, Some(body)).await {
-                // No markdown permission: plain text (buttons need markdown, so they go).
-                let mut plain = json!({ "msg_type": 0, "content": part, "msg_seq": next_seq() });
-                if let Some(Ref::Msg(id)) = reply { plain["msg_id"] = json!(id); }
-                if let Some(Ref::Event(id)) = reply { plain["event_id"] = json!(id); }
-                self.call(reqwest::Method::POST, &path, Some(plain)).await.map_err(|e2| format!("{e2}（markdown：{e}）"))?;
+            if let Err(e) = self.call_trying(reqwest::Method::POST, &path, body).await {
+                // No markdown permission (or QQ refused the content): plain text. Buttons
+                // need markdown, so they go with it.
+                let mut plain = json!({ "msg_type": 0, "content": part, "msg_seq": seq });
+                if i < passive {
+                    if let Some(Ref::Msg(id)) = reply { plain["msg_id"] = json!(id); }
+                    if let Some(Ref::Event(id)) = reply { plain["event_id"] = json!(id); }
+                }
+                self.call_trying(reqwest::Method::POST, &path, plain).await.map_err(|e2| format!("{e2}（markdown：{e}）"))?;
             }
         }
         Ok(())
@@ -322,16 +412,25 @@ impl Rest {
         self.send_file(&To::Group(group.to_owned()), name, bytes, reply).await
     }
 
-    /// Like [`Rest::send_group_file`], to a group or a private chat. `file_type`: 1 image, 2 video, 3 voice, 4 file.
+    /// Like [`Rest::send_group_file`], to a group or a private chat. `file_type`: 1 image,
+    /// 2 video, 3 voice, 4 file — a group takes all four (the official SDK sends
+    /// `file_name` only for type 4). At most 20 MB: the platform's one-shot upload limit
+    /// (`MAX_UPLOAD_SIZE`).
     pub async fn send_file(&self, to: &To, name: &str, bytes: &[u8], reply: Option<&str>) -> Result<(), String> {
+        // QQ refuses a bigger one anyway: say so instead of paying for the upload.
+        if bytes.len() > MAX_UPLOAD { return Err(format!("文件 {name} 超过 QQ 单次上传上限（20 MB），没有发送")); }
         let lower = name.to_ascii_lowercase();
-        let kind = if [".png", ".jpg", ".jpeg", ".gif", ".webp"].iter().any(|e| lower.ends_with(e)) { 1 } else if [".mp4", ".mov"].iter().any(|e| lower.ends_with(e)) { 2 } else { 4 };
-        let up = self.call(reqwest::Method::POST, &to.path("files"),
-            Some(json!({ "file_type": kind, "file_data": b64().encode(bytes), "file_name": name, "srv_send_msg": false }))).await?;
-        let info = up["file_info"].as_str().ok_or("上传文件失败：没有 file_info")?;
+        let kind = if [".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"].iter().any(|e| lower.ends_with(e)) { 1 }
+            else if [".mp4", ".mov", ".avi", ".mkv", ".webm"].iter().any(|e| lower.ends_with(e)) { 2 }
+            else if [".silk", ".amr"].iter().any(|e| lower.ends_with(e)) { 3 }
+            else { 4 };
+        let mut up = json!({ "file_type": kind, "file_data": b64().encode(bytes), "srv_send_msg": false });
+        if kind == 4 { up["file_name"] = json!(name); }
+        let up = self.call_trying(reqwest::Method::POST, &to.path("files"), up).await?;
+        let info = up["file_info"].as_str().ok_or("上传文件失败：没有 file_info")?.to_owned();
         let mut body = json!({ "msg_type": 7, "media": { "file_info": info }, "msg_seq": next_seq() });
         if let Some(id) = reply { body["msg_id"] = json!(id); }
-        self.call(reqwest::Method::POST, &to.path("messages"), Some(body)).await?;
+        self.call_trying(reqwest::Method::POST, &to.path("messages"), body).await?;
         Ok(())
     }
 
@@ -435,20 +534,70 @@ fn keyboard(buttons: &[Button]) -> Value {
     json!({ "content": { "rows": rows } })
 }
 
-/// Split at line ends where possible, never inside a UTF-8 character.
+/// Split `text` into messages QQ accepts: at paragraph and code-block boundaries, never
+/// inside a fenced code block, never inside a UTF-8 character. A code block too long for
+/// one message is cut between lines and every piece gets its own fences, so no part ever
+/// arrives half-open. (The caller numbers the parts when there is more than one.)
 pub fn chunk(text: &str) -> Vec<String> {
-    let mut out = Vec::new();
+    let mut out: Vec<String> = Vec::new();
     let mut cur = String::new();
-    for line in text.split_inclusive('\n') {
-        if cur.chars().count() + line.chars().count() > CHUNK && !cur.is_empty() { out.push(std::mem::take(&mut cur)); }
-        if line.chars().count() > CHUNK {
-            let cs: Vec<char> = line.chars().collect();
-            for piece in cs.chunks(CHUNK) { out.push(piece.iter().collect()); }
-        } else {
-            cur.push_str(line);
-        }
+    for unit in units(text) {
+        if !cur.is_empty() && cur.chars().count() + unit.chars().count() > CHUNK { out.push(std::mem::take(&mut cur)); }
+        cur.push_str(&unit);
     }
     if !cur.trim().is_empty() || out.is_empty() { out.push(cur); }
+    out
+}
+
+/// The pieces [`chunk`] packs: one paragraph, or one fenced code block.
+fn units(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut code = false;
+    for line in text.split_inclusive('\n') {
+        let bare = line.trim_end_matches('\n');
+        let fence = bare.trim_start().starts_with("```");
+        cur.push_str(line);
+        if fence {
+            code = !code;
+            // A code block is never mixed with the text around it.
+            if !code { out.append(&mut cut(&mut cur, true)); }
+        } else if !code && (bare.trim().is_empty() || cur.chars().count() > CHUNK) {
+            out.append(&mut cut(&mut cur, false));
+        }
+    }
+    out.append(&mut cut(&mut cur, false));
+    out
+}
+
+/// Take `cur` and return it in pieces no longer than [`CHUNK`] (a code block is cut
+/// between lines, every piece a complete fenced block).
+fn cut(cur: &mut String, code: bool) -> Vec<String> {
+    let s = std::mem::take(cur);
+    if s.is_empty() { return Vec::new(); }
+    if !code || s.chars().count() <= CHUNK {
+        if s.chars().count() <= CHUNK { return vec![s]; }
+        let cs: Vec<char> = s.chars().collect();
+        return cs.chunks(CHUNK).map(|c| c.iter().collect::<String>()).collect();
+    }
+    let mut lines: Vec<&str> = s.split_inclusive('\n').collect();
+    // trim_end: a CRLF opener ("```rust\r\n", Windows) compares like an LF one.
+    let open = lines.remove(0).trim_end().to_owned();
+    // Drop the closing fence: every piece gets its own.
+    if lines.last().is_some_and(|l| l.trim_start().starts_with("```")) { lines.pop(); }
+    let mut out: Vec<String> = Vec::new();
+    let mut piece = format!("{open}\n");
+    for l in lines {
+        if piece.chars().count() + l.chars().count() + 4 > CHUNK && piece.trim_end() != open {
+            piece.push_str("```\n");
+            out.push(std::mem::take(&mut piece));
+            piece = format!("{open}\n");
+        }
+        piece.push_str(l);
+    }
+    if !piece.ends_with('\n') { piece.push('\n'); }
+    piece.push_str("```");
+    out.push(piece);
     out
 }
 
@@ -753,6 +902,7 @@ fn closed(rest: &Rest, resume: &mut Resume, code: u16, reason: &str) -> End {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::VecDeque;
 
     #[test]
     fn decrypts_what_the_platform_encrypts() {
@@ -820,17 +970,143 @@ mod tests {
         assert_eq!(chunk("hi"), vec!["hi".to_owned()]);
         let long = format!("{}\n{}", "中".repeat(1000), "文".repeat(2000));
         let parts = chunk(&long);
-        assert!(parts.len() == 3 && parts.iter().all(|p| p.chars().count() <= CHUNK), "{:?}", parts.iter().map(|p| p.chars().count()).collect::<Vec<_>>());
+        assert!(parts.len() == 2 && parts.iter().all(|p| p.chars().count() <= CHUNK), "{:?}", parts.iter().map(|p| p.chars().count()).collect::<Vec<_>>());
         assert_eq!(parts.concat(), long);
         let k = keyboard(&[("disco:a:0".into(), "允许一次".into(), true), ("disco:a:x".into(), "拒绝".into(), false)]);
         let b = &k["content"]["rows"][0]["buttons"];
         assert_eq!((b[0]["action"]["data"].as_str(), b[0]["render_data"]["style"].as_i64(), b[1]["render_data"]["label"].as_str()), (Some("disco:a:0"), Some(1), Some("拒绝")));
     }
 
+    /// Long answers are cut at paragraph and code-block boundaries, never inside a code
+    /// block: a block too long for one message gets its own fences on every piece.
+    #[test]
+    fn chunks_never_cut_a_code_block() {
+        let block = "```rust\nfn main() {}\n```";
+        let parts = chunk(&format!("{}\n\n{block}", "字".repeat(1790)));
+        assert_eq!(parts.len(), 2, "{:?}", parts.iter().map(|p| p.chars().count()).collect::<Vec<_>>());
+        assert_eq!(parts[1], block, "{parts:?}");
+        assert!(parts[0].starts_with('字'));
+        for p in &parts { assert_eq!(p.matches("```").count() % 2, 0, "a part must never end inside a code block: {p:?}"); }
+        // A block longer than one message: every piece is a complete block.
+        let big: String = "let x = 1;\n".repeat(400);
+        let parts = chunk(&format!("```rust\n{big}```"));
+        assert!(parts.len() > 1, "{:?}", parts.len());
+        for p in &parts {
+            assert!(p.starts_with("```rust\n") && p.trim_end().ends_with("```") && p.chars().count() <= CHUNK, "{:?}", p.chars().count());
+        }
+        assert_eq!(parts.concat().matches("let x = 1;").count(), 400);
+        // CRLF text (an agent on Windows): same pieces, every one a complete block.
+        let big: String = "let x = 1;\r\n".repeat(400);
+        let parts = chunk(&format!("```rust\r\n{big}```\r\n"));
+        assert!(parts.len() > 1);
+        for p in &parts { assert!(p.starts_with("```rust\n") && p.trim_end().ends_with("```") && p.chars().count() <= CHUNK, "{:?}", p.chars().count()); }
+        assert_eq!(parts.concat().matches("let x = 1;").count(), 400);
+        assert_eq!(chunk("一\r\n\r\n二"), vec!["一\r\n\r\n二".to_owned()]);
+        // Paragraphs stay whole when they fit.
+        assert_eq!(chunk("一\n\n二\n\n三"), vec!["一\n\n二\n\n三".to_owned()]);
+        assert_eq!(chunk(""), vec![String::new()]);
+    }
+
+    /// A 5xx is tried again (same msg_seq: QQ's dedup makes a duplicate harmless), a long
+    /// answer is numbered, and a refused markdown message is resent as plain text.
+    #[tokio::test]
+    async fn retries_transient_failures_and_falls_back_to_plain_text() {
+        let script = Arc::new(Mutex::new(VecDeque::from(vec![
+            (500u16, "{}".into()),
+            (400, r#"{"code":304023,"message":"markdown 不支持"}"#.into()),
+        ])));
+        let (api, log) = mock_send(script).await;
+        let rest = Rest::new(Creds { app_id: "102".into(), secret: "sec".into() },
+            Endpoints { api: api.clone(), token: format!("{api}/app/getAppAccessToken"), proxy: None });
+        let g = To::Group("G1".into());
+        // Long enough for two pieces: both numbered. The first piece is refused twice
+        // (5xx → retried, then markdown → plain text), the second goes straight through.
+        rest.send(&g, &format!("{}\n{}", "中".repeat(1000), "文".repeat(1000)), Some("m1"), &[]).await.unwrap();
+        rest.send(&g, "短回复", Some("m2"), &[]).await.unwrap();
+        let log = log.lock().unwrap().clone();
+        let sent: Vec<Value> = log.iter().filter_map(|l| l.strip_prefix("msg ")).filter_map(|b| serde_json::from_str(b).ok()).collect();
+        assert_eq!(sent.len(), 5, "{log:?}");
+        assert!(sent[0]["markdown"]["content"].as_str().unwrap().starts_with("（1/2）"), "{:?}", sent[0]);
+        assert!(sent[1]["markdown"]["content"].as_str().unwrap().starts_with("（1/2）"), "the retry sends the same text");
+        assert_eq!(sent[1]["msg_seq"], sent[0]["msg_seq"], "one msg_seq per message: a retry is idempotent");
+        assert_eq!(sent[0]["msg_id"], json!("m1"));
+        assert_eq!(sent[2]["msg_type"], json!(0), "markdown refused → plain text");
+        assert_eq!(sent[2]["msg_seq"], sent[0]["msg_seq"]);
+        assert!(sent[2]["content"].as_str().unwrap().starts_with("（1/2）"));
+        assert!(sent[3]["markdown"]["content"].as_str().unwrap().starts_with("（2/2）"), "{:?}", sent[3]);
+        assert_ne!(sent[3]["msg_seq"], sent[0]["msg_seq"]);
+        assert_eq!((sent[4]["msg_type"].clone(), sent[4]["markdown"]["content"].as_str(), sent[4]["msg_id"].as_str()), (json!(2), Some("短回复"), Some("m2")));
+    }
+
+    /// A file goes through the rich media API: upload (file_type 4 for a generic file,
+    /// base64 `file_data`), then msg_type 7 with the `file_info` QQ returned.
+    #[tokio::test]
+    async fn file_upload_and_media_message() {
+        let (api, log) = mock_send(Arc::new(Mutex::new(VecDeque::new()))).await;
+        let rest = Rest::new(Creds { app_id: "102".into(), secret: "sec".into() },
+            Endpoints { api: api.clone(), token: format!("{api}/app/getAppAccessToken"), proxy: None });
+        rest.send_file(&To::Group("G1".into()), "报告.pdf", b"PDF", Some("m1")).await.unwrap();
+        let log = log.lock().unwrap().clone();
+        let (path, body) = log.iter().find_map(|l| l.strip_prefix("up ")).unwrap().split_once(' ').unwrap();
+        assert_eq!(path, "/v2/groups/G1/files");
+        let up: Value = serde_json::from_str(body).unwrap();
+        let enc = b64().encode(b"PDF");
+        assert_eq!((up["file_type"].clone(), up["file_name"].as_str(), up["file_data"].as_str()), (json!(4), Some("报告.pdf"), Some(enc.as_str())));
+        let msg: Value = serde_json::from_str(log.iter().find_map(|l| l.strip_prefix("msg ")).unwrap()).unwrap();
+        assert_eq!((msg["msg_type"].clone(), msg["media"]["file_info"].as_str(), msg["msg_id"].as_str()), (json!(7), Some("FI-1"), Some("m1")));
+        // A picture is file_type 1 and carries no name (the official SDK sends it for type 4 only).
+        let (api, log) = mock_send(Arc::new(Mutex::new(VecDeque::new()))).await;
+        let rest = Rest::new(Creds { app_id: "102".into(), secret: "sec".into() },
+            Endpoints { api: api.clone(), token: format!("{api}/app/getAppAccessToken"), proxy: None });
+        rest.send_file(&To::User("O1".into()), "a.png", b"PNG", None).await.unwrap();
+        let log = log.lock().unwrap().clone();
+        let (path, body) = log.iter().find_map(|l| l.strip_prefix("up ")).unwrap().split_once(' ').unwrap();
+        assert_eq!(path, "/v2/users/O1/files");
+        let up: Value = serde_json::from_str(body).unwrap();
+        assert_eq!((up["file_type"].clone(), up.get("file_name").is_some()), (json!(1), false));
+    }
+
+    /// A QQ API for send tests: scripted answers to `POST .../messages` (a 5xx first, a
+    /// markdown refusal …) and a log of every request line + body.
+    async fn mock_send(script: Arc<Mutex<VecDeque<(u16, String)>>>) -> (String, Arc<Mutex<Vec<String>>>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        // reqwest is built without a default crypto provider: any test may be the first to build a Client.
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let log = Arc::new(Mutex::new(Vec::<String>::new()));
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = l.local_addr().unwrap().port();
+        let lg = log.clone();
+        tokio::spawn(async move {
+            let mut n = 0;
+            loop {
+                let Ok((mut s, _)) = l.accept().await else { return };
+                let mut buf = vec![0u8; 65536];
+                let k = s.read(&mut buf).await.unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..k]).to_string();
+                let line = req.lines().next().unwrap_or_default().to_owned();
+                let body = req.split("\r\n\r\n").nth(1).unwrap_or_default().to_owned();
+                let (code, out) = if line.starts_with("POST /app/getAppAccessToken") {
+                    n += 1;
+                    (200, format!(r#"{{"access_token":"tok{n}","expires_in":"7200"}}"#))
+                } else if line.contains("/files") {
+                    lg.lock().unwrap().push(format!("up {} {body}", line.split_whitespace().nth(1).unwrap_or_default()));
+                    (200, r#"{"file_info":"FI-1","ttl":600}"#.to_owned())
+                } else if line.contains("/messages") {
+                    lg.lock().unwrap().push(format!("msg {body}"));
+                    script.lock().unwrap().pop_front().unwrap_or((200, r#"{"id":"sent"}"#.to_owned()))
+                } else { (404, "{}".to_owned()) };
+                let _ = s.write_all(format!("HTTP/1.1 {code} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{out}", out.len()).as_bytes()).await;
+            }
+        });
+        (format!("http://127.0.0.1:{port}"), log)
+    }
+
     /// A tiny QQ open platform for gateway tests: tokens tok1, tok2, … (one per fetch),
     /// `/gateway` (only with a valid `QQBot tokN` + X-Union-Appid) pointing at `ws`.
     async fn mock_platform(ws: String) -> (String, Arc<Mutex<Vec<String>>>) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        // reqwest is built without a default crypto provider: any test may be the first to build a Client.
+        let _ = rustls::crypto::ring::default_provider().install_default();
         let log = Arc::new(Mutex::new(Vec::<String>::new()));
         let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = l.local_addr().unwrap().port();
@@ -940,6 +1216,52 @@ mod tests {
         assert!(sent[2].get("msg_id").is_none() && sent[2].get("event_id").is_none());
         let seqs: Vec<u64> = sent.iter().filter_map(|b| b["msg_seq"].as_u64()).collect();
         assert!(seqs.iter().all(|s| (1..=65535).contains(s)) && seqs.len() == 3, "{seqs:?}");
+    }
+
+    /// A dropped connection is resumed, not identified again: op 6 with the session id and
+    /// the last sequence number, so QQ replays what happened while we were away.
+    #[tokio::test]
+    async fn reconnects_with_resume() {
+        use tokio_tungstenite::tungstenite::protocol::{CloseFrame, frame::coding::CloseCode};
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let ws = format!("ws://127.0.0.1:{}/websocket/", l.local_addr().unwrap().port());
+        let idents = Arc::new(Mutex::new(Vec::<Value>::new()));
+        let id2 = idents.clone();
+        tokio::spawn(async move {
+            let mut conn = 0;
+            loop {
+                let Ok((s, _)) = l.accept().await else { return };
+                conn += 1;
+                let mut ws = tokio_tungstenite::accept_async(s).await.unwrap();
+                ws.send(Message::text(r#"{"op":10,"d":{"heartbeat_interval":41250}}"#)).await.unwrap();
+                let Some(Ok(Message::Text(t))) = ws.next().await else { continue };
+                id2.lock().unwrap().push(serde_json::from_str(&t).unwrap());
+                if conn == 1 {
+                    ws.send(Message::text(r#"{"op":0,"s":7,"t":"READY","d":{"session_id":"S1","user":{"username":"DiscoBot"}}}"#)).await.unwrap();
+                    // The connection drops (QQ or the network): Disco must resume, not identify.
+                    let _ = ws.close(Some(CloseFrame { code: CloseCode::from(4000), reason: "".into() })).await;
+                    continue;
+                }
+                ws.send(Message::text(r#"{"op":0,"s":8,"t":"RESUMED","d":""}"#)).await.unwrap();
+                ws.send(Message::text(r#"{"op":0,"s":9,"t":"C2C_MESSAGE_CREATE","d":{"id":"c9","content":"离线时发的","author":{"user_openid":"OWNER"}}}"#)).await.unwrap();
+                tokio::time::sleep(Duration::from_secs(30)).await;
+            }
+        });
+        let (api, _log) = mock_platform(ws).await;
+        let rest = Rest::new(Creds { app_id: "102".into(), secret: "sec".into() }, Endpoints { api: api.clone(), token: format!("{api}/app/getAppAccessToken"), proxy: None });
+        let (tx, mut rx) = mpsc::channel(8);
+        let (stop_tx, stop_rx) = watch::channel(false);
+        tokio::spawn(run_gateway(rest, tx, stop_rx, |_| {}));
+        let m = tokio::time::timeout(Duration::from_secs(20), rx.recv()).await.expect("the replayed event never came").unwrap();
+        let _ = stop_tx.send(true);
+        assert_eq!((m.kind, m.content.as_str(), m.id.as_str()), (Kind::Direct, "离线时发的", "c9"));
+        let ids = idents.lock().unwrap().clone();
+        assert_eq!(ids.len(), 2, "{ids:?}");
+        assert_eq!((ids[0]["op"].clone(), ids[1]["op"].clone()), (json!(2), json!(6)), "the second connection must RESUME");
+        assert_eq!(ids[1]["d"]["session_id"], json!("S1"));
+        assert_eq!(ids[1]["d"]["seq"], json!(7), "the last sequence number READY saw");
+        assert_eq!(ids[1]["d"]["token"], "QQBot tok1");
     }
 
     #[test]

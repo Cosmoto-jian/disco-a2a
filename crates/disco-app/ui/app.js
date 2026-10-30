@@ -1617,6 +1617,12 @@ async function loadQQ(sec, q) {
     rows.push(grow("状态", h("span", { id: "qq-status", class: `status${online ? " ok" : ""}` }, h("i"), q.status || "连接中…"),
       h("button", { type: "button", class: "btn sm", title: "断开后重新取 token、连网关", onclick: () => redo(invoke("qq_reconnect")) }, "重新连接")));
     rows.push(grow("机器人", h("span", { class: "val" }, q.name || "QQ 机器人")));
+    // Only the answer reaches QQ and Discord unless this is on: the app keeps the whole trace.
+    const toolsTgl = toggle(!!q.show_tools);
+    toolsTgl.id = "qq-show-tools";
+    toolsTgl.onchange = () => redo(invoke("qq_set", { showTools: toolsTgl.checked }));
+    rows.push(grow("显示工具过程", toolsTgl,
+      h("small", { class: "foot" }, toolsTgl.checked ? "QQ 和 Discord 也会收到 agent 的工具调用、结果和思考过程" : "只把 agent 的最终回答发到 QQ 和 Discord，Disco 里仍能看到完整过程")));
     // What the connection has actually seen: the first place to look when messages do not get through.
     rows.push(grow("最近收到", h("span", { id: "qq-event", class: "val" }, d.events ? `${d.event} · ${ago(d.event_at)}（共 ${d.events} 个）` : "这次启动后还没收到 QQ 消息")));
     if (d.error) rows.push(grow("最近错误", h("span", { id: "qq-error", class: "val err", title: d.error }, `${d.error} · ${ago(d.error_at)}`)));

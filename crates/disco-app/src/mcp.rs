@@ -168,6 +168,11 @@ async fn handle(State(core): State<Arc<Core>>, headers: HeaderMap, body: String)
     axum::Json(reply).into_response()
 }
 
+/// The names of the tools Disco hands every agent (`/tools` in a chat).
+pub(crate) fn tool_names() -> Vec<String> {
+    tools().as_array().into_iter().flatten().filter_map(|t| t["name"].as_str().map(str::to_owned)).collect()
+}
+
 fn tools() -> Value {
     let group = json!({ "type": "string", "description": "群名或群 id。不填 = 当前所在的群" });
     json!([

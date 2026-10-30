@@ -436,6 +436,15 @@ impl Hub {
         }
     }
 
+    /// A fresh session in `context` (what it has seen no longer counts).
+    pub async fn new_session(&self, agent: &str, context: &str) -> bool {
+        let cell = self.live.lock().await.get(agent).cloned();
+        match cell.as_ref().and_then(|c| c.get()) {
+            Some(Runtime::Acp(a)) => a.forget(context).await.is_ok(),
+            _ => false,
+        }
+    }
+
     pub async fn decide(&self, agent: &str, request_id: &str, d: PermissionDecision) -> bool {
         let cell = self.live.lock().await.get(agent).cloned();
         match cell.as_ref().and_then(|c| c.get()) {

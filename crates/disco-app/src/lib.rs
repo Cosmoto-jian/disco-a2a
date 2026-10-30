@@ -341,11 +341,11 @@ impl Core {
                 self.remember_from(&agent, &thread, answer);
                 self.post_message(&thread, &agent, answer);
                 if let Some((d, ch)) = &mirror && let Some(hook) = secret_get(&format!("webhook/{ch}"))
-                    && let Err(e) = d.post_as(&hook, &agent, None, answer).await
+                    && let Err(e) = d.post_as(&hook, &agent, None, &qq::mirror_text(self, answer)).await
                 {
                     self.post_message(&thread, "system", &format!("Discord 发送失败：{e}"));
                 }
-                if let Some((rest, to)) = &qq && !answer.is_empty() && let Err(e) = qq::post(rest, to, &agent, answer).await {
+                if let Some((rest, to)) = &qq && !answer.is_empty() && let Err(e) = qq::post(rest, to, &agent, &qq::mirror_text(self, answer)).await {
                     self.post_message(&thread, "system", &format!("QQ 发送失败：{e}"));
                 }
                 // Meant for QQ but nowhere to send it: say why instead of failing quietly.
@@ -603,12 +603,12 @@ impl Core {
                             // Post as soon as this agent finishes, not when the wave does.
                             self.post_message(thread, agent, &answer);
                             if let (Some(d), Some(hook)) = (self.discord_rest(), g.webhook_ref.as_deref().and_then(secret_get))
-                                && let Err(e) = d.post_as(&hook, agent, None, &self.with_pings(&answer)).await
+                                && let Err(e) = d.post_as(&hook, agent, None, &self.with_pings(&qq::mirror_text(self, &answer))).await
                             {
                                 self.post_message(thread, "system", &format!("Discord 发送失败：{e}"));
                             }
                             if let Some((rest, openid)) = qq::target(self, thread)
-                                && let Err(e) = qq::post(&rest, &openid, agent, &answer).await
+                                && let Err(e) = qq::post(&rest, &openid, agent, &qq::mirror_text(self, &answer)).await
                             {
                                 self.post_message(thread, "system", &format!("QQ 发送失败：{e}"));
                             }
@@ -1855,7 +1855,7 @@ pub fn run() {
             stop_all, resume, save_discord_token, discord_connect, discord_settings, discord_sync, diagnose, open_url, reveal_path, discord_channels, save_group, delete_group, restore_group, memory_restore, set_memory, agent_commands,
             check_update, install_update, space, todo_new, todo_set, todo_remove, doc_save, reveal_doc, share::share_status, share::peer_check, share::create_share, share::share_invite, share::revoke_share, share::accept_invite,
             tunnel::tunnel_status, tunnel::tunnel_install, tunnel::tunnel_login, tunnel::tunnel_setup, tunnel::tunnel_set,
-            qq::qq_status, qq::qq_bind, qq::qq_bind_cancel, qq::qq_unbind, qq::qq_group_code, qq::qq_bind_group, qq::qq_claim_code, qq::qq_reconnect, set_agent_sync
+            qq::qq_status, qq::qq_bind, qq::qq_bind_cancel, qq::qq_unbind, qq::qq_group_code, qq::qq_bind_group, qq::qq_claim_code, qq::qq_reconnect, qq::qq_set, set_agent_sync
         ])
         .build(tauri::generate_context!())
         .expect("error while running Disco")
