@@ -54,10 +54,21 @@ pub struct RemoteAgent {
 impl RemoteAgent {
     /// Resolve `/.well-known/agent-card.json` under `base_url`, negotiate a binding.
     pub async fn connect(base_url: &str, cred: Credential) -> Result<Self, A2aError> {
+        Self::connect_with(base_url, cred, &[]).await
+    }
+
+    /// `connect`, sending `extra` headers on every request, the agent card included
+    /// (a Cloudflare Access service token in front of a shared agent).
+    pub async fn connect_with(base_url: &str, cred: Credential, extra: &[(String, String)]) -> Result<Self, A2aError> {
         // Loopback and tailnet peers are reached directly: a system proxy (a VPN app)
         // would forward 100.x to a remote exit that can't see the tailnet.
         let direct = origin(base_url).is_some_and(|(_, h, _)| is_loopback(&h));
-        let http = direct.then(|| reqwest::Client::builder().no_proxy().build().ok()).flatten();
+        let http = (direct || !extra.is_empty()).then(|| {
+            let headers = extra.iter().filter_map(|(n, v)| Some((
+                reqwest::header::HeaderName::from_bytes(n.as_bytes()).ok()?, reqwest::header::HeaderValue::from_str(v).ok()?))).collect();
+            let b = reqwest::Client::builder().default_headers(headers);
+            if direct { b.no_proxy() } else { b }.build().ok()
+        }).flatten();
         let card = AgentCardResolver::new(http.clone()).resolve(base_url).await.map_err(|e| unreachable_hint(base_url, e))?;
         if matches!(cred, Credential::Header { .. }) {
             check_cred_target(base_url, &serde_json::to_value(&card).unwrap_or_default())

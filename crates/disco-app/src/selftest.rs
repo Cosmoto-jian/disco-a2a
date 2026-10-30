@@ -58,7 +58,7 @@ pub fn spawn(app: AppHandle, mock: String) {
         let st = || app.state::<Arc<Core>>();
         let _ = check!("overview(空)", within(5, crate::overview(st())).await.and_then(|r| r.map(|o| format!("{} agents", o.agents.len()))));
         let spec = |name: &str| crate::NewAgent { template: "command".into(), name: name.into(), url: None, header_name: None, header_value: None,
-            command: Some(format!("\"{mock}\"")), cwd: None, count: None, worktree: None, conda: None, model: None };
+            command: Some(format!("\"{mock}\"")), cwd: None, count: None, worktree: None, conda: None, model: None, extra: Vec::new() };
         let _ = check!("add_agent m1", within(20, crate::add_agent(st(), spec("m1"))).await.and_then(|r| r.map(|v| v.join(","))));
         let _ = check!("add_agent m2", within(20, crate::add_agent(st(), spec("m2"))).await.and_then(|r| r.map(|v| v.join(","))));
         let _ = check!("overview(2)", within(5, crate::overview(st())).await.and_then(|r| r.and_then(|o| if o.agents.len() == 2 { Ok("2 agents".into()) } else { Err(format!("{} agents", o.agents.len())) })));
@@ -187,7 +187,7 @@ pub fn spawn(app: AppHandle, mock: String) {
         let _ = check!("OpenAI 兼容 agent", {
             let base = mock_openai().await?;
             let o = crate::NewAgent { template: "openai".into(), name: "o1".into(), url: Some(format!("{base}/chat/completions")), header_name: None, header_value: None,
-                command: None, cwd: None, count: None, worktree: None, conda: None, model: None };
+                command: None, cwd: None, count: None, worktree: None, conda: None, model: None, extra: Vec::new() };
             within(10, crate::add_agent(st(), o)).await??;
             let n = count(&core, "dm:o1", "o1");
             crate::send(st(), "dm:o1".into(), "记一个待办".into())?;
@@ -209,7 +209,7 @@ pub fn spawn(app: AppHandle, mock: String) {
             Ok(m) });
         // Sharing end to end over loopback: invite → the guest's remote agent → our m1 answers.
         let _ = check!("共享 邀请码接入后能聊", {
-            let code = crate::share::create_share(st(), "m1".into(), "小王".into(), "chat".into(), 0)?;
+            let code = crate::share::create_share(st(), "m1".into(), "小王".into(), "chat".into(), 0, None)?;
             let guest = within(20, crate::share::accept_invite(st(), code, Some("guest1".into()))).await??;
             let n = count(&core, "dm:guest1", "guest1"); crate::send(st(), "dm:guest1".into(), "你好".into())?;
             wait_msg(&core, "dm:guest1", "guest1", n, 40).await.and_then(|b| if b.contains("hello from mock") { Ok(guest) } else { Err(b) }) });
@@ -220,7 +220,7 @@ pub fn spawn(app: AppHandle, mock: String) {
             wait_msg(&core, "dm:guest1", "system", n, 30).await.and_then(|b| if b.contains("撤销") { Ok(b) } else { Err(b) }) });
         // v1.5.13 share
         let _ = check!("共享 不泄露存在与用户名", {
-            crate::share::create_share(st(), "m1".into(), "小李".into(), "chat".into(), 0)?;
+            crate::share::create_share(st(), "m1".into(), "小李".into(), "chat".into(), 0, None)?;
             let id = core.shares().into_iter().find(|(_, s)| s.guest == "小李").map(|(id, _)| id).ok_or("找不到共享")?;
             let (base, http) = (core.share_base()?, crate::openai::client(&[]));
             let body = serde_json::json!({ "jsonrpc": "2.0", "id": 1, "method": "SendMessage", "params": {} });
@@ -459,7 +459,7 @@ pub fn spawn(app: AppHandle, mock: String) {
         // Sharing: peer turns called the way the A2A server calls them.
         let (etx, _erx) = tokio::sync::mpsc::unbounded_channel();
         let mk_share = |agent: &str, guest: &str, mode: &str, limit: u32| -> Result<String, String> {
-            crate::share::create_share(st(), agent.into(), guest.into(), mode.into(), limit)?;
+            crate::share::create_share(st(), agent.into(), guest.into(), mode.into(), limit, None)?;
             core.shares().into_iter().find(|(_, s)| s.guest == guest).map(|(id, _)| id).ok_or_else(|| "找不到共享".to_string())
         };
         let _ = check!("共享 每日额度用完即拒、没开始的失败退回额度", {
@@ -758,6 +758,87 @@ pub fn spawn(app: AppHandle, mock: String) {
         crate::share::revoke_share(st(), fshare);
         let _ = within(10, crate::remove_agent(st(), "fg1".into(), Some(true))).await;
         let _ = std::fs::remove_dir_all(&tmp);
+
+        // v1.9.0 Cloudflare tunnel. cloudflared forwards from loopback, so its requests must
+        // not count as this machine: token on every call, rate limits, expiry, Access.
+        async fn hit(http: &reqwest::Client, url: &str, token: &str, hdr: &[(&str, &str)]) -> Result<(u16, String), String> {
+            let mut r = http.post(url).json(&serde_json::json!({ "jsonrpc": "2.0", "id": 1, "method": "GetTask", "params": {} }));
+            if !token.is_empty() { r = r.bearer_auth(token); }
+            for (k, v) in hdr { r = r.header(*k, *v); }
+            let r = within(10, r.send()).await?.map_err(|e| e.to_string())?;
+            Ok((r.status().as_u16(), r.text().await.unwrap_or_default()))
+        }
+        let http = crate::openai::client(&[]);
+        let tshare = mk_share("m1", "隧道友", "chat", 0).unwrap_or_default();
+        let tport = core.serve_tunnel().unwrap_or_default();
+        let ttoken = crate::secret_get(&format!("share/{tshare}")).unwrap_or_default();
+        let (turl, lurl) = (format!("http://127.0.0.1:{tport}/a/{tshare}/jsonrpc"), format!("{}/a/{tshare}/jsonrpc", core.share_base().unwrap_or_default()));
+        let _ = check!("隧道 每个请求都要 token，名片给 https 地址", {
+            let (none, body) = hit(&http, &turl, "", &[]).await?;
+            if none != 401 || !body.contains("邀请码无效") { return Err(format!("无 token：{none} {body}")); }
+            let (ok, body) = hit(&http, &turl, &ttoken, &[]).await?;
+            if ok != 403 || !body.contains("method not allowed") { return Err(format!("有 token：{ok} {body}")); }
+            let card = |url: String, hdr: Option<(&'static str, &'static str)>| { let mut r = http.get(url); if let Some((k, v)) = hdr { r = r.header(k, v); } r.send() };
+            let via_tunnel = within(10, card(format!("http://127.0.0.1:{tport}/a/{tshare}/.well-known/agent-card.json"), None)).await?.map_err(|e| e.to_string())?.text().await.unwrap_or_default();
+            let base = core.share_base()?;
+            let cf_hdr = within(10, card(format!("{base}/a/{tshare}/.well-known/agent-card.json"), Some(("cf-connecting-ip", "198.51.100.9")))).await?.map_err(|e| e.to_string())?.text().await.unwrap_or_default();
+            let plain = within(10, card(format!("{base}/a/{tshare}/.well-known/agent-card.json"), None)).await?.map_err(|e| e.to_string())?.text().await.unwrap_or_default();
+            let https = |c: &str| c.contains("\"https://");
+            if https(&via_tunnel) && https(&cf_hdr) && !https(&plain) { Ok(String::new()) } else { Err(format!("{via_tunnel} | {cf_hdr} | {plain}")) } });
+        let _ = check!("隧道 按共享限频，本机直连不受影响", {
+            let ip = [("cf-connecting-ip", "203.0.113.7")];
+            let mut last = 0;
+            for _ in 0..=crate::share::SHARE_PER_MIN { last = hit(&http, &turl, &ttoken, &ip).await?.0; }
+            let (local, _) = hit(&http, &lurl, &ttoken, &[]).await?;
+            if last == 429 && local == 403 { Ok(String::new()) } else { Err(format!("隧道最后 {last}，本机 {local}")) } });
+        let _ = check!("隧道 开了 Access 后没过 Access 的请求被拒", {
+            let other = mk_share("m1", "隧道Access", "chat", 0)?;
+            let tok = crate::secret_get(&format!("share/{other}")).unwrap_or_default();
+            let url = format!("http://127.0.0.1:{tport}/a/{other}/jsonrpc");
+            let _ = core.db().set_setting("cf_access", "1");
+            let (no_jwt, body) = hit(&http, &url, &tok, &[]).await?;
+            let (jwt, _) = hit(&http, &url, &tok, &[("cf-access-jwt-assertion", "x.y.z")]).await?;
+            let _ = core.db().set_setting("cf_access", "");
+            crate::share::revoke_share(st(), other);
+            if no_jwt == 403 && body.contains("Access") && jwt == 403 { Ok(String::new()) } else { Err(format!("{no_jwt} {body} / {jwt}")) } });
+        let _ = check!("隧道 文件随消息经隧道送达", {
+            let other = mk_share("m1", "隧道文件", "chat", 0)?;
+            let tok = crate::secret_get(&format!("share/{other}")).unwrap_or_default();
+            let bytes = b"tunnel file".to_vec();
+            let f = disco_types::FilePart { name: "隧道.txt".into(), mime: Some("text/plain".into()), size: bytes.len() as u64,
+                sha256: hex::encode(<sha2::Sha256 as sha2::Digest>::digest(&bytes)), url: None, bytes };
+            let mut msg = a2a::Message::new(a2a::Role::User, vec![a2a::Part::text("__echo__ 收到吗"), disco_a2a::file_part(&f)]);
+            msg.context_id = Some("dm:tf".into());
+            let req = a2a::SendMessageRequest { message: msg, configuration: None, metadata: None, tenant: None };
+            let thread = format!("peer:{other}");
+            let before = count(&core, &thread, "隧道文件");
+            let body = serde_json::json!({ "jsonrpc": "2.0", "id": 1, "method": a2a::methods::SEND_MESSAGE, "params": req });
+            let r = within(40, http.post(format!("http://127.0.0.1:{tport}/a/{other}/jsonrpc")).bearer_auth(&tok).json(&body).send()).await?.map_err(|e| e.to_string())?;
+            let status = r.status().as_u16();
+            let got = wait_msg(&core, &thread, "隧道文件", before, 20).await;
+            let saved = crate::mcp::space_dir(&core, &thread).map(|d| d.join("files").join("隧道.txt")).ok().and_then(|p| std::fs::read(p).ok());
+            crate::share::revoke_share(st(), other);
+            if status == 200 && saved.as_deref() == Some(b"tunnel file".as_slice()) { Ok(got.unwrap_or_default()) } else { Err(format!("{status} {got:?} {saved:?}")) } });
+        let _ = check!("隧道 邀请过期即拒（隧道和本机都一样）", {
+            let mut sh = core.shares().into_iter().find(|(i, _)| *i == tshare).map(|(_, s)| s).ok_or("找不到共享")?;
+            sh.expires = chrono::Utc::now().timestamp() - 1;
+            let json = serde_json::to_string(&sh).map_err(|e| e.to_string())?;
+            let _ = core.db().set_setting(&format!("{}{tshare}", crate::share::SHARE), &json);
+            let (a, body) = hit(&http, &turl, &ttoken, &[("cf-connecting-ip", "203.0.113.8")]).await?;
+            let (b, _) = hit(&http, &lurl, &ttoken, &[]).await?;
+            let v = serde_json::to_value(crate::share::share_status(st())).map_err(|e| e.to_string())?;
+            let shown = v["shares"].as_array().and_then(|a| a.iter().find(|r| r["id"] == tshare.as_str()).map(|r| r["expires"].as_i64().unwrap_or(0))).unwrap_or(0);
+            if a == 401 && body.contains("过期") && b == 401 && shown == sh.expires && v["via"] == "tailscale" { Ok(String::new()) } else { Err(format!("{a} {body} / {b} / {shown}")) } });
+        let _ = check!("隧道 邀请码带 Access 令牌，设置往返", {
+            let s = crate::tunnel::tunnel_set(st(), None, Some("cid.access".into()), Some("sec".into()))?;
+            let v = serde_json::to_value(&s).map_err(|e| e.to_string())?;
+            let hdr = crate::tunnel::access_headers(&core);
+            let off = crate::tunnel::tunnel_set(st(), None, Some(String::new()), Some(String::new()))?;
+            let v2 = serde_json::to_value(&off).map_err(|e| e.to_string())?;
+            let no_conf = crate::tunnel::tunnel_set(st(), Some("cloudflare".into()), None, None).err().unwrap_or_default();
+            if v["access"] == true && v["access_id"] == "cid.access" && !v.to_string().contains("\"sec\"") && hdr.len() == 2 && hdr[1] == ("cf-access-client-secret".to_owned(), "sec".to_owned())
+                && v2["access"] == false && crate::tunnel::access_headers(&core).is_empty() && no_conf.contains("域名") && !crate::tunnel::via_cloudflare(&core) { Ok(String::new()) } else { Err(format!("{v} / {v2} / {no_conf}")) } });
+        crate::share::revoke_share(st(), tshare);
         println!("SELFTEST {}", if fails == 0 { "OK".to_string() } else { format!("{fails} FAILED") });
         std::process::exit(if fails == 0 { 0 } else { 1 });
     });

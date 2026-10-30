@@ -1,9 +1,11 @@
-//! Sharing a local agent with someone on the same Tailscale network.
+//! Sharing a local agent with someone on another device, over Tailscale or a
+//! Cloudflare named tunnel (see tunnel.rs).
 //!
 //! The owner's Disco serves each shared agent as an A2A endpoint at
-//! `http://<tailscale-host>:<port>/a/<share-id>`. Every share has its own random
+//! `http://<tailscale-host>:<port>/a/<share-id>` (or `https://<tunnel-host>/a/<share-id>`). Every share has its own random
 //! bearer token (kept in the vault) that the owner can revoke at any time. Only
-//! loopback and Tailscale peers may connect (checked per connection by `guard`),
+//! loopback and Tailscale peers may connect (checked per connection by `guard`);
+//! tunnel requests are strangers from the internet: no loopback trust, rate limited,
 //! only the two "send message" methods are accepted (plus fetching a file the agent
 //! sent back), and tool permissions are decided on the owner's machine. Files go both
 //! ways as A2A file parts (at most 20 MB): inline from the guest, by url back to it.
@@ -34,6 +36,11 @@ use crate::{CmdResult, Core, St, err, secret_del, secret_get, secret_set, tailne
 pub const SHARE: &str = "share/";
 const PORTS: std::ops::RangeInclusive<u16> = 7480..=7489;
 const SHARE_HEADER: &str = "x-disco-share";
+/// Set by `guard` (never by the caller) on requests that came through the Cloudflare tunnel.
+const VIA_HEADER: &str = "x-disco-via";
+/// Tunnel requests per minute: per client address (before the token is checked) and per share.
+pub(crate) const IP_PER_MIN: usize = 120;
+pub(crate) const SHARE_PER_MIN: usize = 60;
 const PEER_HEADER: &str = "x-disco-peer";
 /// Key of the files `guard` took out of a guest's message (see `take_files`).
 const FILES_HEADER: &str = "x-disco-files";
@@ -42,6 +49,7 @@ const BODY_MAX: usize = (MAX_A2A * 4 / 3) as usize + (1 << 20);
 const INVITE_PREFIX: &str = "disco1:";
 /// One answer for a bad token, an unknown share and a revoked one: nobody learns which ids exist.
 const GONE: &str = "邀请码无效或共享已被撤销，请让对方重新发一个";
+const EXPIRED: &str = "这个邀请已过期，请让对方重新发一个";
 
 /// What a share allows. Stored as JSON in settings under `share/<id>`.
 #[derive(Serialize, Deserialize, Clone)]
@@ -53,26 +61,40 @@ pub struct Share {
     pub mode: String,
     /// Messages per day; 0 = unlimited.
     pub limit: u32,
+    /// Unix time after which the invite stops working; 0 = never.
+    #[serde(default)]
+    pub expires: i64,
 }
 
 #[derive(Serialize)]
-pub struct ShareView { id: String, agent: String, guest: String, mode: String, limit: u32, used_today: u32 }
+pub struct ShareView { id: String, agent: String, guest: String, mode: String, limit: u32, used_today: u32, expires: i64 }
 
 #[derive(Serialize)]
 pub struct ShareStatus {
     /// e.g. "http://100.101.2.3:7480" (the Tailscale IP) once the server runs and Tailscale is found.
     base: Option<String>,
     problem: Option<String>,
+    /// How invites reach this machine: "tailscale" or "cloudflare".
+    via: String,
     shares: Vec<ShareView>,
 }
 
 /// The running server: bound port, the Tailscale addresses it listens on
 /// (besides 127.0.0.1), or the reason it could not start / listen.
 #[derive(Default)]
-pub struct Server { port: Option<u16>, error: Option<String> }
+pub struct Server { port: Option<u16>, error: Option<String>, tunnel: Option<u16> }
+
+/// Marks the loopback listener only the local `cloudflared` talks to.
+#[derive(Clone)]
+struct Tunnel;
 
 #[derive(Serialize, Deserialize)]
-struct Invite { url: String, token: String, agent: String, owner: String }
+struct Invite {
+    url: String, token: String, agent: String, owner: String,
+    /// Headers for every request (a Cloudflare Access service token).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    hdr: Vec<(String, String)>,
+}
 
 /// Today in local time, like quiet hours: the daily limit resets at the owner's midnight.
 fn today() -> String {
@@ -186,7 +208,7 @@ impl Core {
                     self.listen(l);
                     // Tailscale's IPv6 address, where the OS keeps v6 separate; harmless if it fails.
                     if let Ok(l6) = std::net::TcpListener::bind((std::net::Ipv6Addr::UNSPECIFIED, port)) { self.listen(l6); }
-                    *srv = Server { port: Some(port), error: None };
+                    *srv = Server { port: Some(port), error: None, tunnel: srv.tunnel };
                     return;
                 }
                 Err(e) => last = e.to_string(),
@@ -195,14 +217,32 @@ impl Core {
         srv.error = Some(format!("端口 7480–7489 都被占用：{last}"));
     }
 
-    fn listen(self: &Arc<Self>, l: std::net::TcpListener) {
+    fn listen(self: &Arc<Self>, l: std::net::TcpListener) { self.listen_as(l, false); }
+
+    fn listen_as(self: &Arc<Self>, l: std::net::TcpListener, tunnel: bool) {
         let _ = l.set_nonblocking(true);
         let core = self.clone();
         tauri::async_runtime::spawn(async move {
             let Ok(listener) = tokio::net::TcpListener::from_std(l) else { return };
-            let app = router(core).into_make_service_with_connect_info::<SocketAddr>();
-            let _ = axum::serve(listener, app).await;
+            let r = router(core);
+            let r = if tunnel { r.layer(axum::Extension(Tunnel)) } else { r };
+            let _ = axum::serve(listener, r.into_make_service_with_connect_info::<SocketAddr>()).await;
         });
+    }
+
+    /// The loopback port `cloudflared` forwards tunnel traffic to (idempotent). A separate
+    /// listener, so `guard` knows those requests come from the internet, not this machine.
+    /// The same port across restarts where possible: a connector left over from a crash
+    /// then still reaches us.
+    pub(crate) fn serve_tunnel(self: &Arc<Self>) -> Result<u16, String> {
+        let mut srv = self.server.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(p) = srv.tunnel { return Ok(p); }
+        let l = (7490..=7499).find_map(|p| std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, p)).ok())
+            .or_else(|| std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).ok()).ok_or("没有可用的本机端口给隧道")?;
+        let port = l.local_addr().map_err(err)?.port();
+        self.listen_as(l, true);
+        srv.tunnel = Some(port);
+        Ok(port)
     }
 
     pub(crate) fn net_policy(&self) -> tailnet::Policy {
@@ -214,6 +254,10 @@ impl Core {
             let s = self.server.lock().unwrap_or_else(|p| p.into_inner());
             (s.port, s.error.clone())
         };
+        if crate::tunnel::via_cloudflare(self) {
+            return crate::tunnel::conf(self).filter(|c| !c.hostname.is_empty()).map(|c| format!("https://{}", c.hostname))
+                .ok_or_else(|| "Cloudflare 隧道还没设置好：到设置「Cloudflare 隧道」里登录并填一个域名".into());
+        }
         let port = port.ok_or_else(|| error.unwrap_or_else(|| "共享服务未启动".into()))?;
         // The IP, not the MagicDNS name: a guest may have Tailscale DNS off (e.g. under another VPN).
         let host = match tailnet::best_ip(&tailnet::my_ips()) {
@@ -496,13 +540,45 @@ fn deny(code: StatusCode, msg: &str) -> Response {
     (code, [(header::CONTENT_TYPE, "application/json")], body.to_string()).into_response()
 }
 
-/// Tailnet/loopback only; per-share bearer token (checked before anything else
-/// looks at the share or asks Tailscale); then the device must pass the access
-/// policy (when Tailscale can say who it is); only message methods. The agent card
-/// is public (A2A clients fetch it without credentials) and names only the agent.
-async fn guard(State(core): State<Arc<Core>>, ConnectInfo(peer): ConnectInfo<SocketAddr>, req: Request, next: Next) -> Response {
+/// Requests through the Cloudflare tunnel arrive from the local `cloudflared`, i.e. from
+/// loopback: they are strangers from the internet and get no loopback trust. Recognised by
+/// the tunnel's own listener, or by Cloudflare's headers on any loopback connection.
+fn via_tunnel(ip: &IpAddr, tunnel_listener: bool, headers: &axum::http::HeaderMap) -> bool {
+    ip.is_loopback() && (tunnel_listener || headers.contains_key("cf-connecting-ip") || headers.contains_key("cf-ray"))
+}
+
+/// Sliding one-minute window per key (a client address or a share).
+pub(crate) fn rate_ok(key: &str, per_min: usize) -> bool {
+    static HITS: Mutex<Option<HashMap<String, Vec<std::time::Instant>>>> = Mutex::new(None);
+    let mut g = HITS.lock().unwrap_or_else(|p| p.into_inner());
+    let m = g.get_or_insert_with(HashMap::new);
+    if m.len() > 4096 { m.retain(|_, v| v.last().is_some_and(|t| t.elapsed().as_secs() < 60)); }
+    let v = m.entry(key.to_owned()).or_default();
+    v.retain(|t| t.elapsed().as_secs() < 60);
+    if v.len() >= per_min { return false; }
+    v.push(std::time::Instant::now());
+    true
+}
+
+/// Tailnet/loopback (or the Cloudflare tunnel) only; per-share bearer token (checked
+/// before anything else looks at the share or asks Tailscale); unexpired invite; then the
+/// device must pass the access policy (when Tailscale can say who it is); only message
+/// methods. The agent card is public (A2A clients fetch it without credentials) and names
+/// only the agent. Tunnel requests are rate limited and, once an Access service token is
+/// set up, must have passed Cloudflare Access.
+async fn guard(State(core): State<Arc<Core>>, ConnectInfo(peer): ConnectInfo<SocketAddr>, mut req: Request, next: Next) -> Response {
     let ip = peer.ip().to_canonical();
-    if !(ip.is_loopback() || tailnet::is_tailnet(&ip)) { return deny(StatusCode::FORBIDDEN, "tailnet only"); }
+    let cf = via_tunnel(&ip, req.extensions().get::<Tunnel>().is_some(), req.headers());
+    if !(cf || ip.is_loopback() || tailnet::is_tailnet(&ip)) { return deny(StatusCode::FORBIDDEN, "tailnet only"); }
+    let client = req.headers().get("cf-connecting-ip").and_then(|v| v.to_str().ok()).unwrap_or("?").to_owned();
+    if cf {
+        if !rate_ok(&format!("ip:{client}"), IP_PER_MIN) { return deny(StatusCode::TOO_MANY_REQUESTS, "请求太频繁，请稍后再试"); }
+        if crate::tunnel::access_on(&core) && !req.headers().contains_key("cf-access-jwt-assertion") {
+            return deny(StatusCode::FORBIDDEN, "需要先通过 Cloudflare Access：请让对方重新发一个邀请码");
+        }
+    }
+    req.headers_mut().remove(VIA_HEADER);
+    if cf { req.headers_mut().insert(VIA_HEADER, HeaderValue::from_static("cf")); }
     let path = req.uri().path().to_owned();
     let Some(rest) = path.strip_prefix("/a/") else { return deny(StatusCode::NOT_FOUND, "not found") };
     let (id, tail) = rest.split_once('/').unwrap_or((rest, ""));
@@ -511,9 +587,13 @@ async fn guard(State(core): State<Arc<Core>>, ConnectInfo(peer): ConnectInfo<Soc
     let token = req.headers().get(header::AUTHORIZATION).and_then(|v| v.to_str().ok()).and_then(|v| v.strip_prefix("Bearer ")).unwrap_or("");
     let secret = secret_get(&format!("share/{id}"));
     let ok = !token.is_empty() && secret.is_some_and(|t| eq_ct(t.as_bytes(), token.as_bytes()));
-    if !ok || core.share(&id).is_none() { return deny(StatusCode::UNAUTHORIZED, GONE); }
+    let Some(share) = core.share(&id).filter(|_| ok) else { return deny(StatusCode::UNAUTHORIZED, GONE) };
+    if share.expires > 0 && chrono::Utc::now().timestamp() >= share.expires { return deny(StatusCode::UNAUTHORIZED, EXPIRED); }
+    if cf && !rate_ok(&format!("share:{id}"), SHARE_PER_MIN) { return deny(StatusCode::TOO_MANY_REQUESTS, "请求太频繁，请稍后再试"); }
     let mut who = String::from("local");
-    if !ip.is_loopback() {
+    if cf {
+        who = format!("cloudflare:{client}");
+    } else if !ip.is_loopback() {
         let policy = core.net_policy();
         match tauri::async_runtime::spawn_blocking(move || tailnet::whois(&ip)).await.ok().flatten() {
             Some(id) => {
@@ -552,11 +632,18 @@ async fn guard(State(core): State<Arc<Core>>, ConnectInfo(peer): ConnectInfo<Soc
 async fn card(State(core): State<Arc<Core>>, axum::extract::Path(id): axum::extract::Path<String>, headers: axum::http::HeaderMap) -> Response {
     let Some(s) = core.share(&id) else { return deny(StatusCode::NOT_FOUND, GONE) };
     let host = headers.get(header::HOST).and_then(|v| v.to_str().ok()).unwrap_or("127.0.0.1");
+    // Through the tunnel the guest reached `https://<tunnel-host>`: the card must say so, or
+    // the guest refuses to send its token anywhere else.
+    let tunnel = headers.get(VIA_HEADER).is_some_and(|v| v == "cf");
+    let (scheme, host) = match crate::tunnel::conf(&core).filter(|c| tunnel && !c.hostname.is_empty()) {
+        Some(c) => ("https", c.hostname),
+        None => (if tunnel { "https" } else { "http" }, host.to_owned()),
+    };
     let card = AgentCard {
         name: s.agent.clone(), description: format!("通过 Disco 共享的 {}", s.agent), version: a2a::VERSION.into(), provider: None,
         capabilities: AgentCapabilities { streaming: Some(true), push_notifications: Some(false), extensions: None, extended_agent_card: None },
         skills: vec![], default_input_modes: vec!["text/plain".into()], default_output_modes: vec!["text/plain".into()],
-        supported_interfaces: vec![AgentInterface::new(format!("http://{host}/a/{id}/jsonrpc"), TRANSPORT_PROTOCOL_JSONRPC)],
+        supported_interfaces: vec![AgentInterface::new(format!("{scheme}://{host}/a/{id}/jsonrpc"), TRANSPORT_PROTOCOL_JSONRPC)],
         security_schemes: None, security_requirements: None, documentation_url: None, icon_url: None, signatures: None,
     };
     axum::Json(card).into_response()
@@ -612,7 +699,17 @@ impl AgentExecutor for PeerExec {
                     if answer { append = true; }
                 }
             });
+            // Cloudflare drops a response that stays silent for 100 s: a long tool run
+            // must not cut the guest off, so say "still working" every 25 s.
+            let (hb_tx, hb_tid, hb_cid) = (tx.clone(), task_id.clone(), context_id.clone());
+            let hb = tauri::async_runtime::spawn(async move {
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_secs(25)).await;
+                    if hb_tx.send(Ok(status(&hb_tid, &hb_cid, TaskState::Working, None))).is_err() { break; }
+                }
+            });
             let res = core.peer_turn_files(&id, &device, &context_id, &text, files, etx).await;
+            hb.abort();
             let _ = fwd.await;
             let _ = tx.send(Ok(match res {
                 Ok(_) => status(&task_id, &context_id, TaskState::Completed, None),
@@ -640,13 +737,15 @@ pub fn share_status(core: St<'_>) -> ShareStatus {
     // Picks up Tailscale addresses that appeared since the server started.
     if !core.shares().is_empty() { core.inner().serve_shares(); }
     let (base, problem) = match core.share_base() { Ok(b) => (Some(b), None), Err(e) => (None, Some(e)) };
-    let shares = core.shares().into_iter().map(|(id, s)| ShareView { used_today: core.used_today(&id), id, agent: s.agent, guest: s.guest, mode: s.mode, limit: s.limit }).collect();
-    ShareStatus { base, problem, shares }
+    let shares = core.shares().into_iter().map(|(id, s)| ShareView { used_today: core.used_today(&id), id, agent: s.agent, guest: s.guest, mode: s.mode, limit: s.limit, expires: s.expires }).collect();
+    let via = if crate::tunnel::via_cloudflare(&core) { "cloudflare" } else { "tailscale" }.into();
+    ShareStatus { base, problem, via, shares }
 }
 
-/// Share `agent` with `guest`; returns the invite code to send them.
+/// Share `agent` with `guest`; returns the invite code to send them. `days`: how long the
+/// invite works (0 or none = until revoked).
 #[tauri::command]
-pub fn create_share(core: St<'_>, agent: String, guest: String, mode: String, limit: u32) -> CmdResult<String> {
+pub fn create_share(core: St<'_>, agent: String, guest: String, mode: String, limit: u32, days: Option<u32>) -> CmdResult<String> {
     core.agent(&agent)?;
     let guest = guest.trim();
     if guest.is_empty() { return Err("写一下对方的名字".into()); }
@@ -655,10 +754,11 @@ pub fn create_share(core: St<'_>, agent: String, guest: String, mode: String, li
     let id = uuid::Uuid::new_v4().simple().to_string()[..12].to_owned();
     let token = format!("{}{}", uuid::Uuid::new_v4().simple(), uuid::Uuid::new_v4().simple());
     secret_set(&format!("share/{id}"), &token)?;
-    let share = Share { agent: agent.clone(), guest: guest.to_owned(), mode: if mode == "ask" { mode } else { "chat".into() }, limit };
+    let expires = days.filter(|d| *d > 0).map_or(0, |d| chrono::Utc::now().timestamp() + i64::from(d) * 86_400);
+    let share = Share { agent: agent.clone(), guest: guest.to_owned(), mode: if mode == "ask" { mode } else { "chat".into() }, limit, expires };
     core.db().set_setting(&format!("{SHARE}{id}"), &serde_json::to_string(&share).map_err(err)?).map_err(err)?;
     let _ = core.db().audit("user", Some(&agent), "share", guest);
-    invite(&base, &id, &token, &agent)
+    invite(&core, &base, &id, &token, &agent)
 }
 
 /// The invite code of an existing share (to send it again).
@@ -666,7 +766,7 @@ pub fn create_share(core: St<'_>, agent: String, guest: String, mode: String, li
 pub fn share_invite(core: St<'_>, id: String) -> CmdResult<String> {
     let s = core.share(&id).ok_or("这个共享已被撤销")?;
     let token = secret_get(&format!("share/{id}")).ok_or("找不到共享密钥")?;
-    invite(&core.share_base()?, &id, &token, &s.agent)
+    invite(&core, &core.share_base()?, &id, &token, &s.agent)
 }
 
 #[tauri::command]
@@ -684,8 +784,10 @@ pub fn revoke_share(core: St<'_>, id: String) {
     let _ = core.db().audit("user", None, "revoke_share", &id);
 }
 
-fn invite(base: &str, id: &str, token: &str, agent: &str) -> CmdResult<String> {
-    let inv = Invite { url: format!("{base}/a/{id}"), token: token.to_owned(), agent: agent.to_owned(), owner: owner_name() };
+fn invite(core: &Core, base: &str, id: &str, token: &str, agent: &str) -> CmdResult<String> {
+    // A tunnel invite carries the Access service token, so the guest's Disco gets past Access.
+    let hdr = if base.starts_with("https://") { crate::tunnel::access_headers(core) } else { Vec::new() };
+    let inv = Invite { url: format!("{base}/a/{id}"), token: token.to_owned(), agent: agent.to_owned(), owner: owner_name(), hdr };
     Ok(format!("{INVITE_PREFIX}{}", b64(serde_json::to_string(&inv).map_err(err)?.as_bytes())))
 }
 
@@ -699,7 +801,7 @@ pub async fn accept_invite(core: St<'_>, code: String, name: Option<String>) -> 
         let n = format!("{}-{}", slug(&inv.agent), slug(&inv.owner));
         n.chars().take(32).collect()
     });
-    let spec = crate::NewAgent::remote(name, inv.url, inv.token);
+    let spec = crate::NewAgent::remote(name, inv.url, inv.token, inv.hdr);
     let names = crate::add_agent_rows(&core, spec).await?;
     core.agents_changed();
     core.inner().warm(Some(names.clone()));

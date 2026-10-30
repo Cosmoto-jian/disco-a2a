@@ -193,13 +193,8 @@ impl Hub {
     async fn start(&self, row: &AgentRow, secret: &CredLookup) -> Result<Runtime, String> {
         let rt = match row.transport.as_str() {
             "a2a" => {
-                let cred = row
-                    .credential_ref
-                    .as_deref()
-                    .and_then(secret)
-                    .and_then(|s| s.split_once('\n').map(|(n, v)| Credential::Header { name: n.into(), value: v.into() }))
-                    .unwrap_or(Credential::None);
-                Runtime::A2a(Arc::new(RemoteAgent::connect(&row.endpoint, cred).await.map_err(|e| e.to_string())?))
+                let (cred, extra) = remote_cred(row.credential_ref.as_deref().and_then(secret).as_deref());
+                Runtime::A2a(Arc::new(RemoteAgent::connect_with(&row.endpoint, cred, &extra).await.map_err(|e| e.to_string())?))
             }
             "acp" => {
                 let spec: LocalSpec = row.card_json.as_deref().and_then(|j| serde_json::from_str(j).ok()).ok_or("缺少启动配置")?;
@@ -735,6 +730,15 @@ fn login_script(cmd: &str, args: &[String], env: &[(String, String)], cwd: &std:
     let line: Vec<String> = std::iter::once(cmd).chain(args.iter().map(String::as_str)).map(q).collect();
     script.push_str(&format!("{}\necho\necho '完成后可以关闭这个窗口，回到 Disco。'\n", line.join(" ")));
     script
+}
+
+/// A remote agent's saved secret: `name\nvalue` lines in pairs. The first pair is its
+/// credential, any more are headers for every request (a Cloudflare Access service token).
+pub fn remote_cred(secret: Option<&str>) -> (Credential, Vec<(String, String)>) {
+    let lines: Vec<&str> = secret.unwrap_or_default().split('\n').collect();
+    let mut pairs = lines.as_chunks::<2>().0.iter().map(|[n, v]| ((*n).to_owned(), (*v).to_owned()));
+    let cred = pairs.next().map_or(Credential::None, |(name, value)| Credential::Header { name, value });
+    (cred, pairs.collect())
 }
 
 /// Full path of `cmd` on `path`, if it is there.

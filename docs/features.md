@@ -8,7 +8,7 @@
 - `手动验证` = 无法离线确定性测试（真实 Discord 网关、Tailscale、系统对话框、更新服务器），后面写手动步骤。
 - `UI` = 纯界面行为，由 ui-test/ 与 `notes/ui-feature-inventory.md` 守护，本文件只登记。
 
-v1.6.5 基线新增的 selftest 检查在下表中用 ★ 标出；v1.8.0 跨设备传文件新增的用 ◆ 标出。
+v1.6.5 基线新增的 selftest 检查在下表中用 ★ 标出；v1.8.0 跨设备传文件新增的用 ◆ 标出；v1.9.0 Cloudflare 隧道新增的用 ▲ 标出。
 
 ## 私聊
 
@@ -117,6 +117,9 @@ v1.6.5 基线新增的 selftest 检查在下表中用 ★ 标出；v1.8.0 跨设
 | 跨设备传文件 访客 → 主人 | 和共享来的（A2A）agent 的会话里附件或 MCP `send_file`：先放进本地共享空间，再随下一条消息作为 A2A 文件部件（inline base64）发过去；主人端 guard 取出文件（绕开 A2A 服务器 10 MB 正文上限），校验大小与 SHA-256，用 safe_name 存进 `peer:<id>` 共享空间，会话里显示 📎，agent 的提示里带保存路径和完整 SHA-256；每条消息合计 ≤20 MB；没送到（连不上）的文件留到下一条 | ◆ST:跨设备文件 访客附件随下一条消息送达，主人校验 SHA 后存下并告诉 agent, UT:disco-a2a file_tests::file_part_survives_the_wire；手动验证：两台电脑经 Tailscale 接入邀请码，访客在私聊附一个 5–15 MB 文件再发一句话，主人端 peer 会话出现 📎 且 agent 能读到文件 |
 | 跨设备传文件 主人 agent → 访客 | 朋友会话里 agent 只有 `send_file` 一个 MCP 工具；文件只在对方这一轮进行中发回（A2A 文件部件带 url），访客 Disco 用同一共享 token 到同一来源取一次（1 小时内），校验 SHA 后存进自己的会话空间并显示 📎；「只聊天」共享只能发共享空间里的文件，「需要时问我」其他文件要主人在收件箱同意（5 分钟） | ◆ST:跨设备文件 主人的 agent 用 MCP send_file 发回访客（只聊天只能发共享空间里的）, ◆ST:跨设备文件 需要时问我：主人拒绝不发、同意后对方不在线也不发, ST:MCP 伪造 context 被拒；手动验证：主人的 Claude 在朋友会话里被要求「把刚才那个文件发回给我」，访客端出现 📎 |
 | 跨设备传文件 限制与安全 | >20 MB 在附件、MCP、接收三处都拒绝并给中文原因；SHA 不符或不完整的文件不落盘；文件名只取安全的基名；主人旁观 peer 会话不能发文件；取回地址需共享 token、只能取一次 | ◆ST:跨设备文件 超过 20 MB 被拒（附件、MCP、接收）, ◆ST:跨设备文件 SHA 不符或不完整就丢弃，文件名不能越界, ◆ST:跨设备文件 旁观中不能发、取回地址要共享 token 且只能取一次 |
+| Cloudflare 隧道 设置 `tunnel_status` `tunnel_install` `tunnel_login` `tunnel_setup` `tunnel_set` | 找 cloudflared（Disco 自己下载的 → PATH → Homebrew / Program Files）；没有就从 Cloudflare 官方 GitHub 下载到 `<appdata>/bin`；`cloudflared tunnel login` 打开浏览器登录用户自己的账号（页面打不开时给链接，UI 轮询 cert.pem）；填域名后创建本机的命名隧道（一次，凭据在 `<appdata>/cloudflared/<id>.json`）、`route dns --overwrite-dns` 绑定域名、写 config.yml（只把该域名转到隧道监听口，其余 404）并运行；`share_via=cloudflare` 时启动时自动拉起、退出时结束；与 Tailscale 并存，已发的 Tailscale 邀请继续有效 | UT:tunnel::hosts_and_ids, UT:tunnel::config_routes_only_the_hostname, ▲ST:隧道 邀请码带 Access 令牌，设置往返, UI:T1–T5；手动验证：mac / Windows 各一台，设置里安装 cloudflared → 登录 Cloudflare → 填 disco.<你的域名> → 状态「已连接」 |
+| Cloudflare 隧道 安全 | 隧道请求来自本机 cloudflared，但不给本机信任：专用回环监听口（7490–7499）或回环连接上带 Cf-Connecting-Ip / Cf-Ray 即视为隧道；每个请求都要该共享的 token；按来源地址（120/分钟，验 token 前）和按共享（60/分钟）限频；邀请可设有效期（隧道默认 7 天，过期一律拒绝，Tailscale 也适用）；保存 Access Service Token 后没有 Cf-Access-Jwt-Assertion 的隧道请求被拒；名片在隧道上给 `https://<域名>`；共享服务仍监听 0.0.0.0 | ▲ST:隧道 每个请求都要 token，名片给 https 地址, ▲ST:隧道 按共享限频，本机直连不受影响, ▲ST:隧道 开了 Access 后没过 Access 的请求被拒, ▲ST:隧道 邀请过期即拒（隧道和本机都一样） |
+| Cloudflare 隧道 邀请与传文件 | 邀请码指向 `https://<域名>/a/<id>`，访客不需要 Tailscale；开了 Access 时邀请码带 CF-Access-Client-Id/Secret，访客 Disco 每个请求（含名片、取文件）都带上；共享 agent 回复中每 25 秒发一次「仍在处理」，避开 Cloudflare 100 秒无响应断开；20 MB 文件照常走隧道 | ▲ST:隧道 文件随消息经隧道送达, UI:T6；手动验证：两台不在同一 Tailscale 的电脑，主人开隧道发邀请码，访客接入后聊天、互发 10 MB 文件；agent 跑一个 >2 分钟的工具也不断 |
 | 对方群回话 `peer_check` | 只有 Bot 能看到频道且主人账号在该服务器时才能说话；否则只读并说明缺什么 | ST:对方群需你和 Bot 都在, ★ST:对方群 peer_turn …（peer_check 返回原因）；手动验证：朋友把你的 Bot 和你拉进他的服务器，你的 agent 被 @ 后，peer 会话出现输入框 |
 
 ## Agent 接入（ACP / OpenAI / A2A / 邀请码）
@@ -214,7 +217,8 @@ v1.6.5 基线新增的 selftest 检查在下表中用 ★ 标出；v1.8.0 跨设
 | reveal_doc | 手动验证（打开访达） |
 | share_status, share_invite | ★ST:共享状态、重发邀请码、坏邀请码 |
 | peer_check | ★ST:共享 chat 模式…（无群返回空）, ★ST:对方群 peer_turn … |
-| create_share, revoke_share, accept_invite | ST:共享 邀请码接入后能聊, ST:共享 撤销后被拒 |
+| create_share, revoke_share, accept_invite | ST:共享 邀请码接入后能聊, ST:共享 撤销后被拒, ▲ST:隧道 邀请过期即拒（`days`） |
+| tunnel_status, tunnel_install, tunnel_login, tunnel_setup, tunnel_set | ▲ST:隧道 邀请码带 Access 令牌，设置往返；安装/登录/建隧道手动验证（真实 Cloudflare 账号） |
 
 ## 维护规则
 

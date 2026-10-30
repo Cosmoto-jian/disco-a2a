@@ -220,7 +220,7 @@ const agentSub = (a) => [...new Set([KIND[a.kind] ?? "A2A", a.kind === "acp" ? s
 // The git branch of a local agent's folder, as a tiny grey tag after a subtitle (nothing when there is none).
 const branchTag = (a) => a?.branch ? h("span", { class: "branch", title: `git 分支 ${a.branch}` }, ic("git-branch"), a.branch) : null;
 const withBranch = (sub, a) => a?.branch ? [sub, sub ? " · " : "", branchTag(a)] : sub;
-const SETTINGS_SECS = [["dc", "Discord", "discord-logo:fill"], ["net", "共享与 Tailscale", "share-network"], ["mem", "记忆", "brain"], ["run", "运行", "power"], ["gen", "通用与更新", "gear-six"]];
+const SETTINGS_SECS = [["dc", "Discord", "discord-logo:fill"], ["net", "共享与 Tailscale", "share-network"], ["cf", "Cloudflare 隧道", "globe"], ["mem", "记忆", "brain"], ["run", "运行", "power"], ["gen", "通用与更新", "gear-six"]];
 const runLabel = () => (S.ov?.paused ? "已全部停止" : busyAgents().size ? `${busyAgents().size} 个 agent 正在回复` : "运行中");
 function drawList() {
   if (!S.ov) return;
@@ -1281,7 +1281,10 @@ async function shareDialog(agent) {
   const st = await invoke("share_status").catch((e) => ({ problem: String(e), shares: [] }));
   const mine = st.shares.filter((s) => s.agent === agent);
   const guest = h("input", { class: "fld", placeholder: "对方的名字，如 小王", maxlength: 24 });
-  const st2 = { mode: "chat", limit: 50 };
+  const cf = st.via === "cloudflare";
+  // Internet-facing tunnel invites expire after a week by default; Tailscale ones last until revoked.
+  const st2 = { mode: "chat", limit: 50, days: cf ? 7 : 0 };
+  const days = choice([[1, "1 天"], [7, "7 天"], [30, "30 天"], [0, "不限"]], st2.days, (v) => { st2.days = v; });
   const modes = h("div", { class: "seg" });
   const drawModes = () => modes.replaceChildren(...[["chat", "只聊天", "需要批准的操作一律拒绝"], ["ask", "需要时问我", `由你在这台${IS_WIN ? "电脑" : " Mac "}上批准`]]
     .map(([v, t, sub]) => h("button", { type: "button", class: st2.mode === v ? "on" : "", onclick: () => { st2.mode = v; drawModes(); } }, h("b", {}, t), h("small", {}, sub))));
@@ -1293,21 +1296,24 @@ async function shareDialog(agent) {
   const list = h("div", { class: "glist" }, ...mine.map((s) => shareRow(s, () => shareDialog(agent))));
   form.replaceChildren(...[
     h("div", { class: "del-head" }, avatar(agent), h("div", {}, h("h3", {}, `共享 ${agent}`),
-      h("p", { class: "del-sub" }, "通过 Tailscale 私有网络共享，只有拿到邀请码的人能用，随时可以撤销。"))),
-    st.problem ? h("div", { class: "warn" }, ic("warning"), h("span", {}, st.problem, " ", h("button", { type: "button", class: "linkish", onclick: () => invoke("open_url", { url: "https://tailscale.com/download" }) }, "下载 Tailscale"))) : null,
+      h("p", { class: "del-sub" }, cf ? "通过你的 Cloudflare 隧道共享，只有拿到邀请码的人能用，随时可以撤销。" : "通过 Tailscale 私有网络共享，只有拿到邀请码的人能用，随时可以撤销。"))),
+    st.problem ? h("div", { class: "warn" }, ic("warning"), h("span", {}, st.problem, " ", cf
+      ? h("button", { type: "button", class: "linkish", onclick: () => { d.close(); gotoSetting("cf"); } }, "去设置")
+      : h("button", { type: "button", class: "linkish", onclick: () => invoke("open_url", { url: "https://tailscale.com/download" }) }, "下载 Tailscale"))) : null,
     h("div", { class: "glist" },
       grow("共享给", guest),
       // Not a <label>: a click anywhere in a label also clicks its first button, so the
       // second choice could never stay selected.
       h("div", { class: "grow-row col" }, h("span", { class: "gl" }, "权限"), modes),
-      grow("每天上限", limit, h("small", { class: "foot" }, "条，0 = 不限"))),
+      grow("每天上限", limit, h("small", { class: "foot" }, "条，0 = 不限")),
+      grow("有效期", days)),
     err, out,
     mine.length ? h("div", { class: "lab" }, "已共享") : null, mine.length ? list : null,
     h("div", { class: "actions" }, h("button", { class: "btn", type: "button", onclick: () => d.close() }, "关闭"), go)].filter(Boolean));
   form.onsubmit = async (e) => {
     e.preventDefault(); err.textContent = ""; go.disabled = true;
     try {
-      const code = await invoke("create_share", { agent, guest: guest.value, mode: st2.mode, limit: Number(limit.value()) || 0 });
+      const code = await invoke("create_share", { agent, guest: guest.value, mode: st2.mode, limit: Number(limit.value()) || 0, days: st2.days });
       const cp = h("button", { type: "button", class: "btn", onclick: () => copyText(code, cp) }, "复制");
       out.hidden = false;
       out.replaceChildren(h("div", { class: "foot" }, "把这串邀请码发给对方，让他在 Disco「添加 Agent → 朋友的邀请码」里粘贴。"),
@@ -1319,11 +1325,17 @@ async function shareDialog(agent) {
   if (!d.open) d.showModal();
   guest.focus();
 }
+// " · 3 天后过期" / " · 已过期" / "" (no expiry).
+function expiry(at) {
+  if (!at) return "";
+  const left = at - Date.now() / 1000;
+  return left <= 0 ? " · 已过期" : left < 86400 ? ` · ${Math.max(1, Math.round(left / 3600))} 小时后过期` : ` · ${Math.round(left / 86400)} 天后过期`;
+}
 function shareRow(s, after) {
   const cp = h("button", { type: "button", class: "btn sm" }, "复制邀请");
   cp.onclick = async () => { try { copyText(await invoke("share_invite", { id: s.id }), null); cp.textContent = "已复制"; } catch (e) { toast(e); } };
   return h("div", { class: "share-row" }, avatar(s.guest, { person: true, small: true }),
-    h("div", { class: "grow" }, h("b", {}, s.guest), h("small", {}, `${s.mode === "ask" ? "需要时问我" : "只聊天"} · 今天 ${s.used_today}${s.limit ? "/" + s.limit : ""} 条`)),
+    h("div", { class: "grow" }, h("b", {}, s.guest), h("small", {}, `${s.mode === "ask" ? "需要时问我" : "只聊天"} · 今天 ${s.used_today}${s.limit ? "/" + s.limit : ""} 条${expiry(s.expires)}`)),
     cp, h("button", { type: "button", class: "btn sm danger", onclick: async () => { await invoke("revoke_share", { id: s.id }); toast(`已撤销 ${s.guest} 的访问`); await load(); after(); } }, "撤销"));
 }
 // A styled on/off switch around a real checkbox (keyboard and forms keep working).
@@ -1447,6 +1459,8 @@ function renderSettings() {
     h("button", { class: "btn pri sm" }, "保存"));
   const netBox = h("section", { class: "gsec", id: "set-net" }, h("div", { class: "gsec-h" }, h("span", {}, "共享与 Tailscale")), h("div", { class: "glist" }, h("div", { class: "grow-row" }, h("span", { class: "gl mute" }, "正在读取…"))));
   loadNet(netBox);
+  const cfBox = h("section", { class: "gsec", id: "set-cf" });
+  loadTunnel(cfBox);
   const mems = h("div", { class: "glist" }); loadMemories(mems);
   const upLine = h("span", { class: "val" }, "正在检查…");
   const upBtn = h("button", { class: "btn pri sm", type: "button", hidden: true, onclick: installUpdate }, "更新并重启");
@@ -1473,6 +1487,7 @@ function renderSettings() {
     ], keys, "set-dc"),
     discordBox,
     netBox,
+    cfBox,
     gsec("记忆", null, [mems], `在私聊里说「记住 …」存给这个 agent，在群聊里说存给本群；agent 也能用 remember 工具按主题记下东西。记忆是普通的 Markdown 文件，每次新会话自动带上，只发给这台${IS_WIN ? "电脑" : " Mac "}上的 agent。每个对话顶部的记忆按钮可以单独关掉。`, "set-mem"),
     gsec("运行", null, [
       grow("状态", h("span", { id: "run-state", class: "status" }, h("i"), runLabel())),
@@ -1505,6 +1520,53 @@ async function loadNet(sec) {
     grow("免打扰", qs, h("small", { class: "foot" }, "到"), qe),
     grow("", save)),
     h("p", { class: "foot" }, "朋友通过邀请码使用你共享的 agent 时，Disco 会向 Tailscale 确认对方是哪台设备，再按这里的规则放行；免打扰时段不接共享消息。"));
+}
+// Cloudflare named tunnel: the other way (besides Tailscale) for friends to reach shared agents.
+let tunnelPoll = 0;
+async function loadTunnel(sec, t) {
+  const head = h("div", { class: "gsec-h" }, h("span", {}, "Cloudflare 隧道"));
+  try { t = t ?? await invoke("tunnel_status"); } catch (e) { sec.replaceChildren(head, h("div", { class: "glist" }, h("div", { class: "grow-row" }, h("span", { class: "err" }, String(e))))); return; }
+  const redo = (p) => p.then((s) => loadTunnel(sec, s)).catch((e) => { toast(e, 8000); loadTunnel(sec); });
+  const busyBtn = (label, cls, run) => { const b = h("button", { class: `btn sm ${cls}`, type: "button" }, label); b.onclick = () => { b.disabled = true; b.textContent = "请稍候…"; redo(run()); }; return b; };
+  const rows = [];
+  rows.push(grow("cloudflared", t.bin ? h("span", { class: "val" }, t.bin)
+    : busyBtn("安装 cloudflared", "pri", () => invoke("tunnel_install")), t.bin ? null : h("small", { class: "foot" }, "从 Cloudflare 官方 GitHub 下载")));
+  if (t.bin) {
+    const login = busyBtn("登录 Cloudflare", "", async () => {
+      const s = await invoke("tunnel_login");
+      clearInterval(tunnelPoll);
+      // The sign-in finishes in the browser: watch for it for a few minutes.
+      let n = 0;
+      tunnelPoll = setInterval(async () => {
+        if (++n > 100 || !sec.isConnected) { clearInterval(tunnelPoll); return; }
+        const s2 = await invoke("tunnel_status").catch(() => null);
+        if (s2?.logged_in) { clearInterval(tunnelPoll); loadTunnel(sec, s2); toast("已登录 Cloudflare"); }
+      }, 3000);
+      return s;
+    });
+    rows.push(grow("账号", t.logged_in ? h("span", { class: "status ok" }, h("i"), "已登录") : login,
+      !t.logged_in && t.login_url ? h("button", { type: "button", class: "linkish", onclick: () => invoke("open_url", { url: t.login_url }) }, "浏览器没打开？") : null));
+  }
+  if (t.bin && t.logged_in) {
+    const host = h("input", { class: "fld", value: t.hostname, placeholder: "disco.你的域名.com", spellcheck: false });
+    rows.push(grow("域名", host, busyBtn(t.hostname ? "更新" : "启用", "pri", () => invoke("tunnel_setup", { hostname: host.value }))));
+  }
+  if (t.hostname) {
+    const label = { running: "已连接", starting: "正在连接…", error: t.error || "出错了", off: "未运行" }[t.state] ?? t.state;
+    rows.push(grow("状态", h("span", { class: `status${t.state === "running" ? " ok" : t.state === "error" ? " bad" : ""}` }, h("i"), label)));
+    const via = toggle(t.via === "cloudflare");
+    via.onchange = () => redo(invoke("tunnel_set", { via: via.checked ? "cloudflare" : "tailscale" }));
+    rows.push(grow("用隧道发邀请", via, h("small", { class: "foot" }, via.checked ? `新邀请码指向 https://${t.hostname}` : "新邀请码走 Tailscale")));
+    const id = h("input", { class: "fld", placeholder: "Client ID", spellcheck: false });
+    const secret = h("input", { class: "fld", type: "password", placeholder: "Client Secret" });
+    rows.push(t.access
+      ? grow("Access 令牌", h("span", { class: "val" }, `已开启 · ${t.access_id ?? ""}`), busyBtn("移除", "danger", () => invoke("tunnel_set", { accessId: "", accessSecret: "" })))
+      : h("div", { class: "grow-row col" }, h("span", { class: "gl" }, "Access 令牌（建议）"),
+        h("div", { class: "gc" }, id, secret, busyBtn("保存", "", () => invoke("tunnel_set", { accessId: id.value, accessSecret: secret.value })))));
+  }
+  sec.replaceChildren(...[head, h("div", { class: "glist" }, ...rows),
+    h("p", { class: "foot" }, "不用 Tailscale 也能把 agent 共享给朋友：用你自己的 Cloudflare 账号和域名建一条固定隧道，朋友只要邀请码。每个请求都要邀请码里的密钥，还有频率限制和有效期。"),
+    t.hostname ? h("p", { class: "foot" }, `更安全：在 Cloudflare Zero Trust → Access → Applications 给 ${t.hostname} 加一个自托管应用。浏览器访问可以用 One-time PIN（邮箱验证码）策略；朋友的 Disco 不是浏览器，要再加一条 Service Auth 策略，在 Access → Service credentials 建一个 Service Token，把 Client ID 和 Secret 填在上面，之后的邀请码会自动带上，没经过 Access 的请求一律拒绝。`) : null].filter(Boolean));
 }
 async function loadDiscordSettings(box) {
   let d;

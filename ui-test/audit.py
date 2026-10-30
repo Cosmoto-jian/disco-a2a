@@ -769,7 +769,7 @@ class Audit:
         self.ok("D1 stepper", await pg.input_value("#dlg .stepper input") == "60")
         m = await self.mark()
         await self.step("create share", lambda: pg.click("#dlg button[type=submit]"))
-        await self.expect("D1 create_share", "create_share", m, lambda a: a == {"agent": "claude", "guest": "老张", "mode": "ask", "limit": 60})
+        await self.expect("D1 create_share", "create_share", m, lambda a: a == {"agent": "claude", "guest": "老张", "mode": "ask", "limit": 60, "days": 0})
         self.ok("D1 invite code shown and copied", (await self.text("#dlg .invite code")).startswith("disco1:") and (await self.js("window.CLIP") or "").startswith("disco1:"))
         await self.step("copy invite", lambda: pg.click("#dlg .share-row button:text-is('复制邀请')"))
         await self.expect("D1 copy existing invite", "share_invite", m, lambda a: a == {"id": "s1"})
@@ -869,9 +869,9 @@ class Audit:
         pg = self.pg
         m0 = await self.mark()
         await self.tab("settings")
-        self.ok("G sections", all([await self.has(f"#set-{s}") for s in ["dc", "net", "mem", "run", "gen"]]))
+        self.ok("G sections", all([await self.has(f"#set-{s}") for s in ["dc", "net", "cf", "mem", "run", "gen"]]))
         navs = await self.js("[...document.querySelectorAll('#items li.nav .name')].map((n) => n.textContent)")
-        self.ok("L10 settings nav rows", navs == ["Discord", "共享与 Tailscale", "记忆", "运行", "通用与更新"], navs)
+        self.ok("L10 settings nav rows", navs == ["Discord", "共享与 Tailscale", "Cloudflare 隧道", "记忆", "运行", "通用与更新"], navs)
         self.ok("L10 Discord row shows live status", "在线 · MyBot#0001" in await self.text("#items li.nav >> nth=0"))
         await self.step("nav mem", lambda: pg.click("#items li.nav:has-text('记忆')"))
         self.ok("L10 nav selects + scrolls", await self.js("S.setSec") == "mem" and await self.has("#items li.nav.on:has-text('记忆')"))
@@ -938,6 +938,63 @@ class Audit:
         m = await self.mark()
         await self.step("update", lambda: pg.click("#set-gen button:text-is('更新并重启')"))
         await self.expect("G5 更新并重启", "install_update", m)
+
+    async def tunnel(self):
+        pg = self.pg
+        await self.tab("settings")
+        await pg.wait_for_selector("#set-cf .glist .grow-row")
+        sec = "#set-cf"
+        self.ok("T1 tunnel status rows", "已连接" in await self.text(f"{sec} .grow-row:has(.gl:text-is('状态')) .status.ok") and "已登录" in await self.text(sec))
+        self.ok("T1 hostname filled", await pg.input_value(f"{sec} input[placeholder^='disco.']") == "disco.example.com")
+        self.ok("T1 Access explained", "Service Auth" in await self.text(f"{sec} > p.foot >> nth=1") and "One-time PIN" in await self.text(f"{sec} > p.foot >> nth=1"))
+        self.ok("T1 no button inside a label", await self.js("document.querySelectorAll('#set-cf label button').length") == 0)
+        m = await self.mark()
+        await self.step("via on", lambda: pg.click(f"{sec} .grow-row:has(.gl:text-is('用隧道发邀请')) input.tgl"))
+        await self.expect("T2 tunnel_set via cloudflare", "tunnel_set", m, lambda a: a == {"via": "cloudflare"})
+        await pg.wait_for_selector(f"{sec} .foot:has-text('https://disco.example.com')")
+        self.ok("T2 invites now point at the tunnel", await self.has(f"{sec} .grow-row input.tgl:checked"))
+        await pg.fill(f"{sec} input[placeholder^='disco.']", "agents.example.com")
+        await self.step("hostname", lambda: pg.click(f"{sec} .grow-row:has(.gl:text-is('域名')) button"))
+        await self.expect("T3 tunnel_setup", "tunnel_setup", m, lambda a: a == {"hostname": "agents.example.com"})
+        await pg.wait_for_selector(f"{sec} .status:has-text('正在连接')")
+        self.ok("T3 starting state", True)
+        await pg.fill(f"{sec} input[placeholder='Client ID']", "cid.access")
+        await pg.fill(f"{sec} input[placeholder='Client Secret']", "s3cret")
+        await self.step("access save", lambda: pg.click(f"{sec} .grow-row:has(input[placeholder='Client ID']) button"))
+        await self.expect("T4 save Access token", "tunnel_set", m, lambda a: a == {"accessId": "cid.access", "accessSecret": "s3cret"})
+        await pg.wait_for_selector(f"{sec} .val:has-text('已开启 · cid.access')")
+        self.ok("T4 secret never shown", "s3cret" not in await self.text(sec))
+        await self.step("access remove", lambda: pg.click(f"{sec} button:text-is('移除')"))
+        await self.expect("T4 remove Access token", "tunnel_set", m, lambda a: a == {"accessId": "", "accessSecret": ""})
+        # fresh install: install → login
+        await self.js("Object.assign(STUB.tunnel, { bin: null, logged_in: false, hostname: '', via: 'tailscale', state: 'off' })")
+        await self.step("settings again", lambda: self.js("renderSettings()"))
+        await pg.wait_for_selector(f"{sec} button:text-is('安装 cloudflared')")
+        self.ok("T5 only the install step shows", not await self.has(f"{sec} input[placeholder^='disco.']"))
+        await self.step("install", lambda: pg.click(f"{sec} button:text-is('安装 cloudflared')"))
+        await self.expect("T5 tunnel_install", "tunnel_install", m)
+        await pg.wait_for_selector(f"{sec} button:text-is('登录 Cloudflare')")
+        await self.step("login", lambda: pg.click(f"{sec} button:text-is('登录 Cloudflare')"))
+        await self.expect("T5 tunnel_login", "tunnel_login", m)
+        await pg.wait_for_selector(f"{sec} button:text-is('浏览器没打开？')")
+        await self.step("login link", lambda: pg.click(f"{sec} button:text-is('浏览器没打开？')"))
+        await self.expect("T5 sign-in link fallback", "open_url", m, lambda a: a == {"url": "https://dash.cloudflare.com/argotunnel?x"})
+        await self.js("Object.assign(STUB.tunnel, { logged_in: true })")
+        await pg.wait_for_selector(f"{sec} .status.ok:has-text('已登录')", timeout=5000)
+        self.ok("T5 sign-in noticed by polling", await self.has(f"{sec} input[placeholder^='disco.']"))
+        # share dialog over the tunnel: one-week default, tunnel wording, expiry shown
+        await self.js("Object.assign(STUB.tunnel, { hostname: 'disco.example.com', via: 'cloudflare', state: 'running' }); STUB.shares = [{ id: 's9', agent: 'claude', guest: '阿明', mode: 'chat', limit: 0, used_today: 0, expires: Math.floor(Date.now() / 1000) + 3 * 86400 + 600 }]")
+        await self.step("share via tunnel", lambda: self.js("shareDialog('claude')"))
+        await pg.wait_for_selector("#dlg[open]")
+        self.ok("T6 tunnel wording", "Cloudflare 隧道" in await self.text("#dlg .del-sub"))
+        self.ok("T6 expiry in share row", "3 天后过期" in await self.text("#dlg .share-row"))
+        self.ok("T6 default 7 days", "7 天" in await self.text("#dlg .grow-row:has(.gl:text-is('有效期')) .model-pill"))
+        await pg.fill("#dlg input.fld", "老李")
+        m = await self.mark()
+        await self.step("create tunnel share", lambda: pg.click("#dlg button[type=submit]"))
+        await self.expect("T6 create_share with 7 days", "create_share", m, lambda a: a.get("days") == 7 and a.get("guest") == "老李")
+        await self.step("close", lambda: pg.click("#dlg .actions .btn:text-is('关闭')"))
+        await self.js("Object.assign(STUB.tunnel, { via: 'tailscale' })")
 
     async def events(self):
         pg = self.pg
@@ -1037,7 +1094,7 @@ addEventListener('DOMContentLoaded', () => setTimeout(() => { __L.message({ payl
     async def run(self):
         self.pg = await self.new_page()
         for suite in [self.boot, self.rail, self.list_column, self.inbox_tab, self.dm_chat, self.dm_codex, self.composer, self.remote_files, self.group_chat,
-                      self.group_pages, self.peers, self.agents_tab, self.gallery, self.settings, self.events, self.clickrace, self.remove_agent]:
+                      self.group_pages, self.peers, self.agents_tab, self.gallery, self.settings, self.tunnel, self.events, self.clickrace, self.remove_agent]:
             if self.verbose:
                 print(f"[{self.label}] {suite.__name__}")
             try:

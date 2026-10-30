@@ -14,6 +14,7 @@ mod share;
 mod files;
 mod git;
 mod tailnet;
+mod tunnel;
 mod templates;
 #[cfg(debug_assertions)]
 mod selftest;
@@ -1084,6 +1085,9 @@ pub(crate) struct NewAgent {
     /// OpenAI-compatible agents: the model id (blank = the first the endpoint lists).
     #[serde(default)]
     model: Option<String>,
+    /// Remote agents: headers sent on every request besides the credential (Cloudflare Access).
+    #[serde(default)]
+    extra: Vec<(String, String)>,
 }
 
 #[tauri::command]
@@ -1104,14 +1108,14 @@ async fn add_agent(core: St<'_>, spec: NewAgent) -> CmdResult<Vec<String>> {
 
 impl NewAgent {
     /// A remote A2A agent behind a bearer token (Disco invites).
-    pub(crate) fn remote(name: String, url: String, token: String) -> Self {
+    pub(crate) fn remote(name: String, url: String, token: String, extra: Vec<(String, String)>) -> Self {
         Self { template: "a2a".into(), name, url: Some(url), header_name: Some("authorization".into()), header_value: Some(format!("Bearer {token}")),
-            command: None, cwd: None, count: None, worktree: None, conda: None, model: None }
+            command: None, cwd: None, count: None, worktree: None, conda: None, model: None, extra }
     }
 }
 
 pub(crate) async fn add_agent_rows(core: &Core, spec: NewAgent) -> CmdResult<Vec<String>> {
-    let NewAgent { template, name, url, header_name, header_value, command, cwd, count, worktree, conda, model } = spec;
+    let NewAgent { template, name, url, header_name, header_value, command, cwd, count, worktree, conda, model, extra } = spec;
     let name = valid_name(&name)?;
     let kind = match template.as_str() { "a2a" => "a2a", "command" => "command", "openai" => "openai", _ => "acp" };
     let row = match kind {
@@ -1143,10 +1147,11 @@ pub(crate) async fn add_agent_rows(core: &Core, spec: NewAgent) -> CmdResult<Vec
                 (Some(n), Some(v)) => Credential::Header { name: n, value: v },
                 _ => Credential::None,
             };
-            let agent = RemoteAgent::connect(&url, cred.clone()).await.map_err(err)?;
+            let agent = RemoteAgent::connect_with(&url, cred.clone(), &extra).await.map_err(err)?;
             let credential_ref = if let Credential::Header { name: h, value } = &cred {
                 let account = format!("agent/{name}");
-                secret_set(&account, &format!("{h}\n{value}"))?;
+                let more: String = extra.iter().map(|(n, v)| format!("\n{n}\n{v}")).collect();
+                secret_set(&account, &format!("{h}\n{value}{more}"))?;
                 Some(account)
             } else { None };
             let row = AgentRow { id: uuid::Uuid::new_v4().to_string(), name: name.clone(), transport: "a2a".into(), endpoint: url, credential_ref, card_json: serde_json::to_string(&agent.card).ok() };
@@ -1731,6 +1736,7 @@ pub fn run() {
             mcp::start(core.clone());
             core.warm(None);
             if !core.shares().is_empty() { core.serve_shares(); }
+            tunnel::resume(&core);
             app.manage(core);
             #[cfg(debug_assertions)]
             if let Ok(mock) = std::env::var("DISCO_SELFTEST") { selftest::spawn(app.handle().clone(), mock); }
@@ -1747,13 +1753,15 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             overview, detect_agents, conda_envs, choose_path, memories, forget, add_agent, remove_agent, rename_agent, restart_agent, set_look, set_avatar, stop_reply, messages, send, inbox, inbox_answer, net_policy, net_policy_set, send_file, team_state, team_files, agent_configs, set_agent_config,
             stop_all, resume, save_discord_token, discord_connect, discord_settings, discord_sync, diagnose, open_url, reveal_path, discord_channels, save_group, delete_group, restore_group, memory_restore, set_memory, agent_commands,
-            check_update, install_update, space, todo_new, todo_set, todo_remove, doc_save, reveal_doc, share::share_status, share::peer_check, share::create_share, share::share_invite, share::revoke_share, share::accept_invite
+            check_update, install_update, space, todo_new, todo_set, todo_remove, doc_save, reveal_doc, share::share_status, share::peer_check, share::create_share, share::share_invite, share::revoke_share, share::accept_invite,
+            tunnel::tunnel_status, tunnel::tunnel_install, tunnel::tunnel_login, tunnel::tunnel_setup, tunnel::tunnel_set
         ])
         .build(tauri::generate_context!())
         .expect("error while running Disco")
         .run(|app, ev| {
             // Quitting must not leave agent processes behind.
             if let tauri::RunEvent::Exit = ev && let Some(core) = app.try_state::<Arc<Core>>() {
+                tunnel::stop();
                 tauri::async_runtime::block_on(core.hub.stop_all());
             }
         });

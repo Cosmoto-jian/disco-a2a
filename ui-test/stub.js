@@ -90,6 +90,7 @@
     shares: [{ id: "s1", agent: "claude", guest: "小王", mode: "ask", limit: 50, used_today: 3 }],
     memories: [{ key: "k1", scope: "all", topic: "偏好", text: "回答用中文，代码注释用英文" }, { key: "k2", scope: "group-g1", topic: "项目", text: "Disco 用 Tauri 2 + 原生 JS" }],
     update: { current: "1.5.14", version: null },
+    tunnel: { bin: "/opt/homebrew/bin/cloudflared", logged_in: true, hostname: "disco.example.com", via: "tailscale", state: "running", error: null, login_url: null, access: false, access_id: null },
     policy: { mode: "tailnet", allow: [], deny: ["old-laptop"], quiet_start: "23:00", quiet_end: "08:00" },
     commands: { claude: [["review", "Review code"], ["compact", "Compact context"]] },
     choosePath: "/Users/x/bin/my-agent",
@@ -127,7 +128,16 @@
       for (const n of names) STUB.agents.push({ name: n, kind: s.url && s.template === "a2a" ? "a2a" : s.template === "openai" ? "openai" : "acp", template: s.template, detail: s.cwd ?? "", live: false, look: "" });
       return names; },
     accept_invite: (a) => { const n = a.name || "agent-friend"; STUB.agents.push({ name: n, kind: "a2a", template: "a2a", detail: "invite", live: false, look: "" }); return n; },
-    share_status: () => ({ base: "http://mac.tail1.ts.net:7480", problem: null, shares: clone(STUB.shares) }),
+    share_status: () => ({ base: STUB.tunnel.via === "cloudflare" ? `https://${STUB.tunnel.hostname}` : "http://mac.tail1.ts.net:7480", problem: null, via: STUB.tunnel.via, shares: clone(STUB.shares) }),
+    tunnel_status: () => clone(STUB.tunnel),
+    tunnel_install: () => { STUB.tunnel.bin = "/Users/x/Library/Application Support/dev.cosmoto.disco/bin/cloudflared"; return clone(STUB.tunnel); },
+    tunnel_login: () => { STUB.tunnel.login_url = "https://dash.cloudflare.com/argotunnel?x"; return clone(STUB.tunnel); },
+    tunnel_setup: (a) => { STUB.tunnel.hostname = a.hostname; STUB.tunnel.via = "cloudflare"; STUB.tunnel.state = "starting"; return clone(STUB.tunnel); },
+    tunnel_set: (a) => {
+      if (a.via) STUB.tunnel.via = a.via;
+      if (a.accessId !== undefined) { STUB.tunnel.access = !!a.accessId; STUB.tunnel.access_id = a.accessId || null; }
+      return clone(STUB.tunnel);
+    },
     create_share: () => "disco1:eyJ1cmwiOiJodHRwOi8vbWFjLnRhaWwxLnRzLm5ldDo3NDgwL2EvYWJjIiwidG9rZW4iOiIxMjMifQ",
     share_invite: () => "disco1:invite",
     revoke_share: (a) => { STUB.shares = STUB.shares.filter((s) => s.id !== a.id); return null; },
