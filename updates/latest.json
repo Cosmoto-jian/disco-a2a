@@ -1,19 +1,19 @@
 {
-  "version": "1.9.0",
-  "notes": "1.9.0：新增 Cloudflare 固定隧道，作为 Tailscale 之外的跨设备共享方式。在设置「Cloudflare 隧道」里安装 cloudflared、登录自己的 Cloudflare 账号、填一个域名即可；朋友拿邀请码就能用，不需要 Tailscale。隧道请求不享受本机信任：每次都要邀请密钥，按来源和共享限频，邀请可设有效期（默认 7 天），可配合 Cloudflare Access 服务令牌。传文件（20 MB）同样可以经隧道。",
-  "pub_date": "2026-10-30T04:20:52Z",
+  "version": "1.10.0",
+  "notes": "新增 QQ 群：设置 → QQ 用手机 QQ 扫一次码接入官方机器人；群聊可同步到 QQ 群（发绑定码连上），在 QQ 群里 @机器人 叫 agent、点按钮批准、收发文件。Discord 不变。",
+  "pub_date": "2026-10-30T06:02:23Z",
   "platforms": {
     "darwin-aarch64": {
-      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVUcDdocWFJV0FyVjd5SHFQakNEanFacW12dHMrVSs4V0ZyWG1LckdBa0ZoaXRqWElwa01ZTEpVRElQWnJ2NFZUSEFRQ21LRnVLeVRKZFpPdEtBbHlScHdmVEFvaFFMNHdFPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkzMzM0MDUwCWZpbGU6RGlzY29fMS45LjBfdW5pdmVyc2FsLmFwcC50YXIuZ3oKSnVkU2l4YVAwbXlYSWlZc21jb0Q0Z28xUGRuY0dUeTBzYUF6VlFzTXNva3MxTHpBUVJwLzYwMEZZUFN5RXdOWWhWRVB2bmtFVjU2dCtaZVRydzRRRGc9PQo=",
-      "url": "https://github.com/Cosmoto-jian/disco-a2a/releases/download/v1.9.0/Disco_1.9.0_universal.app.tar.gz"
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVUcDdocWFJV0FyVjBSd0VJREtuWUVGTG1zL050TzA0SytBem1LY0NqUDdsYVk5R1UvdjRCMEtKWnExMTYwaVY3cDh3a2lHQzBlUEFIUThtYXJvR0RNclRsWUllUzVGWkE0PQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkzMzQwMTQxCWZpbGU6RGlzY29fMS4xMC4wX3VuaXZlcnNhbC5hcHAudGFyLmd6CnhDYlRQcWNkZWVDaXc3Z0EwcGp6aDJBNnJ1Q3prUlRZL1BlQWwxdm52V1c2Rzg4OXhONnZoZVNjVUIzOEYwRHQrbVgvUjExaUs0aVFYdlFGSTNGWUJBPT0K",
+      "url": "https://github.com/Cosmoto-jian/disco-a2a/releases/download/v1.10.0/Disco_1.10.0_universal.app.tar.gz"
     },
     "darwin-x86_64": {
-      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVUcDdocWFJV0FyVjd5SHFQakNEanFacW12dHMrVSs4V0ZyWG1LckdBa0ZoaXRqWElwa01ZTEpVRElQWnJ2NFZUSEFRQ21LRnVLeVRKZFpPdEtBbHlScHdmVEFvaFFMNHdFPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkzMzM0MDUwCWZpbGU6RGlzY29fMS45LjBfdW5pdmVyc2FsLmFwcC50YXIuZ3oKSnVkU2l4YVAwbXlYSWlZc21jb0Q0Z28xUGRuY0dUeTBzYUF6VlFzTXNva3MxTHpBUVJwLzYwMEZZUFN5RXdOWWhWRVB2bmtFVjU2dCtaZVRydzRRRGc9PQo=",
-      "url": "https://github.com/Cosmoto-jian/disco-a2a/releases/download/v1.9.0/Disco_1.9.0_universal.app.tar.gz"
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVUcDdocWFJV0FyVjBSd0VJREtuWUVGTG1zL050TzA0SytBem1LY0NqUDdsYVk5R1UvdjRCMEtKWnExMTYwaVY3cDh3a2lHQzBlUEFIUThtYXJvR0RNclRsWUllUzVGWkE0PQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkzMzQwMTQxCWZpbGU6RGlzY29fMS4xMC4wX3VuaXZlcnNhbC5hcHAudGFyLmd6CnhDYlRQcWNkZWVDaXc3Z0EwcGp6aDJBNnJ1Q3prUlRZL1BlQWwxdm52V1c2Rzg4OXhONnZoZVNjVUIzOEYwRHQrbVgvUjExaUs0aVFYdlFGSTNGWUJBPT0K",
+      "url": "https://github.com/Cosmoto-jian/disco-a2a/releases/download/v1.10.0/Disco_1.10.0_universal.app.tar.gz"
     },
     "windows-x86_64": {
-      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVUcDdocWFJV0FyVi9SK21yT1pLWXhOZjZKRUYrQmlZdXErWmZwRlBXSC9FdWx5Ti9EaE9jK0RsZTJSZUo5ekkvQm5wOEFiQnU0MTZJNTFCNFduS0hvTzZ5YmVUUVdFV1FrPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkzMzM0MDUyCWZpbGU6RGlzY29fMS45LjBfeDY0LXNldHVwLmV4ZQpmUHNsbkJsRTNuazQ3OEhMbVgxT3B2S0pYUGRBcUtscHgrQXhzRlpZbTFnTVJVemRYOWVBc0dyK2h4MzkyK3I4bzJrNDB5QUVxbWpxeGxTMGhyOGVEdz09Cg==",
-      "url": "https://github.com/Cosmoto-jian/disco-a2a/releases/download/v1.9.0/Disco_1.9.0_x64-setup.exe"
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVUcDdocWFJV0FyVjI1SXgyaHhxN1NpRUdJb1dTWHdmM21rSmorN2ZVNmNkSkVsN0YrT3hpaXRRaVdJRHFLVDZySTNjWkU3SDNTblk2bEViZy85UUxhcW9GRW5ySFhrYmc0PQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkzMzQwMTQzCWZpbGU6RGlzY29fMS4xMC4wX3g2NC1zZXR1cC5leGUKTUpPbkhHS2ZaWWFuYWZYWDd1UmhMKzVGYW01bkhKd1BLNVNhVG5RTU1IdGFUakt0VGF5UThsQlJUNjl3YTFWVHNFWXo1OGNnQis4ZmlFYnRGcitwQ3c9PQo=",
+      "url": "https://github.com/Cosmoto-jian/disco-a2a/releases/download/v1.10.0/Disco_1.10.0_x64-setup.exe"
     }
   }
 }
