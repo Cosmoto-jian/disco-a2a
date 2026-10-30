@@ -1091,8 +1091,9 @@ pub fn spawn(app: AppHandle, mock: String) {
             let s = serde_json::to_value(crate::qq::qq_bind_group(st(), "G3".into(), None)?).map_err(|e| e.to_string())?;
             if s["unbound"].as_array().is_none_or(|v| v.iter().any(|u| u["openid"] == "G3")) { return Err(format!("绑定后还在未绑定列表：{}", s["unbound"])); }
             let ov = within(5, crate::overview(st())).await??;
-            let made = ov.groups.iter().find(|g| g.qq && g.name.starts_with("QQ群") && g.id != qgid).map(|g| (g.id.clone(), g.name.clone())).ok_or("没有新建群聊")?;
-            if crate::qq::openid_of(&core, &made.0).as_deref() != Some("G3") { return Err(format!("{:?}", crate::qq::openid_of(&core, &made.0))); }
+            // The G2 check above made a "QQ群 …" group too: find the one tied to G3.
+            let made = ov.groups.iter().find(|g| g.qq && g.name.starts_with("QQ群") && g.id != qgid && crate::qq::openid_of(&core, &g.id).as_deref() == Some("G3"))
+                .map(|g| (g.id.clone(), g.name.clone())).ok_or_else(|| format!("没有为 G3 新建群聊：{:?}", ov.groups.iter().map(|g| &g.name).collect::<Vec<_>>()))?;
             until(10, || qlog("msg:G3").iter().any(|b| b["markdown"]["content"].as_str().unwrap_or_default().contains("已和 Disco 群聊"))).await?;
             Ok(made.1)
         });
