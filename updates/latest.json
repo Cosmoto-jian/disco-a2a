@@ -1,19 +1,19 @@
 {
-  "version": "1.11.0",
-  "notes": "agent 私聊可以同步到 QQ：导入时选「同步到 Discord / QQ」，选 QQ 就在手机 QQ 给机器人发私聊和它聊，@名字 切换 agent；之后可在 agent 信息里改。",
-  "pub_date": "2026-10-30T07:27:12Z",
+  "version": "1.11.1",
+  "notes": "QQ 连接修复：按官方 QQ 机器人 SDK 修正网关和鉴权（4004 后重新取 token 重连、每条消息新的 msg_seq、群消息里的 @ 标记、被动回复过期改发主动消息、连不上时走系统代理）；扫码没带出主人时第一个私聊的人算主人，也可在设置 → QQ「认领私聊」；设置 → QQ 和一键诊断能看到连接阶段、最近收到的消息、最近错误和发送失败。",
+  "pub_date": "2026-10-30T09:30:09Z",
   "platforms": {
     "darwin-aarch64": {
-      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVUcDdocWFJV0FyVjlYZ3B2dGUvY1c0M0x1ZkRJdDFkMUFzNmFxc2lrNWJMTFYrbWgwTFNiWnhxcHZsNUxQb04vVnVYU0JxdVNwUzFrUTVHV1VLbzl5ajY4WVlUZU5INXdFPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkzMzQ1MjMwCWZpbGU6RGlzY29fMS4xMS4wX3VuaXZlcnNhbC5hcHAudGFyLmd6CnVIOEZlbGZ1WXNsaGtWYmxPemNQZDJhSjRTaDdzV1Z0bG1ydWZjUXVINUlnYmJUaFpTZXlnNTVKdmtxRmdnMng3NElEc2NCMXpscm1aNi9PdjRWekFnPT0K",
-      "url": "https://github.com/Cosmoto-jian/disco-a2a/releases/download/v1.11.0/Disco_1.11.0_universal.app.tar.gz"
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVUcDdocWFJV0FyVnozMTJINjMxTnNoS2cxR0x6dkVlbk4wK2dZRnd1S2YrMkw1L3lGL2VlcmpJR0t5d2M1cUErUWhWdCtydnJhNUs1Tm1VT2JobWwyUnVJcVpCVjNzK1EwPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkzMzUyNjA3CWZpbGU6RGlzY29fMS4xMS4xX3VuaXZlcnNhbC5hcHAudGFyLmd6Ck1MUEhscmJkWWVPVXd0YWFibXBmMUtBakZwSGlVZHAzZmFwWVhFV1V3L29uYTFjMCtScW8zWldTNkw1N0xoYnNWS0tlSTlzYzhnSUFHSlk3a0dpRURBPT0K",
+      "url": "https://github.com/Cosmoto-jian/disco-a2a/releases/download/v1.11.1/Disco_1.11.1_universal.app.tar.gz"
     },
     "darwin-x86_64": {
-      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVUcDdocWFJV0FyVjlYZ3B2dGUvY1c0M0x1ZkRJdDFkMUFzNmFxc2lrNWJMTFYrbWgwTFNiWnhxcHZsNUxQb04vVnVYU0JxdVNwUzFrUTVHV1VLbzl5ajY4WVlUZU5INXdFPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkzMzQ1MjMwCWZpbGU6RGlzY29fMS4xMS4wX3VuaXZlcnNhbC5hcHAudGFyLmd6CnVIOEZlbGZ1WXNsaGtWYmxPemNQZDJhSjRTaDdzV1Z0bG1ydWZjUXVINUlnYmJUaFpTZXlnNTVKdmtxRmdnMng3NElEc2NCMXpscm1aNi9PdjRWekFnPT0K",
-      "url": "https://github.com/Cosmoto-jian/disco-a2a/releases/download/v1.11.0/Disco_1.11.0_universal.app.tar.gz"
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVUcDdocWFJV0FyVnozMTJINjMxTnNoS2cxR0x6dkVlbk4wK2dZRnd1S2YrMkw1L3lGL2VlcmpJR0t5d2M1cUErUWhWdCtydnJhNUs1Tm1VT2JobWwyUnVJcVpCVjNzK1EwPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkzMzUyNjA3CWZpbGU6RGlzY29fMS4xMS4xX3VuaXZlcnNhbC5hcHAudGFyLmd6Ck1MUEhscmJkWWVPVXd0YWFibXBmMUtBakZwSGlVZHAzZmFwWVhFV1V3L29uYTFjMCtScW8zWldTNkw1N0xoYnNWS0tlSTlzYzhnSUFHSlk3a0dpRURBPT0K",
+      "url": "https://github.com/Cosmoto-jian/disco-a2a/releases/download/v1.11.1/Disco_1.11.1_universal.app.tar.gz"
     },
     "windows-x86_64": {
-      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVUcDdocWFJV0FyVjcycG1COUlmSHJHeHU4NCs3dHpVQXlLQ2EvQ3JsMGdSQ2gvVVprUXZZcjhZa1BQMWUwTzJYQVcwd21xT3RLZUVQNVZLYzZiYk9TdFAxM1hBTCtkekFBPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkzMzQ1MjMyCWZpbGU6RGlzY29fMS4xMS4wX3g2NC1zZXR1cC5leGUKYXhUSmoxQjIwSy96dkxnVFJGUHNFZDlFSGVNQjUydkx5NTJHVVNiQ1dLc1lqUDdnV1RHbUtLdGYyS3pOaDNYOHMvRWFOSXdHcXRwWVpLdDRpYmRoQmc9PQo=",
-      "url": "https://github.com/Cosmoto-jian/disco-a2a/releases/download/v1.11.0/Disco_1.11.0_x64-setup.exe"
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVUcDdocWFJV0FyVnhpNVJybTMraTNQN0I0OXZLQzdBM05MdW1ENW1iaXRtb1ZaVHFmWHRqZmYwMC8wVGZ5eTljWE4vM2YwWDVuck1icW1mOXVEempmWU1NNTFzemQ3WFFFPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkzMzUyNjA5CWZpbGU6RGlzY29fMS4xMS4xX3g2NC1zZXR1cC5leGUKSHk5K3JBVTNCNFBra1dIemdMZUJPRy92cHoyZE40RElBSXdoNU1KTGpRWVdVanY2R1lwbTNNcTduU3p0ellWbThDTStYUDRiUWYydnc1RmJrVjhQQnc9PQo=",
+      "url": "https://github.com/Cosmoto-jian/disco-a2a/releases/download/v1.11.1/Disco_1.11.1_x64-setup.exe"
     }
   }
 }
