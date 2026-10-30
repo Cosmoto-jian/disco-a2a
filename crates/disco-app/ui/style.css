@@ -335,6 +335,9 @@ body.collapsed #expand { display:grid; }
 .seg2 { display:flex; width:100%; padding:2px; border-radius:8px; background:var(--fill); }
 .seg2 button { flex:1; height:26px; border-radius:6px; color:var(--mute); white-space:nowrap; }
 .seg2 button:hover { color:var(--fg); }
+.seg2.sync { width:auto; flex:none; }
+.seg2.sync button { display:inline-flex; align-items:center; justify-content:center; gap:5px; padding:0 12px; }
+.seg2.sync .ic { width:14px; height:14px; }
 .seg2 button.on { background:var(--card); color:var(--fg); font-weight:600; box-shadow:0 1px 2px rgba(0,0,0,.08), 0 0 0 .5px rgba(0,0,0,.04); }
 .insp-body { flex:1; overflow:auto; padding:14px; display:flex; flex-direction:column; gap:14px; -webkit-user-select:text; user-select:text; }
 .lab { color:var(--mute); font-size:11.5px; font-weight:600; padding:0 4px 6px; letter-spacing:.02em; }

@@ -58,7 +58,7 @@ pub fn spawn(app: AppHandle, mock: String) {
         let st = || app.state::<Arc<Core>>();
         let _ = check!("overview(空)", within(5, crate::overview(st())).await.and_then(|r| r.map(|o| format!("{} agents", o.agents.len()))));
         let spec = |name: &str| crate::NewAgent { template: "command".into(), name: name.into(), url: None, header_name: None, header_value: None,
-            command: Some(format!("\"{mock}\"")), cwd: None, count: None, worktree: None, conda: None, model: None, extra: Vec::new() };
+            command: Some(format!("\"{mock}\"")), cwd: None, count: None, worktree: None, conda: None, model: None, extra: Vec::new(), sync: None };
         let _ = check!("add_agent m1", within(20, crate::add_agent(st(), spec("m1"))).await.and_then(|r| r.map(|v| v.join(","))));
         let _ = check!("add_agent m2", within(20, crate::add_agent(st(), spec("m2"))).await.and_then(|r| r.map(|v| v.join(","))));
         let _ = check!("overview(2)", within(5, crate::overview(st())).await.and_then(|r| r.and_then(|o| if o.agents.len() == 2 { Ok("2 agents".into()) } else { Err(format!("{} agents", o.agents.len())) })));
@@ -187,7 +187,7 @@ pub fn spawn(app: AppHandle, mock: String) {
         let _ = check!("OpenAI 兼容 agent", {
             let base = mock_openai().await?;
             let o = crate::NewAgent { template: "openai".into(), name: "o1".into(), url: Some(format!("{base}/chat/completions")), header_name: None, header_value: None,
-                command: None, cwd: None, count: None, worktree: None, conda: None, model: None, extra: Vec::new() };
+                command: None, cwd: None, count: None, worktree: None, conda: None, model: None, extra: Vec::new(), sync: None };
             within(10, crate::add_agent(st(), o)).await??;
             let n = count(&core, "dm:o1", "o1");
             crate::send(st(), "dm:o1".into(), "记一个待办".into())?;
@@ -926,10 +926,83 @@ pub fn spawn(app: AppHandle, mock: String) {
             let _ = std::fs::remove_file(&f);
             let dev_untouched = crate::qq::target(&core, &format!("group:{gid}")).is_none();
             if up["file_type"] == 4 && up["file_name"].as_str().is_some_and(|n| n.starts_with("disco-qq-")) && dev_untouched { Ok(String::new()) } else { Err(format!("{up} {dev_untouched}")) } });
+        // v1.11.0 QQ private chat: an agent's 1:1 chat synced to the bot's C2C chat with the owner.
+        let c2c = || qlog("c2c:OWNER");
+        let _ = check!("QQ 私聊：导入时选 QQ，不建 Discord 频道，记住选择；Discord 的 agent 不变", {
+            let ov = within(5, crate::overview(st())).await??;
+            if ov.sync_default != "qq" { return Err(format!("只接了 QQ 时默认应是 QQ：{}", ov.sync_default)); }
+            within(20, crate::add_agent(st(), crate::NewAgent { sync: Some("qq".into()), ..spec("mq") })).await??;
+            within(20, crate::add_agent(st(), crate::NewAgent { sync: Some("qq".into()), ..spec("mq2") })).await??;
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            let ov = within(5, crate::overview(st())).await??;
+            let sync = |n: &str| ov.agents.iter().find(|a| a.name == n).map(|a| a.sync).unwrap_or_default();
+            let note = last_from(&core, "dm:mq", "system").unwrap_or_default();
+            let last = core.db().setting("sync_last");
+            let ok = sync("mq") == "qq" && sync("mq2") == "qq" && sync("m1") == "discord" && core.agent_channel("mq").is_none()
+                && crate::qq::target(&core, "dm:mq").is_some() && crate::qq::target(&core, "dm:m1").is_none()
+                && crate::qq::owner(&core).as_deref() == Some("OWNER") && last.as_deref() == Some("qq") && note.contains("同步到 QQ") && ov.sync_default == "qq";
+            if ok { Ok(String::new()) } else { Err(format!("mq={} m1={} last={last:?} note={note}", sync("mq"), sync("m1"))) } });
+        let _ = check!("QQ 私聊：主人的消息给当前 agent，回复带「**名字**：」、是被动回复，审批卡片也发到私聊", {
+            let n = count(&core, "dm:mq", "mq");
+            feed("C2C_MESSAGE_CREATE", serde_json::json!({ "id": "c1", "content": "你好", "author": { "user_openid": "OWNER" } }))?;
+            wait_msg(&core, "dm:mq", "mq", n, 30).await?;
+            let said = |b: &serde_json::Value| b["msg_id"] == "c1" && b["markdown"]["content"].as_str().unwrap_or_default().starts_with("**mq**：");
+            until(10, || c2c().iter().any(said)).await?;
+            let card = c2c().iter().any(|b| b["keyboard"]["content"]["rows"][0]["buttons"][0]["action"]["data"].as_str().is_some_and(|d| d.starts_with("disco:")));
+            let seqs: Vec<u64> = c2c().iter().filter(|b| b["msg_id"] == "c1").filter_map(|b| b["msg_seq"].as_u64()).collect();
+            let unique = seqs.iter().all(|s| seqs.iter().filter(|x| *x == s).count() == 1);
+            if last_from(&core, "dm:mq", "me").as_deref() == Some("你好") && card && unique && seqs.iter().all(|s| (1..=5).contains(s)) { Ok(String::new()) } else { Err(format!("card={card} {seqs:?} {:?}", c2c())) } });
+        let _ = check!("QQ 私聊：@名字 换 agent，之后的消息也给它；别人的私聊被忽略", {
+            let n = count(&core, "dm:mq2", "mq2");
+            feed("C2C_MESSAGE_CREATE", serde_json::json!({ "id": "c2", "content": "@mq2 在吗", "author": { "user_openid": "OWNER" } }))?;
+            wait_msg(&core, "dm:mq2", "mq2", n, 30).await?;
+            if last_from(&core, "dm:mq2", "me").as_deref() != Some("在吗") { return Err(format!("{:?}", last_from(&core, "dm:mq2", "me"))); }
+            let n = count(&core, "dm:mq2", "mq2");
+            feed("C2C_MESSAGE_CREATE", serde_json::json!({ "id": "c3", "content": "继续", "author": { "user_openid": "OWNER" } }))?;
+            wait_msg(&core, "dm:mq2", "mq2", n, 30).await?;
+            let len = |t: &str| core.db().messages(t, 500).map(|v| v.len()).unwrap_or(0);
+            let (a, b) = (len("dm:mq"), len("dm:mq2"));
+            feed("C2C_MESSAGE_CREATE", serde_json::json!({ "id": "c4", "content": "@mq 你好", "author": { "user_openid": "STRANGER" } }))?;
+            feed("C2C_MESSAGE_CREATE", serde_json::json!({ "id": "c3", "content": "继续", "author": { "user_openid": "OWNER" } }))?;
+            tokio::time::sleep(Duration::from_millis(800)).await;
+            if last_from(&core, "dm:mq2", "me").as_deref() == Some("继续") && len("dm:mq") == a && len("dm:mq2") == b { Ok(String::new()) } else { Err(format!("{a}->{} {b}->{}", len("dm:mq"), len("dm:mq2"))) } });
+        let _ = check!("QQ 私聊：附件存进 agent 的空间；卡片按钮只认主人", {
+            let n = count(&core, "dm:mq2", "mq2");
+            feed("C2C_MESSAGE_CREATE", serde_json::json!({ "id": "c5", "content": "@mq2", "author": { "user_openid": "OWNER" },
+                "attachments": [{ "url": format!("{qbase}/file.txt"), "filename": "c.txt", "size": 7 }] }))?;
+            wait_msg(&core, "dm:mq2", "mq2", n, 30).await?;
+            let saved = crate::mcp::space_dir(&core, "dm:mq2").map(|d| d.join("files").join("c.txt")).ok().and_then(|p| std::fs::read_to_string(p).ok());
+            if saved.as_deref() != Some("qq file") || !last_from(&core, "dm:mq2", "me").unwrap_or_default().contains("📎 c.txt") { return Err(format!("{saved:?}")); }
+            let (id, rx) = core.inbox_question("dm:mq2", "mq2", "继续吗？", vec!["好".into(), "不".into()], false);
+            until(10, || c2c().iter().any(|b| b["keyboard"]["content"]["rows"][0]["buttons"][0]["action"]["data"] == format!("disco:{id}:0").as_str())).await?;
+            feed("INTERACTION_CREATE", serde_json::json!({ "id": "i3", "chat_type": 2, "user_openid": "STRANGER", "data": { "resolved": { "button_data": format!("disco:{id}:0") } } }))?;
+            until(10, || !qlog("ack:i3").is_empty()).await?;
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            if !core.inbox.list().iter().any(|i| i.id == id) { return Err("别人点的也算了".into()); }
+            feed("INTERACTION_CREATE", serde_json::json!({ "id": "i4", "chat_type": 2, "user_openid": "OWNER", "data": { "resolved": { "button_data": format!("disco:{id}:0") } } }))?;
+            let a = within(10, rx).await?.map_err(|e| e.to_string())?;
+            if a == "好" { Ok(a) } else { Err(a) } });
+        let _ = check!("QQ 私聊：agent 发文件到私聊；改回 Discord 后不再同步", {
+            let f = std::env::temp_dir().join(format!("disco-c2c-{}.txt", std::process::id()));
+            std::fs::write(&f, "to c2c").map_err(|e| e.to_string())?;
+            let tok = core.hub.mcp_tokens.mint("mq2", "dm:mq2");
+            tool(&core, &tok, "send_file", serde_json::json!({ "path": f.display().to_string() })).await?;
+            until(10, || !qlog("c2cfile:OWNER").is_empty()).await?;
+            let up = qlog("c2cfile:OWNER").remove(0);
+            let _ = std::fs::remove_file(&f);
+            if up["file_name"].as_str().is_none_or(|n| !n.starts_with("disco-c2c-")) { return Err(up.to_string()); }
+            within(10, crate::set_agent_sync(st(), "mq2".into(), "discord".into())).await??;
+            let moved = crate::qq::agent_sync(&core, "mq2") == "discord" && crate::qq::target(&core, "dm:mq2").is_none() && crate::qq::qq_agents(&core) == vec!["mq".to_owned()];
+            // mq2 was the current one; with it gone, plain messages go to the first QQ agent.
+            let n = count(&core, "dm:mq", "mq");
+            feed("C2C_MESSAGE_CREATE", serde_json::json!({ "id": "c6", "content": "还在吗", "author": { "user_openid": "OWNER" } }))?;
+            wait_msg(&core, "dm:mq", "mq", n, 30).await?;
+            if moved && last_from(&core, "dm:mq", "me").as_deref() == Some("还在吗") { Ok(String::new()) } else { Err(format!("moved={moved}")) } });
         let _ = check!("QQ 解绑群和机器人", {
             crate::qq::qq_group_code(st(), qgid.clone(), Some(true))?;
             let s = serde_json::to_value(crate::qq::qq_unbind(st())?).map_err(|e| e.to_string())?;
-            if crate::qq::openid_of(&core, &qgid).is_none() && s["bound"] == false && crate::secret_get("qq_bot").is_none() { Ok(String::new()) } else { Err(s.to_string()) } });
+            let refused = within(20, crate::add_agent(st(), crate::NewAgent { sync: Some("qq".into()), ..spec("mq3") })).await?.is_err();
+            if crate::qq::openid_of(&core, &qgid).is_none() && s["bound"] == false && crate::secret_get("qq_bot").is_none() && refused && crate::qq::owner(&core).is_none() { Ok(String::new()) } else { Err(format!("{s} refused={refused}")) } });
         println!("SELFTEST {}", if fails == 0 { "OK".to_string() } else { format!("{fails} FAILED") });
         std::process::exit(if fails == 0 { 0 } else { 1 });
     });
@@ -962,7 +1035,7 @@ async fn mock_openai() -> Result<String, String> {
     Ok(format!("http://127.0.0.1:{port}/v1"))
 }
 
-/// What the mock QQ open platform received: ("msg:<group>" / "file:<group>" / "ack:<id>", body).
+/// What the mock QQ open platform received: ("msg:<group>" / "file:<group>" / "c2c:<user>" / "c2cfile:<user>" / "ack:<id>", body).
 static QQ_LOG: std::sync::Mutex<Vec<(String, serde_json::Value)>> = std::sync::Mutex::new(Vec::new());
 
 /// A tiny QQ open platform: one-scan bind (scanned on the second poll), token, bot name,
@@ -988,6 +1061,8 @@ async fn mock_qq() -> Result<String, String> {
         .route("/gateway", get(|| async { Json(json!({ "url": "ws://127.0.0.1:9/no-gateway-in-tests" })) }))
         .route("/v2/groups/{g}/messages", post(move |Path(g): Path<String>, Json(b): Json<Value>| async move { log(format!("msg:{g}"), b); Json(json!({ "id": "sent" })) }))
         .route("/v2/groups/{g}/files", post(move |Path(g): Path<String>, Json(b): Json<Value>| async move { log(format!("file:{g}"), b); Json(json!({ "file_info": "FI" })) }))
+        .route("/v2/users/{u}/messages", post(move |Path(u): Path<String>, Json(b): Json<Value>| async move { log(format!("c2c:{u}"), b); Json(json!({ "id": "sent" })) }))
+        .route("/v2/users/{u}/files", post(move |Path(u): Path<String>, Json(b): Json<Value>| async move { log(format!("c2cfile:{u}"), b); Json(json!({ "file_info": "FI" })) }))
         .route("/interactions/{i}", put(move |Path(i): Path<String>| async move { log(format!("ack:{i}"), json!({})); Json(json!({})) }))
         .route("/file.txt", get(|| async { "qq file" }));
     let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.map_err(|e| e.to_string())?;

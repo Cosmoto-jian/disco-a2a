@@ -6,11 +6,18 @@
 //! code Disco shows (`绑定 1234`) in that group, which also tells Disco which group
 //! member is its owner. From then on the group works like a Discord-synced one: one bot
 //! speaks for every local agent as `**name**：text`, people @ the bot and name an agent.
+//!
+//! An agent's 1:1 chat can sync to QQ instead of a Discord channel (chosen when it is
+//! imported, changeable later): it mirrors into the bot's private (C2C) chat with the
+//! owner, the person who scanned the bind code. That one private chat is shared by every
+//! QQ-synced agent: answers come as `**name**：text`, and the owner's messages go to the
+//! agent they start with (`@name …`, which also makes it the current one) or else to the
+//! current one. Nobody but the owner can talk to agents there.
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use disco_qq::{Bind, BindState, Creds, Endpoints, Incoming, Kind, Rest};
+use disco_qq::{Bind, BindState, Creds, Endpoints, Incoming, Kind, Rest, To};
 use serde::Serialize;
 use tauri::Emitter;
 use tokio::sync::{mpsc, watch};
@@ -26,10 +33,18 @@ const GROUP: &str = "qq_group/";
 const OF: &str = "qq_of/";
 /// QQ group openid → the owner's member openid in it (learned from the bind code).
 const ME: &str = "qq_me/";
+/// The bot's owner: the scanner's openid from the bind (the only one heard in private chat).
+const OWNER: &str = "qq_owner";
+/// The agent the owner's private QQ messages go to when they name none.
+const CUR: &str = "qq_cur";
+/// Per agent: where its 1:1 chat syncs, "qq" or "discord" (unset = Discord, as before v1.11).
+pub(crate) const SYNC: &str = "sync/";
+/// The last choice made when importing (the next import's default).
+const SYNC_LAST: &str = "sync_last";
 /// A bind code is valid this long.
 const CODE_TTL: Duration = Duration::from_secs(600);
-/// QQ accepts passive replies to a message for 5 minutes, at most 5 of them.
-const REPLY_TTL: Duration = Duration::from_secs(290);
+/// QQ accepts at most 5 passive replies to a message (within 5 minutes in a group, 60 in
+/// a private chat: `To::reply_window`).
 const REPLY_MAX: u32 = 5;
 
 struct Conn { rest: Rest, stop: watch::Sender<bool> }
@@ -40,8 +55,8 @@ static QR: Mutex<Option<(Bind, String, u64)>> = Mutex::new(None);
 static QR_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// Bind codes waiting to be sent in a QQ group: (code, Disco group id, issued).
 static CODES: Mutex<Vec<(String, String, Instant)>> = Mutex::new(Vec::new());
-/// Per QQ group: the newest message to reply to, when it came, the next sequence number.
-type Replies = HashMap<String, (String, Instant, u32)>;
+/// Per QQ group / private chat: the newest message to reply to, when it came, the next sequence number.
+type Replies = HashMap<To, (String, Instant, u32)>;
 static REPLY: Mutex<Option<Replies>> = Mutex::new(None);
 /// Message ids already handled (QQ may deliver one twice).
 static SEEN: Mutex<VecDeque<String>> = Mutex::new(VecDeque::new());
@@ -69,40 +84,128 @@ fn group_of(core: &Core, openid: &str) -> Option<String> {
     core.db().setting(&format!("{OF}{openid}")).filter(|s| !s.is_empty())
 }
 
-/// Where to post a thread's messages in QQ: the bot and the QQ group.
-pub(crate) fn target(core: &Core, thread: &str) -> Option<(Rest, String)> {
-    let openid = openid_of(core, thread.strip_prefix("group:")?)?;
-    Some((rest()?, openid))
+/// The bot's owner (whose private chat QQ-synced agents use), once known.
+pub(crate) fn owner(core: &Core) -> Option<String> {
+    core.db().setting(OWNER).filter(|s| !s.is_empty())
 }
 
-/// Reserve `n` passive replies to the group's newest message, if QQ still allows them.
-fn reply_slot(openid: &str, n: u32) -> Option<(String, u32)> {
+fn bound(core: &Core) -> bool { core.db().setting(SET_ON).as_deref() == Some("1") }
+
+/// Where an agent's 1:1 chat syncs: "qq" or "discord".
+pub(crate) fn agent_sync(core: &Core, agent: &str) -> &'static str {
+    if core.db().setting(&format!("{SYNC}{agent}")).as_deref() == Some("qq") { "qq" } else { "discord" }
+}
+
+/// The choice offered first when importing: the last one made (QQ only while a bot is
+/// bound), else whatever is connected, Discord when both are.
+pub(crate) fn sync_default(core: &Core) -> &'static str {
+    let last = core.db().setting(SYNC_LAST).unwrap_or_default();
+    let qq = bound(core);
+    match last.as_str() {
+        "qq" if qq => "qq",
+        "discord" => "discord",
+        _ if core.discord_rest().is_none() && qq => "qq",
+        _ => "discord",
+    }
+}
+
+/// Check a requested sync choice ("" / None = the default).
+pub(crate) fn sync_choice(core: &Core, want: Option<&str>) -> Result<&'static str, String> {
+    match want.unwrap_or_default() {
+        "" => Ok(sync_default(core)),
+        "discord" => Ok("discord"),
+        "qq" if bound(core) => Ok("qq"),
+        "qq" => Err("先在设置里扫码接入 QQ 机器人，才能同步到 QQ".into()),
+        other => Err(format!("未知的同步位置：{other}")),
+    }
+}
+
+/// Remember where agents sync (and, when the user picked it, the choice for next time).
+pub(crate) fn set_sync(core: &Core, names: &[String], to: &str, remember: bool) -> Result<(), String> {
+    for n in names { core.db().set_setting(&format!("{SYNC}{n}"), to).map_err(err)?; }
+    if remember { core.db().set_setting(SYNC_LAST, to).map_err(err)?; }
+    Ok(())
+}
+
+/// A renamed (`Some(new)`) or removed agent: its sync choice and "current" mark follow it.
+pub(crate) fn agent_follow(core: &Core, old: &str, new: Option<&str>) {
+    let was = core.db().setting(&format!("{SYNC}{old}")).filter(|v| !v.is_empty());
+    if let Some(v) = was {
+        let _ = core.db().set_setting(&format!("{SYNC}{old}"), "");
+        if let Some(n) = new { let _ = core.db().set_setting(&format!("{SYNC}{n}"), &v); }
+    }
+    let cur = core.db().setting(CUR);
+    if cur.as_deref() == Some(old) { let _ = core.db().set_setting(CUR, new.unwrap_or_default()); }
+}
+
+/// Agents whose 1:1 chat syncs to QQ, in list order.
+pub(crate) fn qq_agents(core: &Core) -> Vec<String> {
+    let names: Vec<String> = core.db().list_agents().map(|v| v.into_iter().map(|a| a.name).collect()).unwrap_or_default();
+    let syncs = core.db().settings_with_prefix(SYNC).unwrap_or_default();
+    names.into_iter().filter(|n| syncs.iter().any(|(k, v)| k == n && v == "qq")).collect()
+}
+
+/// Where to post a thread's messages in QQ: the bot, and the QQ group (group chats) or
+/// the owner's private chat (an agent whose 1:1 chat syncs to QQ).
+pub(crate) fn target(core: &Core, thread: &str) -> Option<(Rest, To)> {
+    if let Some(g) = thread.strip_prefix("group:") {
+        let openid = openid_of(core, g)?;
+        return Some((rest()?, To::Group(openid)));
+    }
+    let agent = thread.strip_prefix("dm:")?;
+    if agent_sync(core, agent) != "qq" { return None; }
+    let owner = owner(core)?;
+    Some((rest()?, To::User(owner)))
+}
+
+/// Reserve `n` passive replies to the newest message there, if QQ still allows them.
+fn reply_slot(to: &To, n: u32) -> Option<(String, u32)> {
     let mut g = lock(&REPLY);
-    let e = g.get_or_insert_with(HashMap::new).get_mut(openid)?;
-    if e.1.elapsed() > REPLY_TTL || e.2 + n > REPLY_MAX + 1 { return None; }
+    let e = g.get_or_insert_with(HashMap::new).get_mut(to)?;
+    if e.1.elapsed() > to.reply_window() || e.2 + n > REPLY_MAX + 1 { return None; }
     let seq = e.2;
     e.2 += n;
     Some((e.0.clone(), seq))
 }
 
-/// Post into a group's QQ group as `**who**：text` (or just `text` when `who` is empty).
-pub(crate) async fn post(rest: &Rest, openid: &str, who: &str, text: &str) -> Result<(), String> {
+/// Send with a passive reply when one is left; in a private chat a refused passive reply
+/// (the message got too old on QQ's clock) is sent again as an active message.
+async fn deliver<F, Fut>(to: &To, n: u32, send: F) -> Result<(), String>
+where F: Fn(Option<(String, u32)>) -> Fut, Fut: std::future::Future<Output = Result<u32, String>> {
+    let slot = reply_slot(to, n);
+    let passive = slot.is_some();
+    match send(slot).await {
+        Err(_) if passive && matches!(to, To::User(_)) => send(None).await.map(|_| ()),
+        r => r.map(|_| ()),
+    }
+}
+
+/// Post as `**who**：text` (or just `text` when `who` is empty).
+pub(crate) async fn post(rest: &Rest, to: &To, who: &str, text: &str) -> Result<(), String> {
     let body = if who.is_empty() { text.to_owned() } else { format!("**{who}**：{text}") };
     let n = disco_qq::chunk(&body).len() as u32;
-    let slot = reply_slot(openid, n);
-    rest.send_group(openid, &body, slot.as_ref().map(|(id, s)| (id.as_str(), *s)), &[]).await.map(|_| ())
+    deliver(to, n, |slot| { let body = &body; async move { rest.send(to, body, slot.as_ref().map(|(id, s)| (id.as_str(), *s)), &[]).await } }).await
 }
 
-/// A file in the group's QQ group.
-pub(crate) async fn post_file(rest: &Rest, openid: &str, name: &str, bytes: &[u8]) -> Result<(), String> {
-    let slot = reply_slot(openid, 1);
-    rest.send_group_file(openid, name, bytes, slot.as_ref().map(|(id, s)| (id.as_str(), *s))).await.map(|_| ())
+/// A file.
+pub(crate) async fn post_file(rest: &Rest, to: &To, name: &str, bytes: &[u8]) -> Result<(), String> {
+    deliver(to, 1, |slot| async move { rest.send_file(to, name, bytes, slot.as_ref().map(|(id, s)| (id.as_str(), *s))).await }).await
 }
 
-/// A card with buttons (an inbox item) in the group's QQ group.
-pub(crate) async fn post_card(rest: &Rest, openid: &str, text: &str, buttons: &[disco_qq::Button]) -> Result<(), String> {
-    let slot = reply_slot(openid, disco_qq::chunk(text).len() as u32);
-    rest.send_group(openid, text, slot.as_ref().map(|(id, s)| (id.as_str(), *s)), buttons).await.map(|_| ())
+/// A card with buttons (an inbox item).
+pub(crate) async fn post_card(rest: &Rest, to: &To, text: &str, buttons: &[disco_qq::Button]) -> Result<(), String> {
+    let n = disco_qq::chunk(text).len() as u32;
+    deliver(to, n, |slot| async move { rest.send(to, text, slot.as_ref().map(|(id, s)| (id.as_str(), *s)), buttons).await }).await
+}
+
+/// `@name rest` naming one of `agents` (the longest that fits; ASCII case ignored) → (agent, rest).
+fn pick<'a>(text: &'a str, agents: &[String]) -> Option<(String, &'a str)> {
+    let t = text.trim_start().strip_prefix('@').or_else(|| text.trim_start().strip_prefix('＠'))?;
+    let a = agents.iter().filter(|a| {
+        t.get(..a.len()).is_some_and(|h| h.eq_ignore_ascii_case(a))
+            && t[a.len()..].chars().next().is_none_or(|c| !(c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.'))
+    }).max_by_key(|a| a.len())?;
+    Some((a.clone(), t[a.len()..].trim_start_matches([' ', '\u{3000}', ':', '：', ',', '，']).trim()))
 }
 
 fn set_status(core: &Core, s: String) {
@@ -168,12 +271,13 @@ impl Core {
                 }
             }
             Kind::Group if first_time(&m.id) => { tauri::async_runtime::spawn(async move { c.qq_group_message(m).await }); }
+            Kind::Direct if first_time(&m.id) => { tauri::async_runtime::spawn(async move { c.qq_direct(m).await }); }
             _ => {}
         }
     }
 
     async fn qq_group_message(self: &Arc<Self>, m: Incoming) {
-        lock(&REPLY).get_or_insert_with(HashMap::new).insert(m.group.clone(), (m.id.clone(), Instant::now(), 1));
+        lock(&REPLY).get_or_insert_with(HashMap::new).insert(To::Group(m.group.clone()), (m.id.clone(), Instant::now(), 1));
         let Some(gid) = group_of(self, &m.group) else {
             // Not tied to a Disco group yet: only a bind code means anything here.
             let Some(code) = bind_code(&m.content) else { return };
@@ -190,7 +294,7 @@ impl Core {
             self.post_message(&format!("group:{gid}"), "system", &format!("已和 QQ 群连上，绑定人 {} 算作你本人。在 QQ 群里 @机器人 并写 @agent 名字来叫 agent。", m.author));
             self.agents_changed();
             if let Some(rest) = rest() {
-                let _ = post(&rest, &m.group, "", &format!("已和 Disco 群聊「{name}」连上 ✅\n@我 说话，组长会回答；想叫某个 agent，就在话里写 @它的名字。\n/help 查看用法")).await;
+                let _ = post(&rest, &To::Group(m.group.clone()), "", &format!("已和 Disco 群聊「{name}」连上 ✅\n@我 说话，组长会回答；想叫某个 agent，就在话里写 @它的名字。\n/help 查看用法")).await;
             }
             return;
         };
@@ -222,14 +326,65 @@ impl Core {
         self.group(gid, author, text, true).await;
     }
 
-    /// A button on an inbox card: only the group's owner may answer.
+    /// The owner's message in the bot's private chat: to the agent it names (`@name …`,
+    /// which becomes the current one) or the current one. Anyone else is ignored.
+    async fn qq_direct(self: &Arc<Self>, m: Incoming) {
+        let me = owner(self);
+        if me.as_deref() != Some(m.author_id.as_str()) {
+            let _ = self.db().audit(&format!("qq:{}", m.author_id), None, "qq.ignored", "private message from someone other than the owner");
+            return;
+        }
+        let to = To::User(m.author_id.clone());
+        lock(&REPLY).get_or_insert_with(HashMap::new).insert(to.clone(), (m.id.clone(), Instant::now(), 1));
+        let agents = qq_agents(self);
+        let say = |text: String| { let to = to.clone(); async move { if let Some(r) = rest() { let _ = post(&r, &to, "", &text).await; } } };
+        if agents.is_empty() {
+            say("还没有同步到 QQ 的 agent。在 Disco 里导入 agent 时选「同步到 QQ」，或在 agent 的信息里改成 QQ。".into()).await;
+            return;
+        }
+        let saved = self.db().setting(CUR).filter(|c| agents.contains(c));
+        let current = saved.unwrap_or_else(|| agents[0].clone());
+        if matches!(m.content.trim(), "/help" | "/帮助" | "/agents") {
+            say(format!("同步到这里的 agent：{}\n现在在和 **{current}** 说话。以 @名字 开头就换成它，之后的消息都发给它。", agents.join("、"))).await;
+            return;
+        }
+        let (agent, mut text, named) = match pick(&m.content, &agents) {
+            Some((a, rest)) => (a, rest.to_owned(), true),
+            None => (current, m.content.trim().to_owned(), false),
+        };
+        if named { let _ = self.db().set_setting(CUR, &agent); }
+        let thread = format!("dm:{agent}");
+        // Files and pictures go to the agent's space, like group files; it gets their paths.
+        if !m.attachments.is_empty() && let (Some(rest), Ok(dir)) = (rest(), crate::mcp::space_dir(self, &thread).map(|d| d.join("files"))) {
+            for a in &m.attachments {
+                match rest.download(&a.url, crate::files::MAX_SEND).await.and_then(|b| crate::files::save_new(&dir, &a.name, &b)) {
+                    Ok((path, size)) => text.push_str(&format!("\n📎 {}（{}）\n{}", crate::files::safe_name(&a.name), crate::files::human_size(size), path.display())),
+                    Err(e) => text.push_str(&format!("\n📎 {}（没收到：{e}）", a.name)),
+                }
+            }
+        }
+        if text.trim().is_empty() {
+            if named { say(format!("好的，接下来的消息都发给 **{agent}**。")).await; }
+            return;
+        }
+        if self.paused.load(std::sync::atomic::Ordering::Relaxed) {
+            self.post_message(&thread, "me", &text);
+            say("Disco 已全部停止，先在 Disco 里点「恢复」。".into()).await;
+            return;
+        }
+        self.dm(agent, "me".into(), text, true).await;
+    }
+
+    /// A button on an inbox card: only the owner may answer (in a group, the member who
+    /// sent the bind code; in the private chat, the bot's owner).
     async fn qq_press(&self, m: Incoming) {
         let Some(rest) = rest() else { return };
         let _ = rest.ack(&m.id).await;
         let press = m.press.unwrap_or_default();
         let mut parts = press.splitn(3, ':');
         let (Some("disco"), Some(id), Some(pick)) = (parts.next(), parts.next(), parts.next()) else { return };
-        if self.db().setting(&format!("{ME}{}", m.group)).as_deref() != Some(m.author_id.as_str()) { return; }
+        let allowed = if m.group.is_empty() { owner(self) } else { self.db().setting(&format!("{ME}{}", m.group)) };
+        if allowed.as_deref() != Some(m.author_id.as_str()) { return; }
         let option = self.inbox_option(id, pick);
         let _ = self.inbox_answer(id, crate::inbox::Answer { option, text: None }, "QQ").await;
     }
@@ -296,8 +451,8 @@ pub async fn qq_bind(core: St<'_>) -> CmdResult<QqStatus> {
                     }
                     Err(e) => { set_status(&core2, e); break; }
                 },
-                Ok(BindState::Done { creds, owner: _ }) => {
-                    let r = save_bot(&core2, creds).await;
+                Ok(BindState::Done { creds, owner }) => {
+                    let r = save_bot(&core2, creds, owner).await;
                     *lock(&QR) = None;
                     match r { Ok(()) => connect(&core2), Err(e) => set_status(&core2, e) }
                     return;
@@ -311,10 +466,11 @@ pub async fn qq_bind(core: St<'_>) -> CmdResult<QqStatus> {
 }
 
 /// Check the scanned bot works, then keep it (keychain) and its name.
-async fn save_bot(core: &Core, creds: Creds) -> Result<(), String> {
+async fn save_bot(core: &Core, creds: Creds, owner: Option<String>) -> Result<(), String> {
     let name = Rest::new(creds.clone(), endpoints()).me().await?;
     secret_set(VAULT, &serde_json::to_string(&creds).map_err(err)?)?;
     core.db().set_setting(SET_NAME, &name).map_err(err)?;
+    core.db().set_setting(OWNER, owner.as_deref().unwrap_or_default()).map_err(err)?;
     core.db().set_setting(SET_ON, "1").map_err(err)?;
     Ok(())
 }
@@ -332,6 +488,7 @@ pub fn qq_unbind(core: St<'_>) -> CmdResult<QqStatus> {
     secret_del(VAULT);
     core.db().set_setting(SET_ON, "").map_err(err)?;
     core.db().set_setting(SET_NAME, "").map_err(err)?;
+    core.db().set_setting(OWNER, "").map_err(err)?;
     *lock(&STATUS) = String::new();
     core.agents_changed();
     Ok(status(&core))
@@ -375,11 +532,30 @@ mod tests {
         assert_eq!(relayed("**claude**：好的"), Some(("claude", "好的")));
         assert_eq!(relayed("**a\nb**：x"), None);
         assert_eq!(relayed("claude：x"), None);
-        lock(&REPLY).get_or_insert_with(HashMap::new).insert("G-test".into(), ("m1".into(), Instant::now(), 1));
-        assert_eq!(reply_slot("G-test", 2), Some(("m1".into(), 1)));
-        assert_eq!(reply_slot("G-test", 3), Some(("m1".into(), 3)));
-        assert_eq!(reply_slot("G-test", 1), None, "a sixth reply must be an active message");
-        assert_eq!(reply_slot("nope", 1), None);
+        let g = To::Group("G-test".into());
+        lock(&REPLY).get_or_insert_with(HashMap::new).insert(g.clone(), ("m1".into(), Instant::now(), 1));
+        assert_eq!(reply_slot(&g, 2), Some(("m1".into(), 1)));
+        assert_eq!(reply_slot(&g, 3), Some(("m1".into(), 3)));
+        assert_eq!(reply_slot(&g, 1), None, "a sixth reply must be an active message");
+        assert_eq!(reply_slot(&To::Group("nope".into()), 1), None);
+        // Private chats: same five, a longer window; an old message gets none.
+        let u = To::User("O-test".into());
+        lock(&REPLY).get_or_insert_with(HashMap::new).insert(u.clone(), ("c1".into(), Instant::now() - Duration::from_secs(600), 1));
+        assert_eq!(reply_slot(&u, 1), Some(("c1".into(), 1)), "10 minutes is still inside the private-chat window");
+        lock(&REPLY).get_or_insert_with(HashMap::new).insert(u.clone(), ("c1".into(), Instant::now() - Duration::from_secs(3600), 1));
+        assert_eq!(reply_slot(&u, 1), None);
         assert!(first_time("x-1") && !first_time("x-1") && first_time(""));
+    }
+
+    #[test]
+    fn picks_the_named_agent() {
+        let agents = vec!["claude".to_owned(), "claude-2".to_owned(), "写手".to_owned()];
+        assert_eq!(pick("@claude 看下", &agents), Some(("claude".into(), "看下")));
+        assert_eq!(pick("@claude-2：继续", &agents), Some(("claude-2".into(), "继续")));
+        assert_eq!(pick("@Claude", &agents), Some(("claude".into(), "")));
+        assert_eq!(pick("@写手帮我写", &agents), Some(("写手".into(), "帮我写")));
+        assert_eq!(pick("@claudex hi", &agents), None);
+        assert_eq!(pick("hi @claude", &agents), None);
+        assert_eq!(pick("＠claude hi", &agents), Some(("claude".into(), "hi")));
     }
 }

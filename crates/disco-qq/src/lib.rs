@@ -142,6 +142,20 @@ pub struct Rest {
 /// One button of an inline keyboard: (button data, label, primary).
 pub type Button = (String, String, bool);
 
+/// Where a message goes: a QQ group (its openid) or one user's private chat with the bot (C2C, the user's openid).
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum To { Group(String), User(String) }
+
+impl To {
+    fn path(&self, what: &str) -> String {
+        match self { To::Group(g) => format!("/v2/groups/{g}/{what}"), To::User(u) => format!("/v2/users/{u}/{what}") }
+    }
+    /// The passive-reply window QQ gives: 5 minutes in groups, 60 in private chats (kept a little shorter).
+    pub fn reply_window(&self) -> Duration {
+        match self { To::Group(_) => Duration::from_secs(290), To::User(_) => Duration::from_secs(3500) }
+    }
+}
+
 impl Rest {
     pub fn new(creds: Creds, at: Endpoints) -> Self {
         Self { http: reqwest::Client::builder().connect_timeout(Duration::from_secs(15)).build().unwrap_or_default(), creds, at, token: Arc::default() }
@@ -188,14 +202,19 @@ impl Rest {
     /// active message. Buttons go with the last piece. Falls back to plain text when the
     /// bot may not send markdown.
     pub async fn send_group(&self, group: &str, text: &str, reply: Option<(&str, u32)>, buttons: &[Button]) -> Result<u32, String> {
+        self.send(&To::Group(group.to_owned()), text, reply, buttons).await
+    }
+
+    /// Like [`Rest::send_group`], to a group or to one user's private (C2C) chat with the bot.
+    pub async fn send(&self, to: &To, text: &str, reply: Option<(&str, u32)>, buttons: &[Button]) -> Result<u32, String> {
         let mut seq = reply.map_or(1, |r| r.1);
         let parts = chunk(text);
         let n = parts.len();
+        let path = to.path("messages");
         for (i, part) in parts.into_iter().enumerate() {
             let mut body = json!({ "msg_type": 2, "markdown": { "content": part }, "msg_seq": seq });
             if let Some((id, _)) = reply { body["msg_id"] = json!(id); }
             if i + 1 == n && !buttons.is_empty() { body["keyboard"] = keyboard(buttons); }
-            let path = format!("/v2/groups/{group}/messages");
             if let Err(e) = self.call(reqwest::Method::POST, &path, Some(body.clone())).await {
                 // No markdown permission: plain text (buttons need markdown, so they go).
                 let mut plain = json!({ "msg_type": 0, "content": part, "msg_seq": seq + 1 });
@@ -210,15 +229,20 @@ impl Rest {
 
     /// Upload a file (≤ the caller's limit) to a group and post it. `kind`: 1 image, 2 video, 3 voice, 4 file.
     pub async fn send_group_file(&self, group: &str, name: &str, bytes: &[u8], reply: Option<(&str, u32)>) -> Result<u32, String> {
+        self.send_file(&To::Group(group.to_owned()), name, bytes, reply).await
+    }
+
+    /// Like [`Rest::send_group_file`], to a group or a private chat.
+    pub async fn send_file(&self, to: &To, name: &str, bytes: &[u8], reply: Option<(&str, u32)>) -> Result<u32, String> {
         let lower = name.to_ascii_lowercase();
         let kind = if [".png", ".jpg", ".jpeg", ".gif", ".webp"].iter().any(|e| lower.ends_with(e)) { 1 } else if [".mp4", ".mov"].iter().any(|e| lower.ends_with(e)) { 2 } else { 4 };
-        let up = self.call(reqwest::Method::POST, &format!("/v2/groups/{group}/files"),
+        let up = self.call(reqwest::Method::POST, &to.path("files"),
             Some(json!({ "file_type": kind, "file_data": b64().encode(bytes), "file_name": name, "srv_send_msg": false }))).await?;
         let info = up["file_info"].as_str().ok_or("上传文件失败：没有 file_info")?;
         let seq = reply.map_or(1, |r| r.1);
         let mut body = json!({ "msg_type": 7, "media": { "file_info": info }, "msg_seq": seq });
         if let Some((id, _)) = reply { body["msg_id"] = json!(id); }
-        self.call(reqwest::Method::POST, &format!("/v2/groups/{group}/messages"), Some(body)).await?;
+        self.call(reqwest::Method::POST, &to.path("messages"), Some(body)).await?;
         Ok(seq + 1)
     }
 
@@ -485,6 +509,11 @@ mod tests {
         assert!(parse("GROUP_AT_MESSAGE_CREATE", &json!({ "id": "m3", "group_openid": "G1", "content": "x", "author": {} })).unwrap().at_me);
         let press = parse("INTERACTION_CREATE", &json!({ "id": "i1", "group_openid": "G1", "group_member_openid": "U1", "data": { "resolved": { "button_data": "disco:a:0" } } })).unwrap();
         assert_eq!((press.kind, press.id.as_str(), press.author_id.as_str(), press.press.as_deref()), (Kind::Press, "i1", "U1", Some("disco:a:0")));
+        let c2c_press = parse("INTERACTION_CREATE", &json!({ "id": "i2", "chat_type": 2, "user_openid": "O1", "data": { "resolved": { "button_data": "disco:b:1" } } })).unwrap();
+        assert_eq!((c2c_press.group.as_str(), c2c_press.author_id.as_str()), ("", "O1"));
+        assert_eq!(To::User("O1".into()).path("files"), "/v2/users/O1/files");
+        assert_eq!(To::Group("G1".into()).path("messages"), "/v2/groups/G1/messages");
+        assert!(To::User(String::new()).reply_window() > To::Group(String::new()).reply_window());
         let dm = parse("C2C_MESSAGE_CREATE", &json!({ "id": "m4", "content": "hi", "author": { "user_openid": "O1" } })).unwrap();
         assert_eq!((dm.kind, dm.group.as_str()), (Kind::Direct, "O1"));
         assert_eq!(parse("GROUP_ADD_ROBOT", &json!({ "group_openid": "G2", "op_member_openid": "U9" })).map(|m| (m.kind, m.group, m.author_id)), Some((Kind::Added, "G2".into(), "U9".into())));

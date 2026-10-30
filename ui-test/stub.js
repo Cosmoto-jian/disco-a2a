@@ -14,7 +14,7 @@
   const long = Array.from({ length: 40 }, (_, i) => ({ author: i % 2 ? "helper" : "me", body: `第 ${i + 1} 条消息\n${"内容 ".repeat(12)}`, ts: now - 4000 + i }));
   const STUB = {
     agents: [
-      { name: "claude", kind: "acp", template: "claude-code", detail: "/Users/x/code", live: true, look: "", branch: "main",
+      { name: "claude", kind: "acp", template: "claude-code", detail: "/Users/x/code", live: true, look: "", branch: "main", sync: "discord",
         doing: "写 README 的 MCP 章节，补上 overview 工具的输出示例和注意事项", busy_since: Date.now() - 120000 },
       { name: "codex", kind: "acp", template: "codex", detail: "", live: true, look: "", branch: "disco/codex" },
       { name: "researcher", kind: "a2a", template: "a2a", detail: "A2A research agent", live: false, look: "", avatar: "bloom.candy" },
@@ -43,6 +43,8 @@
     // QQ bot: not bound; `qq_bind` shows a QR code, `STUB.qq_scan()` simulates the scan in mobile QQ.
     qq: { bound: false, status: "", name: "", qr: null, url: null },
     qq_codes: [],
+    // Where new agents' 1:1 chats sync (backend: last choice, else what is connected, Discord if both).
+    sync_last: null,
     paused: false,
     inbox: [
       { id: "a1", kind: "permission", thread: "group:g1", agent: "codex", title: "Run: cargo test -p disco-app",
@@ -102,8 +104,9 @@
   Object.assign(STUB, window.STUB_INIT || {});
   const clone = (v) => (v === undefined ? null : JSON.parse(JSON.stringify(v)));
   const OV_KEYS = ["agents", "groups", "memory_off", "heads", "peers", "discord_token", "discord_status", "qq_status", "paused"];
+  const syncDefault = () => (STUB.sync_last === "qq" && STUB.qq.bound ? "qq" : STUB.sync_last === "discord" ? "discord" : !STUB.discord_token && STUB.qq.bound ? "qq" : "discord");
   const H = {
-    overview: () => Object.fromEntries(OV_KEYS.map((k) => [k, clone(STUB[k])])),
+    overview: () => ({ ...Object.fromEntries(OV_KEYS.map((k) => [k, clone(STUB[k])])), sync_default: syncDefault() }),
     inbox: () => clone(STUB.inbox),
     inbox_answer: (a) => { STUB.inbox = STUB.inbox.filter((i) => i.id !== a.id); return null; },
     messages: (a) => clone(STUB.messages[a.thread] ?? STUB.messages.default),
@@ -129,8 +132,13 @@
     detect_agents: () => clone(STUB.detect),
     conda_envs: () => clone(STUB.envs),
     add_agent: (a) => { const s = a.spec; const names = s.count > 1 ? Array.from({ length: s.count }, (_, i) => `${s.name}-${i + 1}`) : [s.name];
-      for (const n of names) STUB.agents.push({ name: n, kind: s.url && s.template === "a2a" ? "a2a" : s.template === "openai" ? "openai" : "acp", template: s.template, detail: s.cwd ?? "", live: false, look: "" });
+      if (s.sync === "qq" && !STUB.qq.bound) throw "先在设置里扫码接入 QQ 机器人，才能同步到 QQ";
+      const sync = s.sync || syncDefault();
+      if (s.sync) STUB.sync_last = s.sync;
+      for (const n of names) STUB.agents.push({ name: n, kind: s.url && s.template === "a2a" ? "a2a" : s.template === "openai" ? "openai" : "acp", template: s.template, detail: s.cwd ?? "", live: false, look: "", sync });
       return names; },
+    set_agent_sync: (a) => { const ag = STUB.agents.find((x) => x.name === a.name); if (!ag) throw "no such agent";
+      if (a.to === "qq" && !STUB.qq.bound) throw "先在设置里扫码接入 QQ 机器人，才能同步到 QQ"; ag.sync = a.to; return null; },
     accept_invite: (a) => { const n = a.name || "agent-friend"; STUB.agents.push({ name: n, kind: "a2a", template: "a2a", detail: "invite", live: false, look: "" }); return n; },
     share_status: () => ({ base: STUB.tunnel.via === "cloudflare" ? `https://${STUB.tunnel.hostname}` : "http://mac.tail1.ts.net:7480", problem: null, via: STUB.tunnel.via, shares: clone(STUB.shares) }),
     tunnel_status: () => clone(STUB.tunnel),

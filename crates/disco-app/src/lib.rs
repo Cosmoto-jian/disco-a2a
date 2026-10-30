@@ -320,12 +320,16 @@ impl Core {
     }
 
     /// 1:1 chat. The same thread is mirrored to the agent's own Discord channel
-    /// (when there is one), whichever side the message came from.
+    /// (when there is one), whichever side the message came from — or, for an agent that
+    /// syncs to QQ, its answers go to the QQ bot's private chat with the owner.
+    /// `from_discord`: the message came from outside the app (Discord or QQ).
     async fn dm(&self, agent: String, author: String, text: String, from_discord: bool) {
         let thread = format!("dm:{agent}");
         self.post_message(&thread, &author, &text);
         if self.user_remember(&thread, &agent, &text) { return; }
-        let mirror = self.agent_channel(&agent).and_then(|ch| Some((self.discord_rest()?, ch)));
+        let qq = qq::target(self, &thread);
+        let on_qq = qq::agent_sync(self, &agent) == "qq";
+        let mirror = if on_qq { None } else { self.agent_channel(&agent).and_then(|ch| Some((self.discord_rest()?, ch))) };
         // Mirror in the background: the agent must not wait on Discord.
         if !from_discord && let Some((d, ch)) = mirror.clone() {
             let line = format!("**我**：{text}");
@@ -341,8 +345,17 @@ impl Core {
                 {
                     self.post_message(&thread, "system", &format!("Discord 发送失败：{e}"));
                 }
+                if let Some((rest, to)) = &qq && !answer.is_empty() && let Err(e) = qq::post(rest, to, &agent, answer).await {
+                    self.post_message(&thread, "system", &format!("QQ 发送失败：{e}"));
+                }
             }
-            Err(e) => self.report_failure(&thread, &agent, &e),
+            Err(e) => {
+                self.report_failure(&thread, &agent, &e);
+                if let Some((rest, to)) = qq {
+                    let line = fail_line(&agent, &e);
+                    tauri::async_runtime::spawn(async move { let _ = qq::post(&rest, &to, &agent, &line).await; });
+                }
+            }
         }
     }
 
@@ -463,6 +476,8 @@ impl Core {
         let agents = self.db().list_agents().map_err(err)?;
         let mut n = 0;
         for a in agents.iter().filter(|a| only.is_none_or(|o| o.contains(&a.name))) {
+            // Agents whose 1:1 chat syncs to QQ get no Discord channel.
+            if qq::agent_sync(self, &a.name) == "qq" { continue; }
             let spec: LocalSpec = a.card_json.as_deref().and_then(|j| serde_json::from_str(j).ok()).unwrap_or_default();
             let topic = if a.transport == "a2a" { format!("A2A agent · {}", a.endpoint) } else { spec.description.clone() };
             let (ch, created) = rest.ensure_channel(&guild, AGENT_CATEGORY, &a.name, &topic).await?;
@@ -927,6 +942,8 @@ struct AgentView {
     /// When its current turn started, in ms since the epoch.
     #[serde(skip_serializing_if = "Option::is_none")]
     busy_since: Option<i64>,
+    /// Where its 1:1 chat syncs: "discord" or "qq".
+    sync: &'static str,
 }
 #[derive(Serialize)]
 struct GroupView { id: String, name: String, guild_id: String, lead: Option<String>, members: Vec<String>, people: Vec<String>, guests: Vec<String>, qq: bool }
@@ -944,6 +961,8 @@ struct Overview {
     discord_status: String,
     /// The QQ bot's state ("" = no bot bound).
     qq_status: String,
+    /// Where a newly imported agent's 1:1 chat syncs unless the user picks otherwise.
+    sync_default: &'static str,
     paused: bool,
     /// Chats with memory switched off.
     memory_off: Vec<String>,
@@ -969,7 +988,8 @@ async fn overview(core: St<'_>) -> CmdResult<Overview> {
         let avatar = avatar::get(&core, &a.name);
         let branch = core.hub.branch(&a);
         let (busy_since, doing) = core.hub.activity(&a.name);
-        agents.push(AgentView { live: core.hub.is_live(&a.name).await, name: a.name, kind: a.transport, template, detail, look, avatar, branch, doing, busy_since });
+        let sync = qq::agent_sync(&core, &a.name);
+        agents.push(AgentView { live: core.hub.is_live(&a.name).await, name: a.name, kind: a.transport, template, detail, look, avatar, branch, doing, busy_since, sync });
     }
     let peers = core.shares().into_iter().map(|(id, s)| {
         let missing = core.peer_missing(&id);
@@ -986,6 +1006,8 @@ async fn overview(core: St<'_>) -> CmdResult<Overview> {
     let discord_token = core.db().setting(SET_TOKEN_SAVED).is_some();
     let memory_off: Vec<String> = core.db().settings_with_prefix(memory::MEM_OFF).unwrap_or_default().into_iter()
         .filter(|(_, v)| v == "1").map(|(k, _)| k).collect();
+    let qq_status = qq::overview_status(&core);
+    let sync_default = qq::sync_default(&core);
     Ok(Overview {
         peers,
         agents,
@@ -993,7 +1015,8 @@ async fn overview(core: St<'_>) -> CmdResult<Overview> {
         heads: heads.into_iter().map(|(t, m)| Head { thread: t, author: m.author, body: m.body, ts: m.ts }).collect(),
         discord_token,
         discord_status: core.discord_status(),
-        qq_status: qq::overview_status(&core),
+        qq_status,
+        sync_default,
         paused: core.paused.load(Ordering::Relaxed),
         memory_off,
     })
@@ -1108,14 +1131,23 @@ pub(crate) struct NewAgent {
     /// Remote agents: headers sent on every request besides the credential (Cloudflare Access).
     #[serde(default)]
     extra: Vec<(String, String)>,
+    /// Where the 1:1 chat syncs: "discord" or "qq" (None / "" = the default, see `qq::sync_default`).
+    #[serde(default)]
+    sync: Option<String>,
 }
 
 #[tauri::command]
 async fn add_agent(core: St<'_>, spec: NewAgent) -> CmdResult<Vec<String>> {
+    // Where the new agents' 1:1 chats sync: Discord (a channel each, as always) or QQ.
+    let picked = spec.sync.clone().filter(|s| !s.is_empty());
+    let to = qq::sync_choice(&core, picked.as_deref())?;
     let names = add_agent_rows(&core, spec).await?;
+    qq::set_sync(&core, &names, to, picked.is_some())?;
     core.agents_changed();
     core.inner().warm(Some(names.clone()));
-    if core.discord_rest().is_some() {
+    if to == "qq" {
+        for n in &names { core.post_message(&format!("dm:{n}"), "system", &qq_dm_note(n)); }
+    } else if core.discord_rest().is_some() {
         let (c, n) = (core.inner().clone(), names.clone());
         tauri::async_runtime::spawn(async move {
             if let Err(e) = c.sync_agent_channels(Some(&n)).await {
@@ -1126,16 +1158,21 @@ async fn add_agent(core: St<'_>, spec: NewAgent) -> CmdResult<Vec<String>> {
     Ok(names)
 }
 
+/// The note an agent's chat gets when it starts (or switches to) syncing to QQ.
+fn qq_dm_note(agent: &str) -> String {
+    format!("这个对话同步到 QQ：在 QQ 里给机器人发私聊就是和 {agent} 说话，它的回复也会发到那里。几个 agent 共用这一个私聊：以 @{agent} 开头的消息发给它，之后不带 @ 的消息也继续发给它。")
+}
+
 impl NewAgent {
     /// A remote A2A agent behind a bearer token (Disco invites).
     pub(crate) fn remote(name: String, url: String, token: String, extra: Vec<(String, String)>) -> Self {
         Self { template: "a2a".into(), name, url: Some(url), header_name: Some("authorization".into()), header_value: Some(format!("Bearer {token}")),
-            command: None, cwd: None, count: None, worktree: None, conda: None, model: None, extra }
+            command: None, cwd: None, count: None, worktree: None, conda: None, model: None, extra, sync: None }
     }
 }
 
 pub(crate) async fn add_agent_rows(core: &Core, spec: NewAgent) -> CmdResult<Vec<String>> {
-    let NewAgent { template, name, url, header_name, header_value, command, cwd, count, worktree, conda, model, extra } = spec;
+    let NewAgent { template, name, url, header_name, header_value, command, cwd, count, worktree, conda, model, extra, sync: _ } = spec;
     let name = valid_name(&name)?;
     let kind = match template.as_str() { "a2a" => "a2a", "command" => "command", "openai" => "openai", _ => "acp" };
     let row = match kind {
@@ -1224,6 +1261,7 @@ async fn remove_agent(core: St<'_>, name: String, purge: Option<bool>) -> CmdRes
     core.db().delete_agent(&name, purge.unwrap_or(false)).map_err(err)?;
     core.shares_follow(&name, None);
     let _ = core.db().set_setting(&format!("{SET_LOOK}{name}"), "");
+    qq::agent_follow(&core, &name, None);
     let _ = avatar::set(&core, &name, None);
     let _ = core.db().audit("user", Some(&name), "remove_agent", "ok");
     core.agents_changed();
@@ -1293,6 +1331,7 @@ async fn rename_agent(core: St<'_>, name: String, new_name: String) -> CmdResult
         core.db().set_setting(&format!("{SET_LOOK}{new}"), &av).map_err(err)?;
     }
     avatar::rename(&core, &name, &new);
+    qq::agent_follow(&core, &name, Some(&new));
     if let Some(ch) = core.agent_channel(&name) {
         core.db().set_setting(&format!("{SET_AGENT_CH}{name}"), "").map_err(err)?;
         core.db().set_setting(&format!("{SET_AGENT_CH}{new}"), &ch).map_err(err)?;
@@ -1303,6 +1342,41 @@ async fn rename_agent(core: St<'_>, name: String, new_name: String) -> CmdResult
     let _ = core.db().audit("user", Some(&name), "rename_agent", &new_name);
     core.agents_changed();
     core.inner().warm(Some(vec![new_name.trim().to_owned()]));
+    Ok(())
+}
+
+/// Change where an agent's 1:1 chat syncs. To QQ: its Discord channel is let go (kept on
+/// Discord, no longer mirrored). To Discord: it gets its channel back (or a new one).
+#[tauri::command]
+async fn set_agent_sync(core: St<'_>, name: String, to: String) -> CmdResult<()> {
+    core.agent(&name)?;
+    let to = qq::sync_choice(&core, Some(to.as_str()).filter(|t| !t.is_empty()).or(Some("discord")))?;
+    if qq::agent_sync(&core, &name) == to { return Ok(()); }
+    qq::set_sync(&core, std::slice::from_ref(&name), to, false)?;
+    let thread = format!("dm:{name}");
+    if to == "qq" {
+        let ch = core.agent_channel(&name);
+        if let Some(ch) = ch {
+            core.db().set_setting(&format!("{SET_AGENT_CH}{name}"), "").map_err(err)?;
+            if let (Some(d), Some(hook)) = (core.discord_rest(), secret_get(&format!("webhook/{ch}"))) {
+                let who = name.clone();
+                tauri::async_runtime::spawn(async move { let _ = d.post_as(&hook, &who, None, "这个对话改为同步到 QQ，这个频道不再同步。").await; });
+            }
+        }
+        core.post_message(&thread, "system", &qq_dm_note(&name));
+    } else {
+        core.post_message(&thread, "system", "这个对话改为同步到 Discord。");
+        if core.discord_rest().is_some() {
+            let (c, n) = (core.inner().clone(), name.clone());
+            tauri::async_runtime::spawn(async move {
+                if let Err(e) = c.sync_agent_channels(Some(std::slice::from_ref(&n))).await {
+                    c.post_message(&format!("dm:{n}"), "system", &format!("没能在 Discord 建频道：{e}"));
+                }
+            });
+        }
+    }
+    let _ = core.db().audit("user", Some(&name), "set_agent_sync", to);
+    core.agents_changed();
     Ok(())
 }
 
@@ -1778,7 +1852,7 @@ pub fn run() {
             stop_all, resume, save_discord_token, discord_connect, discord_settings, discord_sync, diagnose, open_url, reveal_path, discord_channels, save_group, delete_group, restore_group, memory_restore, set_memory, agent_commands,
             check_update, install_update, space, todo_new, todo_set, todo_remove, doc_save, reveal_doc, share::share_status, share::peer_check, share::create_share, share::share_invite, share::revoke_share, share::accept_invite,
             tunnel::tunnel_status, tunnel::tunnel_install, tunnel::tunnel_login, tunnel::tunnel_setup, tunnel::tunnel_set,
-            qq::qq_status, qq::qq_bind, qq::qq_bind_cancel, qq::qq_unbind, qq::qq_group_code
+            qq::qq_status, qq::qq_bind, qq::qq_bind_cancel, qq::qq_unbind, qq::qq_group_code, set_agent_sync
         ])
         .build(tauri::generate_context!())
         .expect("error while running Disco")

@@ -642,7 +642,12 @@ function drawInfo(t) {
     isec(null, irow(null, "类型", null, val(KIND[a.kind] ?? "A2A")),
       a.detail ? irow(null, a.kind === "acp" ? "目录" : "地址", null, val(a.kind === "acp" ? shortPath(a.detail) : a.detail, " mono")) : null,
       irow(null, "状态", null, val(a.live ? "在线" : "未启动"))),
-    isec("本对话", memorySwitch(t)),
+    isec("本对话", memorySwitch(t),
+      qqBound() || a.sync === "qq" ? irow(null, "同步到", a.sync === "qq" ? "机器人私聊" : "自己的频道",
+        syncSeg(a.sync === "qq" ? "qq" : "discord", async (v) => {
+          try { await invoke("set_agent_sync", { name, to: v }); await load(); toast(v === "qq" ? `${name} 改为同步到 QQ` : `${name} 改为同步到 Discord`, 2500); }
+          catch (e) { toast(e); drawInfo(t); }
+        })) : null),
     isec(null, irow(lic("image"), "更换头像…", null, null, () => avatarDialog(name)),
       a.kind !== "a2a" ? irow(lic("share-network"), "共享给朋友…", null, null, () => shareDialog(name)) : null,
       irow(lic("pencil-simple"), "重命名", null, null, () => { const h2 = $(".head h2"); if (h2) inlineRename(h2, name); }),
@@ -1122,8 +1127,12 @@ async function renderGallery() {
   const hereOn = IS_WIN ? "这台电脑上" : "这台 Mac 上";
   const todo = have.filter((t) => !S.ov.agents.some((a) => a.template === t.id));
   const all = h("button", { type: "button", class: "btn pri sm", disabled: !todo.length, onclick: () => importAll(todo, all) }, todo.length ? "全部导入" : "已全部导入");
-  page.replaceChildren(h("h1", {}, "添加 Agent"),
+  // One choice for everything imported from this page (全部导入 included).
+  const sync = qqBound() ? gsec(null, null, [grow("同步到", syncSeg(syncPick(), (v) => { S.syncTo = v; }))],
+    "Discord：每个 agent 一个频道。QQ：都在 QQ 机器人的私聊里，以 @名字 开头切换 agent。导入后也能在 agent 信息里改。", "sync-pick") : null;
+  page.replaceChildren(...[h("h1", {}, "添加 Agent"),
     h("p", { class: "lead" }, have.length ? "导入后直接沿用终端里的登录和模型；点整行可以调目录和环境。" : `没在${here}上找到已安装的 agent，可以手动添加。`),
+    sync,
     have.length ? gsec(`${hereOn}检测到 ${have.length} 个`, all, have.map((t) => agentRow({ ...t, kind: "acp" }, t.found))) : null,
     gsec("更多接入方式", null, [
       agentRow({ id: "openai", name: "OpenAI 兼容模型", kind: "openai" }, "OpenRouter、DeepSeek、Ollama 等，填地址和 Key"),
@@ -1133,7 +1142,7 @@ async function renderGallery() {
     miss.length ? gsec("还没安装", null, miss.map((t) => h("div", { class: "arow" }, h("div", { class: "ahead static" }, brandIcon(t.id),
       h("div", { class: "ameta" }, h("b", {}, t.name), INSTALL[t.id] ? h("code", { class: "path" }, INSTALL[t.id]) : null),
       INSTALL[t.id] ? h("button", { type: "button", class: "tbtn", title: `复制安装命令：${INSTALL[t.id]}`, onclick: () => copy(INSTALL[t.id], `已复制：${INSTALL[t.id]}`) }, "复制安装命令") : null))),
-      "装好后会自动出现在上面。") : null);
+      "装好后会自动出现在上面。") : null].filter(Boolean));
 }
 function agentRow(t, sub) {
   const row = h("div", { class: "arow" });
@@ -1162,7 +1171,21 @@ function brandIcon(id, small = false) {
   return h("span", { class: `brand${small ? " sm" : ""}` }, ic(KIND_IC[id] ?? "robot"));
 }
 const freeName = (base) => { let name = base, i = 2; while (S.ov.agents.some((a) => a.name === name)) name = `${base}-${i++}`; return name; };
-const quickSpec = (t, name) => ({ template: t.id, name, url: null, headerName: null, headerValue: null, command: null, cwd: null, count: 1, worktree: false, conda: null });
+const quickSpec = (t, name) => ({ template: t.id, name, url: null, headerName: null, headerValue: null, command: null, cwd: null, count: 1, worktree: false, conda: null, sync: syncSpec() });
+// Where an imported agent's 1:1 chat syncs: Discord (its own channel) or QQ (the bot's private chat).
+// Offered only once a QQ bot is bound; the default is the backend's (last choice, else what is connected).
+const qqBound = () => !!S.ov?.qq_status;
+const syncPick = () => S.syncTo ?? S.ov?.sync_default ?? "discord";
+const syncSpec = () => (qqBound() ? syncPick() : null);
+// Apple-style segmented control: Discord | QQ. `onPick(v)`; returns the element.
+function syncSeg(value, onPick) {
+  const el = h("div", { class: "seg2 sync", role: "radiogroup", "aria-label": "同步到" });
+  const draw = (v) => el.replaceChildren(...[["discord", "discord-logo", "Discord"], ["qq", "chat-teardrop-dots", "QQ"]].map(([k, icon, label]) =>
+    h("button", { type: "button", role: "radio", class: v === k ? "on" : "", "aria-checked": String(v === k), "data-sync": k,
+      onclick: () => { if (k === v) return; draw(k); onPick(k); } }, ic(icon), label)));
+  draw(value);
+  return el;
+}
 // One click: import a detected agent with default settings and open its chat.
 async function quickImport(t, btn) {
   const name = freeName(t.id);
@@ -1264,7 +1287,7 @@ function agentForm(t) {
     go.disabled = true; err.textContent = "";
     try {
       const added = await invoke("add_agent", { spec: { template: t.id, name: name.value, url: url?.value ?? null, headerName: hn?.value || null, headerValue: hv?.value || null,
-        command: cmd?.value ?? null, cwd: st.cwd || null, count: st.count, worktree: st.count > 1, conda: st.conda || null, model: model?.value || null } });
+        command: cmd?.value ?? null, cwd: st.cwd || null, count: st.count, worktree: st.count > 1, conda: st.conda || null, model: model?.value || null, sync: syncSpec() } });
       if (pic) for (const n of added ?? []) await invoke("set_avatar", { agent: n, data: pic }).catch(() => {});
       await load(); setTab("chats"); openThread(`dm:${name.value.trim()}`);
     } catch (e) { err.textContent = String(e); go.disabled = false; }

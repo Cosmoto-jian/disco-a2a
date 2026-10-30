@@ -8,7 +8,7 @@
 - `手动验证` = 无法离线确定性测试（真实 Discord 网关、Tailscale、系统对话框、更新服务器），后面写手动步骤。
 - `UI` = 纯界面行为，由 ui-test/ 与 `notes/ui-feature-inventory.md` 守护，本文件只登记。
 
-v1.6.5 基线新增的 selftest 检查在下表中用 ★ 标出；v1.8.0 跨设备传文件新增的用 ◆ 标出；v1.9.0 Cloudflare 隧道新增的用 ▲ 标出；v1.10.0 QQ 官方机器人新增的用 ● 标出。
+v1.6.5 基线新增的 selftest 检查在下表中用 ★ 标出；v1.8.0 跨设备传文件新增的用 ◆ 标出；v1.9.0 Cloudflare 隧道新增的用 ▲ 标出；v1.10.0 QQ 官方机器人新增的用 ● 标出；v1.11.0 agent 私聊同步到 QQ 新增的用 ◎ 标出。
 
 ## 私聊
 
@@ -133,6 +133,15 @@ v1.6.5 基线新增的 selftest 检查在下表中用 ★ 标出；v1.8.0 跨设
 | 待处理卡片 | 需要批准/提问时，QQ 群里发带按钮的卡片；只有主人（发绑定码的人）点按钮才算，其他人点了无效 | ●ST:QQ 待处理卡片带按钮，只有本人点了才算；手动验证：真实 QQ 群里点按钮 |
 | 解绑机器人 `qq_unbind` | 断开网关、删除钥匙串里的凭据；已绑定的 QQ 群保留，重新扫码后恢复 | ●ST:QQ 解绑群和机器人, UI:Q9 |
 
+## Agent 私聊同步到 QQ（v1.11.0）
+
+| 功能 | 行为契约 | 覆盖 |
+|---|---|---|
+| 导入时选同步位置 `add_agent`（`sync`） | 绑了 QQ 机器人后，添加 Agent 页顶部有「同步到 Discord / QQ」分段选择（快速导入、全部导入、展开表单添加都用这一个选择，全部导入整批一个选择）；没绑 QQ 时不出现、`sync` 为空。默认：上次的选择（QQ 只在机器人仍绑定时），否则看连了什么，两个都连时 Discord；明确选过才记住（`sync_last`）。每个 agent 存 `sync/<名字>`；选 Discord = 以前的行为（连着 Discord 就建自己的频道）；选 QQ 不建 Discord 频道，Discord 连上/同步时也跳过它，会话里写一条用法说明；没绑 QQ 却要求 QQ 时报错 | ◎ST:QQ 私聊：导入时选 QQ，不建 Discord 频道，记住选择；Discord 的 agent 不变, ◎ST:QQ 解绑群和机器人（之后选 QQ 被拒）, UI:S0–S3 |
+| 之后改 `set_agent_sync` | agent 信息「本对话」里的「同步到」分段选择（绑了 QQ 或它已同步到 QQ 时出现）。改成 QQ：放开它的 Discord 频道（频道留在 Discord 不删，发一句说明，不再同步）；改回 Discord：重新建/找回频道。改名、删除 agent 时选择跟着走 | ◎ST:QQ 私聊：agent 发文件到私聊；改回 Discord 后不再同步, UI:S4 |
+| QQ 私聊收发 | 所有同步到 QQ 的 agent 共用机器人和主人（扫码绑定的人，`qq_owner` = 绑定结果里的 openid）的一个 C2C 私聊。agent 的回复以 `**名字**：` 发过去（失败原因也发）；主人发的消息：以 `@名字` 开头 → 给该 agent 并设为当前；否则给当前 agent（默认第一个 QQ agent）；只写 `@名字` 只切换；`/help` 列出 agent。只认主人的 openid，别人的私聊忽略（记审计）；重复投递只处理一次。被动回复：对最新消息 60 分钟内最多 5 条，带 msg_id + msg_seq，超出或被拒时改发主动消息 | ◎ST:QQ 私聊：主人的消息给当前 agent，回复带「**名字**：」、是被动回复，审批卡片也发到私聊, ◎ST:QQ 私聊：@名字 换 agent，之后的消息也给它；别人的私聊被忽略, UT:qq::picks_the_named_agent, UT:qq::codes_relays_and_reply_slots；手动验证：手机 QQ 给机器人发私聊，确认回复、@切换、主动消息额度 |
+| QQ 私聊附件 / 卡片 / 发文件 | 私聊里的图片/文件存进该 agent 的会话空间（同群文件），路径给 agent；它的待处理卡片（批准/提问）发到私聊，按钮只认主人；agent `send_file` 的文件上传到私聊（`/v2/users/{openid}/files` → msg_type 7） | ◎ST:QQ 私聊：附件存进 agent 的空间；卡片按钮只认主人, ◎ST:QQ 私聊：agent 发文件到私聊；改回 Discord 后不再同步, UT:disco-qq parses_group_messages（C2C 按钮、路径） |
+
 ## Agent 接入（ACP / OpenAI / A2A / 邀请码）
 
 | 功能 | 行为契约 | 覆盖 |
@@ -198,7 +207,7 @@ v1.6.5 基线新增的 selftest 检查在下表中用 ★ 标出；v1.8.0 跨设
 
 侧栏标签与快捷键、列表搜索与折叠、聊天头部（头像上传裁剪、双击改名、模型胶囊、记忆/待办/信息按钮）、Inspector（成员/待办/文档/黑板）、@ 与 / 选择器、团队开关、通知卡片、撤销提示、更新条、首次运行导入、Windows/macOS 外观差异。完整清单与验证见 `notes/ui-feature-inventory.md`（项目笔记，64 项）。
 
-## Tauri 命令覆盖总表（invoke_handler 共 64 个）
+## Tauri 命令覆盖总表（invoke_handler 共 65 个）
 
 | 命令 | 覆盖 |
 |---|---|
@@ -231,6 +240,7 @@ v1.6.5 基线新增的 selftest 检查在下表中用 ★ 标出；v1.8.0 跨设
 | create_share, revoke_share, accept_invite | ST:共享 邀请码接入后能聊, ST:共享 撤销后被拒, ▲ST:隧道 邀请过期即拒（`days`） |
 | tunnel_status, tunnel_install, tunnel_login, tunnel_setup, tunnel_set | ▲ST:隧道 邀请码带 Access 令牌，设置往返；安装/登录/建隧道手动验证（真实 Cloudflare 账号） |
 | qq_status, qq_bind, qq_bind_cancel, qq_unbind, qq_group_code | ●ST:QQ 扫码绑定…, ●ST:QQ 绑定码把 QQ 群连上…, ●ST:QQ 解绑群和机器人；真实扫码与 QQ 群手动验证 |
+| set_agent_sync | ◎ST:QQ 私聊：agent 发文件到私聊；改回 Discord 后不再同步, UI:S4 |
 
 ## 维护规则
 
