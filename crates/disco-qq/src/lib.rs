@@ -96,14 +96,23 @@ pub async fn bind_poll(http: &reqwest::Client, host: Option<&str>, bind: &Bind) 
 pub fn decrypt(enc_b64: &str, key_b64: &str) -> Result<String, String> {
     use ring::aead::{AES_256_GCM, Aad, LessSafeKey, Nonce, UnboundKey};
     let bad = || "AppSecret 解密失败".to_owned();
-    let key = b64().decode(key_b64).map_err(|_| bad())?;
-    let data = b64().decode(enc_b64).map_err(|_| bad())?;
+    let key = b64_any(key_b64).ok_or_else(bad)?;
+    let data = b64_any(enc_b64).ok_or_else(bad)?;
     if data.len() < 12 + 16 { return Err(bad()); }
     let key = LessSafeKey::new(UnboundKey::new(&AES_256_GCM, &key).map_err(|_| bad())?);
     let nonce = Nonce::try_assume_unique_for_key(&data[..12]).map_err(|_| bad())?;
     let mut buf = data[12..].to_vec();
     let plain = key.open_in_place(nonce, Aad::empty(), &mut buf).map_err(|_| bad())?;
     String::from_utf8(plain.to_vec()).map_err(|_| bad())
+}
+
+/// Base64 as leniently as Node's `Buffer.from(s, "base64")` (what the official connector
+/// uses): standard or URL-safe alphabet, padding optional, whitespace ignored.
+fn b64_any(s: &str) -> Option<Vec<u8>> {
+    use base64::engine::general_purpose::{STANDARD_NO_PAD, URL_SAFE_NO_PAD};
+    let t: String = s.chars().filter(|c| !c.is_whitespace()).collect();
+    let t = t.trim_end_matches('=');
+    STANDARD_NO_PAD.decode(t).or_else(|_| URL_SAFE_NO_PAD.decode(t)).ok()
 }
 
 /// The other half of [`decrypt`], as q.qq.com does it (for mock servers in tests).
@@ -715,6 +724,9 @@ mod tests {
         assert_eq!(decrypt(&enc, &b64().encode(key)).unwrap(), "s3cretAppSecret");
         assert!(decrypt(&enc, &b64().encode([8u8; 32])).is_err());
         assert!(decrypt("AAAA", &b64().encode(key)).is_err());
+        // Whatever base64 flavour comes back (Node decodes all of them).
+        let url = enc.replace('+', "-").replace('/', "_").trim_end_matches('=').to_owned();
+        assert_eq!(decrypt(&format!("{url}\n"), &b64().encode(key)).unwrap(), "s3cretAppSecret");
     }
 
     #[test]
