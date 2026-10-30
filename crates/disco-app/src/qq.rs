@@ -17,7 +17,7 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use disco_qq::{Bind, BindState, Creds, Endpoints, Incoming, Kind, Rest, To};
+use disco_qq::{Bind, BindState, Creds, Endpoints, Incoming, Kind, Rest, Status, To};
 use serde::Serialize;
 use tauri::Emitter;
 use tokio::sync::{mpsc, watch};
@@ -62,15 +62,66 @@ static REPLY: Mutex<Option<Replies>> = Mutex::new(None);
 static SEEN: Mutex<VecDeque<String>> = Mutex::new(VecDeque::new());
 /// Test endpoints (selftest only): API + token, and the bind host.
 static AT: Mutex<Option<(Endpoints, String)>> = Mutex::new(None);
+/// What the connection has been doing, for Settings → QQ and the diagnostics.
+static DIAG: Mutex<Diag> = Mutex::new(Diag::new());
+/// Private-chat senders already told they are not the owner (told once per launch).
+static TOLD: Mutex<Vec<String>> = Mutex::new(Vec::new());
+/// The bot's name as READY gave it.
+static READY_NAME: Mutex<Option<String>> = Mutex::new(None);
+
+/// The QQ connection's recent history (times are Unix milliseconds, 0 = never).
+#[derive(Clone, Serialize, Default)]
+pub struct Diag {
+    /// 取 token / 取网关地址 / 连网关 / 鉴权 / 在线 / 重试中 / 已停止 / 已断开 (empty = not started).
+    stage: String,
+    /// READY (or RESUMED) and not lost since.
+    ready: bool,
+    /// The gateway is reached through the system proxy.
+    proxy: bool,
+    ready_at: u64,
+    /// The last thing that went wrong on the connection.
+    error: String,
+    error_at: u64,
+    /// The last gateway event of any kind, and how many came since launch.
+    event: String,
+    event_at: u64,
+    events: u64,
+    /// The last message that could not be sent to QQ.
+    send_error: String,
+    send_error_at: u64,
+    /// Someone other than the owner wrote to the bot privately (the tail of their openid).
+    stranger: String,
+}
+
+impl Diag {
+    const fn new() -> Self {
+        Self { stage: String::new(), ready: false, proxy: false, ready_at: 0, error: String::new(), error_at: 0, event: String::new(), event_at: 0, events: 0,
+            send_error: String::new(), send_error_at: 0, stranger: String::new() }
+    }
+}
+
+fn now_ms() -> u64 { std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64) }
+
+fn tail(id: &str) -> String { id.chars().rev().take(6).collect::<Vec<_>>().into_iter().rev().collect() }
+
+/// A message could not be sent to QQ: keep the reason for the status page.
+fn note_send_error(e: &str) {
+    let mut d = lock(&DIAG);
+    d.send_error = e.to_owned();
+    d.send_error_at = now_ms();
+}
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> { m.lock().unwrap_or_else(|p| p.into_inner()) }
 
 #[cfg(debug_assertions)]
 pub(crate) fn use_endpoints(api: &str, bind_host: &str) {
-    *lock(&AT) = Some((Endpoints { api: api.into(), token: format!("{api}/app/getAppAccessToken") }, bind_host.into()));
+    *lock(&AT) = Some((Endpoints { api: api.into(), token: format!("{api}/app/getAppAccessToken"), proxy: None }, bind_host.into()));
 }
 
-fn endpoints() -> Endpoints { lock(&AT).as_ref().map(|a| a.0.clone()).unwrap_or_default() }
+/// The real platform (with the system proxy as the fallback route), or the selftest mock.
+fn endpoints() -> Endpoints {
+    lock(&AT).as_ref().map(|a| a.0.clone()).unwrap_or_else(|| Endpoints { proxy: disco_discord::proxy_url(), ..Endpoints::default() })
+}
 fn bind_host() -> Option<String> { lock(&AT).as_ref().map(|a| a.1.clone()) }
 
 pub(crate) fn rest() -> Option<Rest> { lock(&CONN).as_ref().map(|c| c.rest.clone()) }
@@ -168,34 +219,37 @@ fn reply_slot(to: &To, n: u32) -> Option<(String, u32)> {
     Some((e.0.clone(), seq))
 }
 
-/// Send with a passive reply when one is left; in a private chat a refused passive reply
-/// (the message got too old on QQ's clock) is sent again as an active message.
+/// Send with a passive reply when one is left; a refused passive reply (the message got
+/// too old on QQ's clock, or its replies are used up) is sent again as an active
+/// message. A failure is kept for Settings → QQ and the diagnostics.
 async fn deliver<F, Fut>(to: &To, n: u32, send: F) -> Result<(), String>
-where F: Fn(Option<(String, u32)>) -> Fut, Fut: std::future::Future<Output = Result<u32, String>> {
-    let slot = reply_slot(to, n);
+where F: Fn(Option<String>) -> Fut, Fut: std::future::Future<Output = Result<(), String>> {
+    let slot = reply_slot(to, n).map(|s| s.0);
     let passive = slot.is_some();
-    match send(slot).await {
-        Err(_) if passive && matches!(to, To::User(_)) => send(None).await.map(|_| ()),
-        r => r.map(|_| ()),
-    }
+    let r = match send(slot).await {
+        Err(e) if passive => send(None).await.map_err(|e2| format!("{e2}（被动回复：{e}）")),
+        r => r,
+    };
+    if let Err(e) = &r { note_send_error(e); }
+    r
 }
 
 /// Post as `**who**：text` (or just `text` when `who` is empty).
 pub(crate) async fn post(rest: &Rest, to: &To, who: &str, text: &str) -> Result<(), String> {
     let body = if who.is_empty() { text.to_owned() } else { format!("**{who}**：{text}") };
     let n = disco_qq::chunk(&body).len() as u32;
-    deliver(to, n, |slot| { let body = &body; async move { rest.send(to, body, slot.as_ref().map(|(id, s)| (id.as_str(), *s)), &[]).await } }).await
+    deliver(to, n, |slot| { let body = &body; async move { rest.send(to, body, slot.as_deref(), &[]).await } }).await
 }
 
 /// A file.
 pub(crate) async fn post_file(rest: &Rest, to: &To, name: &str, bytes: &[u8]) -> Result<(), String> {
-    deliver(to, 1, |slot| async move { rest.send_file(to, name, bytes, slot.as_ref().map(|(id, s)| (id.as_str(), *s))).await }).await
+    deliver(to, 1, |slot| async move { rest.send_file(to, name, bytes, slot.as_deref()).await }).await
 }
 
 /// A card with buttons (an inbox item).
 pub(crate) async fn post_card(rest: &Rest, to: &To, text: &str, buttons: &[disco_qq::Button]) -> Result<(), String> {
     let n = disco_qq::chunk(text).len() as u32;
-    deliver(to, n, |slot| async move { rest.send(to, text, slot.as_ref().map(|(id, s)| (id.as_str(), *s)), buttons).await }).await
+    deliver(to, n, |slot| async move { rest.send(to, text, slot.as_deref(), buttons).await }).await
 }
 
 /// `@name rest` naming one of `agents` (the longest that fits; ASCII case ignored) → (agent, rest).
@@ -213,6 +267,54 @@ fn set_status(core: &Core, s: String) {
     let _ = core.app.emit("qq", s);
 }
 
+/// One step of the gateway client: the status line, the diagnostics, the audit log.
+fn on_gateway(core: &Core, s: Status) {
+    let now = now_ms();
+    let mut audit = None;
+    let mut fresh_name = None;
+    let line = {
+        let mut d = lock(&DIAG);
+        match s {
+            Status::Event(t) => { d.event = t; d.event_at = now; d.events += 1; return; }
+            Status::Step(step) => { d.stage = step.into(); d.ready = false; format!("连接中：{step}…") }
+            Status::Ready(name, proxy) => {
+                d.stage = "在线".into();
+                d.ready = true;
+                d.proxy = proxy;
+                d.ready_at = now;
+                audit = Some(("qq.ready", if proxy { "READY（经系统代理）" } else { "READY" }.to_owned()));
+                let mut known = lock(&READY_NAME);
+                if let Some(n) = name.filter(|n| !n.is_empty()) { *known = Some(n.clone()); fresh_name = Some(n); }
+                format!("在线 · {}", known.clone().unwrap_or_else(|| "QQ 机器人".into()))
+            }
+            Status::Retry(e, secs) => {
+                d.stage = "重试中".into();
+                d.ready = false;
+                if d.error != e { audit = Some(("qq.error", e.clone())); }
+                d.error = e.clone();
+                d.error_at = now;
+                format!("{e}，{secs} 秒后重试")
+            }
+            Status::Fatal(e) => {
+                d.stage = "已停止".into();
+                d.ready = false;
+                audit = Some(("qq.error", e.clone()));
+                d.error = e.clone();
+                d.error_at = now;
+                format!("已停止：{e}")
+            }
+            Status::Stopped => { d.stage = "已断开".into(); d.ready = false; "已断开".into() }
+        }
+    };
+    if let Some((action, detail)) = audit { let _ = core.db().audit("qq", None, action, &detail); }
+    // The bot's name from READY (binding may not have been able to read it). One db() per statement.
+    if let Some(n) = fresh_name {
+        let saved = core.db().setting(SET_NAME);
+        if saved.is_some_and(|s| !s.is_empty() && s != n) { let _ = core.db().set_setting(SET_NAME, &n); }
+    }
+    set_status(core, line);
+}
+
 /// Connect the bound bot's gateway (again); called at launch and after binding.
 pub(crate) fn connect(core: &Arc<Core>) {
     if core.db().setting(SET_ON).as_deref() != Some("1") { return; }
@@ -225,7 +327,7 @@ pub(crate) fn connect(core: &Arc<Core>) {
     if let Some(old) = lock(&CONN).replace(Conn { rest: rest.clone(), stop: stop_tx }) { let _ = old.stop.send(true); }
     let (tx, mut rx) = mpsc::channel::<Incoming>(64);
     let c = core.clone();
-    tauri::async_runtime::spawn(disco_qq::run_gateway(rest, tx, stop_rx, move |s| set_status(&c, s)));
+    tauri::async_runtime::spawn(disco_qq::run_gateway(rest, tx, stop_rx, move |s| on_gateway(&c, s)));
     let c = core.clone();
     tauri::async_runtime::spawn(async move { while let Some(m) = rx.recv().await { c.on_qq(m); } });
 }
@@ -284,7 +386,7 @@ impl Core {
             let found = {
                 let mut codes = lock(&CODES);
                 codes.retain(|c| c.2.elapsed() < CODE_TTL);
-                codes.iter().position(|c| c.0 == code).map(|i| codes.remove(i).1)
+                codes.iter().position(|c| c.0 == code && !c.1.is_empty()).map(|i| codes.remove(i).1)
             };
             let Some(gid) = found else { return };
             let name = self.db().list_groups().ok().and_then(|gs| gs.into_iter().find(|g| g.id == gid)).map(|g| g.name).unwrap_or_default();
@@ -329,15 +431,35 @@ impl Core {
     /// The owner's message in the bot's private chat: to the agent it names (`@name …`,
     /// which becomes the current one) or the current one. Anyone else is ignored.
     async fn qq_direct(self: &Arc<Self>, m: Incoming) {
+        let to = To::User(m.author_id.clone());
+        // Every private message opens a passive-reply window, the owner's or not.
+        lock(&REPLY).get_or_insert_with(HashMap::new).insert(to.clone(), (m.id.clone(), Instant::now(), 1));
+        let say = |text: String| { let to = to.clone(); async move { if let Some(r) = rest() { let _ = post(&r, &to, "", &text).await; } } };
         let me = owner(self);
-        if me.as_deref() != Some(m.author_id.as_str()) {
+        // `绑定 1234` with the code from Settings → QQ「认领私聊」: this sender is the owner.
+        let claimed = bind_code(&m.content).is_some_and(|code| {
+            let mut codes = lock(&CODES);
+            codes.retain(|c| c.2.elapsed() < CODE_TTL);
+            codes.iter().position(|c| c.0 == code && c.1.is_empty()).map(|i| codes.remove(i)).is_some()
+        });
+        if claimed || me.is_none() {
+            // The scan did not say who scanned (or the owner re-claims): this sender is the owner.
+            let _ = self.db().set_setting(OWNER, &m.author_id);
+            let _ = self.db().audit(&format!("qq:{}", m.author_id), None, "qq.owner", if claimed { "claimed with a code" } else { "first private message after binding" });
+            lock(&DIAG).stranger.clear();
+            self.agents_changed();
+            if claimed {
+                say("好了，这个私聊现在连着你的 Disco。发 /help 看有哪些 agent。".into()).await;
+                return;
+            }
+        } else if me.as_deref() != Some(m.author_id.as_str()) {
             let _ = self.db().audit(&format!("qq:{}", m.author_id), None, "qq.ignored", "private message from someone other than the owner");
+            lock(&DIAG).stranger = tail(&m.author_id);
+            let first = { let mut t = lock(&TOLD); let f = !t.contains(&m.author_id); if f { t.push(m.author_id.clone()); } f };
+            if first { say("这个机器人连着别人的 Disco，只接主人的私聊。如果你就是主人：在 Disco 设置 → QQ 点「认领私聊」，把显示的「绑定 1234」发给我。".into()).await; }
             return;
         }
-        let to = To::User(m.author_id.clone());
-        lock(&REPLY).get_or_insert_with(HashMap::new).insert(to.clone(), (m.id.clone(), Instant::now(), 1));
         let agents = qq_agents(self);
-        let say = |text: String| { let to = to.clone(); async move { if let Some(r) = rest() { let _ = post(&r, &to, "", &text).await; } } };
         if agents.is_empty() {
             say("还没有同步到 QQ 的 agent。在 Disco 里导入 agent 时选「同步到 QQ」，或在 agent 的信息里改成 QQ。".into()).await;
             return;
@@ -401,6 +523,11 @@ pub struct QqStatus {
     /// While binding: the QR code (SVG) and the page it encodes.
     qr: Option<String>,
     url: Option<String>,
+    /// The bot's private chat knows who its owner is.
+    owner: bool,
+    /// QQ groups tied to Disco groups.
+    groups: usize,
+    diag: Diag,
 }
 
 fn status(core: &Core) -> QqStatus {
@@ -408,8 +535,11 @@ fn status(core: &Core) -> QqStatus {
     // One db() lock per statement: two in one struct literal would deadlock.
     let bound = core.db().setting(SET_ON).as_deref() == Some("1");
     let name = core.db().setting(SET_NAME).unwrap_or_default();
+    let owner = owner(core).is_some();
+    let groups = core.db().settings_with_prefix(GROUP).map(|v| v.iter().filter(|(_, g)| !g.is_empty()).count()).unwrap_or(0);
     let status = lock(&STATUS).clone();
-    QqStatus { bound, status, name, url: qr.as_ref().map(|q| q.1.clone()), qr: qr.map(|q| q.0) }
+    let diag = lock(&DIAG).clone();
+    QqStatus { bound, status, name, url: qr.as_ref().map(|q| q.1.clone()), qr: qr.map(|q| q.0), owner, groups, diag }
 }
 
 /// For the overview: "" when no bot is bound.
@@ -467,7 +597,10 @@ pub async fn qq_bind(core: St<'_>) -> CmdResult<QqStatus> {
 
 /// Check the scanned bot works, then keep it (keychain) and its name.
 async fn save_bot(core: &Core, creds: Creds, owner: Option<String>) -> Result<(), String> {
-    let name = Rest::new(creds.clone(), endpoints()).me().await?;
+    // The credentials must give a token; the name is a nicety (READY also carries it).
+    let rest = Rest::new(creds.clone(), endpoints());
+    rest.token().await.map_err(|e| format!("扫码拿到的机器人用不了：{e}"))?;
+    let name = rest.me().await.unwrap_or_else(|_| "QQ 机器人".into());
     secret_set(VAULT, &serde_json::to_string(&creds).map_err(err)?)?;
     core.db().set_setting(SET_NAME, &name).map_err(err)?;
     core.db().set_setting(OWNER, owner.as_deref().unwrap_or_default()).map_err(err)?;
@@ -490,6 +623,8 @@ pub fn qq_unbind(core: St<'_>) -> CmdResult<QqStatus> {
     core.db().set_setting(SET_NAME, "").map_err(err)?;
     core.db().set_setting(OWNER, "").map_err(err)?;
     *lock(&STATUS) = String::new();
+    *lock(&DIAG) = Diag::default();
+    *lock(&READY_NAME) = None;
     core.agents_changed();
     Ok(status(&core))
 }
@@ -517,6 +652,82 @@ pub fn qq_group_code(core: St<'_>, group: String, unbind: Option<bool>) -> CmdRe
     };
     core.post_message(&format!("group:{group}"), "system", &format!("把 QQ 机器人拉进你的 QQ 群，在群里 @机器人 发送：绑定 {code}\n（10 分钟内有效；发送的人会被当作你本人）"));
     Ok(code)
+}
+
+/// A 4-digit code that makes whoever sends `绑定 <code>` to the bot privately its owner
+/// (for when the scan did not say who scanned, or the owner's QQ changed).
+#[tauri::command]
+pub fn qq_claim_code(core: St<'_>) -> CmdResult<String> {
+    if !bound(&core) { return Err("先在设置里扫码接入 QQ 机器人".into()); }
+    let mut codes = lock(&CODES);
+    codes.retain(|c| c.2.elapsed() < CODE_TTL && !c.1.is_empty());
+    let mut n = (uuid::Uuid::new_v4().as_u128() % 9000 + 1000) as u32;
+    while codes.iter().any(|c| c.0 == n.to_string()) { n = n % 9000 + 1000 + 1; }
+    codes.push((n.to_string(), String::new(), Instant::now()));
+    Ok(n.to_string())
+}
+
+/// Drop the connection and connect again (fresh token, fresh session).
+#[tauri::command]
+pub fn qq_reconnect(core: St<'_>) -> CmdResult<QqStatus> {
+    if !bound(&core) { return Err("先在设置里扫码接入 QQ 机器人".into()); }
+    connect(core.inner());
+    Ok(status(&core))
+}
+
+/// Why messages of `thread` cannot reach QQ although it is meant to sync there (None = fine).
+pub(crate) fn blocked(core: &Core, thread: &str) -> Option<String> {
+    let agent = thread.strip_prefix("dm:")?;
+    if agent_sync(core, agent) != "qq" { return None; }
+    if rest().is_none() { return Some("QQ 机器人没有连上，回复没发到 QQ：到设置 → QQ 看状态，或点「一键诊断」。".into()); }
+    if owner(core).is_none() { return Some("还不知道你的 QQ，回复没发到 QQ：用手机 QQ 给机器人发一条私聊（第一个私聊的人会被认作你本人）。".into()); }
+    None
+}
+
+fn ago(ms: u64) -> String {
+    let s = now_ms().saturating_sub(ms) / 1000;
+    if s < 60 { format!("{s} 秒前") } else if s < 3600 { format!("{} 分钟前", s / 60) } else { format!("{} 小时前", s / 3600) }
+}
+
+/// Settings → 一键诊断: the QQ rows (none when no bot is bound).
+pub(crate) async fn diagnose(core: &Core) -> Vec<(String, Result<String, String>)> {
+    let mut out = Vec::new();
+    if !bound(core) { return out; }
+    let creds = secret_get(VAULT).and_then(|j| serde_json::from_str::<Creds>(&j).ok());
+    let Some(creds) = creds else {
+        out.push(("QQ 机器人凭据".into(), Err("钥匙串里读不到：请到设置 → QQ 解绑后重新扫码".into())));
+        return out;
+    };
+    out.push(("QQ 机器人凭据".into(), Ok(format!("AppID {}", creds.app_id))));
+    let rest = Rest::new(creds, endpoints());
+    let token = rest.token().await;
+    out.push(("QQ access_token".into(), token.as_ref().map(|_| if rest.via_proxy() { "可以取到（经系统代理）".to_owned() } else { "可以取到".to_owned() }).map_err(Clone::clone)));
+    let d = lock(&DIAG).clone();
+    let live = if d.ready {
+        Ok(format!("在线，{}连上{}", ago(d.ready_at), if d.proxy { "（经系统代理）" } else { "" }))
+    } else if token.is_ok() {
+        // The running connection is down: a separate one to READY shows where it stops.
+        match disco_qq::gateway_check(&rest, Duration::from_secs(15)).await {
+            Ok((name, took, proxy)) => Ok(format!("单独测试连上了（{name}，{} ms{}）；后台连接现在是「{}」{}", took.as_millis(), if proxy { "，经系统代理" } else { "" },
+                if d.stage.is_empty() { "未启动" } else { d.stage.as_str() }, if d.error.is_empty() { String::new() } else { format!("，上次错误：{}", d.error) })),
+            Err(e) => Err(format!("{e}{}", if d.error.is_empty() || d.error == e { String::new() } else { format!("（后台连接上次错误：{}）", d.error) })),
+        }
+    } else {
+        Err(format!("没有 access_token，连不了网关{}", if d.error.is_empty() { String::new() } else { format!("（{}）", d.error) }))
+    };
+    out.push(("QQ 实时连接".into(), live));
+    out.push(("QQ 收到的事件".into(), if d.events > 0 { Ok(format!("共 {} 个，最近 {}（{}）", d.events, d.event, ago(d.event_at))) }
+        else { Err("这次启动后还没收到任何 QQ 事件：QQ 群里要 @机器人 才会推送；私聊直接发给机器人".into()) }));
+    let own = owner(core);
+    out.push(("QQ 私聊主人".into(), match (own, d.stranger.is_empty()) {
+        (Some(o), true) => Ok(format!("已认定（openid …{}）", tail(&o))),
+        (Some(o), false) => Err(format!("收到 …{} 的私聊，但主人是 …{}：如果那就是你，在设置 → QQ 点「认领私聊」", d.stranger, tail(&o))),
+        (None, _) => Err("还不知道你的 QQ：用手机 QQ 给机器人发一条私聊".into()),
+    }));
+    out.push(("QQ 发送".into(), if d.send_error.is_empty() { Ok("没有失败记录".into()) } else { Err(format!("{}：{}", ago(d.send_error_at), d.send_error)) }));
+    let summary: Vec<String> = out.iter().map(|(n, r)| format!("{n}={}", if r.is_ok() { "ok" } else { "fail" })).collect();
+    let _ = core.db().audit("qq", None, "qq.diagnose", &summary.join(" "));
+    out
 }
 
 #[cfg(test)]

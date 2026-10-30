@@ -41,7 +41,8 @@
     discord_status: "在线 · MyBot#0001",
     qq_status: "",
     // QQ bot: not bound; `qq_bind` shows a QR code, `STUB.qq_scan()` simulates the scan in mobile QQ.
-    qq: { bound: false, status: "", name: "", qr: null, url: null },
+    qq: { bound: false, status: "", name: "", qr: null, url: null, owner: false, groups: 0,
+      diag: { stage: "", ready: false, proxy: false, ready_at: 0, error: "", error_at: 0, event: "", event_at: 0, events: 0, send_error: "", send_error_at: 0, stranger: "" } },
     qq_codes: [],
     // Where new agents' 1:1 chats sync (backend: last choice, else what is connected, Discord if both).
     sync_last: null,
@@ -157,7 +158,9 @@
     qq_status: () => clone(STUB.qq),
     qq_bind: () => { STUB.qq.qr = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 21 21"><rect width="21" height="21" fill="#fff"/><path d="M1 1h7v7H1z" fill="#000"/></svg>'; STUB.qq.url = "https://q.qq.com/qqbot/openclaw/connect.html?task_id=T1"; STUB.qq.status = ""; return clone(STUB.qq); },
     qq_bind_cancel: () => { STUB.qq.qr = null; STUB.qq.url = null; return clone(STUB.qq); },
-    qq_unbind: () => { Object.assign(STUB.qq, { bound: false, status: "", name: "" }); STUB.qq_status = ""; return clone(STUB.qq); },
+    qq_unbind: () => { Object.assign(STUB.qq, { bound: false, status: "", name: "", owner: false }); STUB.qq_status = ""; return clone(STUB.qq); },
+    qq_claim_code: () => { if (!STUB.qq.bound) throw "先在设置里扫码接入 QQ 机器人"; return "4321"; },
+    qq_reconnect: () => { if (!STUB.qq.bound) throw "先在设置里扫码接入 QQ 机器人"; STUB.qq.status = "连接中：取 token…"; return clone(STUB.qq); },
     qq_group_code: (a) => {
       const g = STUB.groups.find((x) => x.id === a.group); if (!g) throw "没有这个群聊";
       if (a.unbind) { g.qq = false; return ""; }
@@ -183,7 +186,7 @@
     open_url: () => null,
   };
   // The user scanned and confirmed in mobile QQ: the bot is saved and connects.
-  STUB.qq_scan = () => { Object.assign(STUB.qq, { bound: true, qr: null, url: null, name: "DiscoBot", status: "在线 · DiscoBot" }); STUB.qq_status = "在线 · DiscoBot"; };
+  STUB.qq_scan = () => { Object.assign(STUB.qq, { bound: true, qr: null, url: null, name: "DiscoBot", status: "在线 · DiscoBot", owner: true }); Object.assign(STUB.qq.diag, { stage: "在线", ready: true, ready_at: Date.now() }); STUB.qq_status = "在线 · DiscoBot"; };
   window.STUB = STUB; window.CALLS = []; window.UNKNOWN = []; window.STUB_FAIL = {};
   window.__TAURI__ = {
     core: { invoke: async (c, a) => {

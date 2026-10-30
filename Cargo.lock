@@ -1065,6 +1065,7 @@ dependencies = [
  "tauri-build",
  "tauri-plugin-updater",
  "tokio",
+ "tokio-tungstenite",
  "uuid",
 ]
 
@@ -1090,6 +1091,7 @@ dependencies = [
  "qrcode",
  "reqwest",
  "ring",
+ "rustls",
  "serde",
  "serde_json",
  "tokio",

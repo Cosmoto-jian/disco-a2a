@@ -1612,12 +1612,25 @@ async function loadQQ(sec, q) {
     if (q.status) rows.push(grow("上次结果", h("span", { class: "val err", title: q.status }, q.status)));
   } else {
     const online = /^在线/.test(q.status || "");
-    rows.push(grow("状态", h("span", { id: "qq-status", class: `status${online ? " ok" : ""}` }, h("i"), q.status || "连接中…")));
+    const d = q.diag || {};
+    const ago = (ms) => { const s = Math.max(0, Math.round((Date.now() - ms) / 1000)); return s < 60 ? `${s} 秒前` : s < 3600 ? `${Math.floor(s / 60)} 分钟前` : `${Math.floor(s / 3600)} 小时前`; };
+    rows.push(grow("状态", h("span", { id: "qq-status", class: `status${online ? " ok" : ""}` }, h("i"), q.status || "连接中…"),
+      h("button", { type: "button", class: "btn sm", title: "断开后重新取 token、连网关", onclick: () => redo(invoke("qq_reconnect")) }, "重新连接")));
     rows.push(grow("机器人", h("span", { class: "val" }, q.name || "QQ 机器人")));
+    // What the connection has actually seen: the first place to look when messages do not get through.
+    rows.push(grow("最近收到", h("span", { id: "qq-event", class: "val" }, d.events ? `${d.event} · ${ago(d.event_at)}（共 ${d.events} 个）` : "这次启动后还没收到 QQ 消息")));
+    if (d.error) rows.push(grow("最近错误", h("span", { id: "qq-error", class: "val err", title: d.error }, `${d.error} · ${ago(d.error_at)}`)));
+    if (d.send_error) rows.push(grow("发送失败", h("span", { id: "qq-send-error", class: "val err", title: d.send_error }, `${d.send_error} · ${ago(d.send_error_at)}`)));
+    const claim = h("button", { type: "button", class: "btn sm" }, "认领私聊");
+    claim.onclick = async () => {
+      try { const code = await invoke("qq_claim_code"); toast(`用手机 QQ 给机器人私聊发送：绑定 ${code}（10 分钟内有效）`, 12000); } catch (e) { toast(e); }
+    };
+    rows.push(grow("私聊", h("span", { id: "qq-owner", class: `val${q.owner && !d.stranger ? "" : " err"}` },
+      d.stranger ? `收到 …${d.stranger} 的私聊，但不是已认定的你` : q.owner ? "已认定你的 QQ" : "给机器人发一条私聊，就会认定是你"), claim));
     rows.push(grow("解绑", h("button", { type: "button", class: "btn sm danger", onclick: async () => {
       if (await ask("解绑 QQ 机器人？已连上的 QQ 群会停止同步，重新扫码接入后自动恢复。", "解绑")) { await redo(invoke("qq_unbind")); S.ov.qq_status = ""; renderList(); }
     } }, "解绑")));
-    foot = "把机器人拉进 QQ 群，再到 群聊 → 新建群聊 打开「同步到 QQ 群」，按提示在群里发绑定码。QQ 群里 @机器人 说话，写 @agent 名字可以点名；没点名就交给组长。";
+    foot = "把机器人拉进 QQ 群，再到 群聊 → 新建群聊 打开「同步到 QQ 群」，按提示在群里发绑定码。QQ 群里要 @机器人 说话（QQ 只把 @机器人 的消息推给 Disco），写 @agent 名字可以点名；没点名就交给组长。消息过不去时点 通用与更新 → 一键诊断，看「QQ 实时连接」那几行。";
   }
   sec.replaceChildren(head, h("div", { class: "glist" }, ...rows), h("p", { class: "foot" }, foot));
 }

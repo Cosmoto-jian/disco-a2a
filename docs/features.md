@@ -8,7 +8,7 @@
 - `手动验证` = 无法离线确定性测试（真实 Discord 网关、Tailscale、系统对话框、更新服务器），后面写手动步骤。
 - `UI` = 纯界面行为，由 ui-test/ 与 `notes/ui-feature-inventory.md` 守护，本文件只登记。
 
-v1.6.5 基线新增的 selftest 检查在下表中用 ★ 标出；v1.8.0 跨设备传文件新增的用 ◆ 标出；v1.9.0 Cloudflare 隧道新增的用 ▲ 标出；v1.10.0 QQ 官方机器人新增的用 ● 标出；v1.11.0 agent 私聊同步到 QQ 新增的用 ◎ 标出。
+v1.6.5 基线新增的 selftest 检查在下表中用 ★ 标出；v1.8.0 跨设备传文件新增的用 ◆ 标出；v1.9.0 Cloudflare 隧道新增的用 ▲ 标出；v1.10.0 QQ 官方机器人新增的用 ● 标出；v1.11.0 agent 私聊同步到 QQ 新增的用 ◎ 标出；v1.11.1 QQ 连接修复新增的用 ✚ 标出。
 
 ## 私聊
 
@@ -126,12 +126,16 @@ v1.6.5 基线新增的 selftest 检查在下表中用 ★ 标出；v1.8.0 跨设
 
 | 功能 | 行为契约 | 覆盖 |
 |---|---|---|
-| 扫码接入 `qq_status` `qq_bind` `qq_bind_cancel` | 设置 → QQ 只有一个「扫码接入」：Disco 向 q.qq.com 建绑定任务（随机 32 字节 key），在 app 里显示二维码；手机 QQ 扫一次、选择或新建机器人并确认后，AppID 和 AES-256-GCM 加密的 AppSecret 回来，本机解密、用 `/users/@me` 验证后存进钥匙串/凭据管理器并连网关；二维码过期自动换新的；任何地方都没有粘贴 AppID / AppSecret 的输入框 | ●ST:QQ 扫码绑定：显示二维码，扫码确认后保存机器人, UT:disco-qq（解密、分段、事件解析）, UI:Q1–Q4；手动验证：mac / Windows 各一台，设置 → QQ → 扫码接入，用手机 QQ 扫码确认，状态变「在线 · 机器人名」 |
+| 扫码接入 `qq_status` `qq_bind` `qq_bind_cancel` | 设置 → QQ 只有一个「扫码接入」：Disco 向 q.qq.com 建绑定任务（随机 32 字节 key），在 app 里显示二维码；手机 QQ 扫一次、选择或新建机器人并确认后，AppID 和 AES-256-GCM 加密的 AppSecret 回来，本机解密（IV 12 字节 + 密文 + tag 16 字节，标准 base64，同 `@tencent-connect/qqbot-connector`），先用 AppID/AppSecret 取 access_token 验证（取不到就报错、不保存；`/users/@me` 只用来读名字，失败不算错，READY 里的名字会补上），存进钥匙串/凭据管理器并连网关；二维码过期自动换新的；任何地方都没有粘贴 AppID / AppSecret 的输入框 | ●ST:QQ 扫码绑定：显示二维码，扫码确认后保存机器人, UT:disco-qq（解密、分段、事件解析）, UI:Q1–Q4；手动验证：mac / Windows 各一台，设置 → QQ → 扫码接入，用手机 QQ 扫码确认，状态变「在线 · 机器人名」 |
 | QQ 群绑定 `qq_group_code` | 新建群聊时打开「同步到 QQ 群」（群保持本地，不建 Discord 频道），或在已有本地群的群设置里「获取绑定码」：4 位码 10 分钟有效，同时写进会话；在 QQ 群里 @机器人 发「绑定 1234」即连上，发码的人被认作主人本人；Discord 群聊不能再绑 QQ；可断开 | ●ST:QQ 绑定码把 QQ 群连上，发码的人算本人, ●ST:QQ 解绑群和机器人, UI:Q5–Q8；手动验证：把机器人拉进真实 QQ 群，发绑定码，会话出现「已和 QQ 群连上」 |
 | QQ 群收发 | QQ 群里 @机器人 没点名 → 组长；写 @agent 名字点名；其他人记为「名字 (QQ)」；本地和 agent 的消息以 `**名字**：内容` 发到 QQ 群（5 分钟内对最新消息被动回复、最多 5 条，超出走主动消息）；图片/文件附件存进群共享空间并把路径给 agent；agent `send_file` 的文件也发到 QQ 群；重复投递的消息只处理一次；Discord 群聊的行为不变 | ●ST:QQ @机器人 交给组长；回复是对那条消息的被动回复，带名字前缀, ●ST:QQ 群里其他人 @agent：提及改写、附件存进共享空间、名字带 (QQ), ●ST:QQ agent 发文件到 QQ 群，Discord 群聊路径不变 |
 | 其他 Disco 的 QQ 机器人 | 另一个 Disco 的机器人以 `**名字**：` 说话时记为「名字 (Disco)」，可接力（同 Discord 限流）；其他机器人与未绑定的群忽略 | ●ST:QQ 其他 Disco 的机器人按「**名字**：」识别，别的机器人和重复消息忽略；手动验证：两个 Disco 的机器人在同一个 QQ 群里，确认 QQ 是否把一个机器人的消息推给另一个（官方 API 默认只推 @机器人 的消息） |
 | 待处理卡片 | 需要批准/提问时，QQ 群里发带按钮的卡片；只有主人（发绑定码的人）点按钮才算，其他人点了无效 | ●ST:QQ 待处理卡片带按钮，只有本人点了才算；手动验证：真实 QQ 群里点按钮 |
 | 解绑机器人 `qq_unbind` | 断开网关、删除钥匙串里的凭据；已绑定的 QQ 群保留，重新扫码后恢复 | ●ST:QQ 解绑群和机器人, UI:Q9 |
+| QQ 连接（网关）`qq_reconnect` | 与官方 SDK（`@tencent-connect/qqbot-nodejs` 1.0.5）一致：POST bots.qq.com/app/getAppAccessToken `{appId, clientSecret}`（expires_in 是字符串），REST 带 `Authorization: QQBot <token>` + `X-Union-Appid`，GET /gateway 取 wss 地址；HELLO(10) → IDENTIFY(2) `{token: "QQBot <token>", intents: 1<<25｜1<<26, shard: [0,1]}` 或 RESUME(6)；按 HELLO 的间隔发心跳（带最后 seq），心跳到下一次心跳之间没收到 ACK(11) 就重连；READY 才算「在线」。重连：7 → 1 秒后 RESUME；9（d=false）→ 清会话、重新取 token、3 秒后 IDENTIFY；4004 → 重新取 token 再连（不再永久停止），连续 3 次被拒提示重新扫码；4006/4007/4009/4900–4913 → 重新 IDENTIFY；4008 → 60 秒；4914/4915（下架/封禁）才停止。REST 401 → 换 token 重试一次。先直连 QQ，连不上再走系统代理（HTTP CONNECT / SOCKS5），HTTPS 和 WSS 都一样；文本帧和二进制帧都解析。设置 → QQ「重新连接」重新取 token、重连 | ✚ST:QQ 网关：token 用 appId/clientSecret 取，IDENTIFY 带 QQBot token、intents、shard，READY 后才算在线, ✚ST:QQ 网关推来的私聊经 WebSocket 进到 Disco，并被动回复, UT:disco-qq gateway_refreshes_the_token_after_4004_and_delivers_events, UT:disco-qq seqs_hosts_and_close_codes, UT:disco-qq live_gateway_rejects_a_fake_token（`--ignored`，连真实 QQ 网关，假 token 应得 op 9 / 4004）, UI:Q10 |
+| QQ 发送细节 | 每条消息（含分段、markdown 失败后的纯文本、文件）用新的随机 msg_seq（1–65535，同官方 SDK），避免被 QQ 当重复消息丢掉；被动回复被拒（过期、额度用完）时群和私聊都改发主动消息；失败原因记在设置 → QQ「发送失败」和一键诊断 | ✚ST:QQ 群：被动回复被拒（消息过期）时改发主动消息，不丢 |
+| QQ 消息里的 @ 标记 | 真实 QQ 群消息里机器人自己的 @ 可能是 `<@!appid>` 且不在 mentions 里（官方 SDK 会删掉所有剩下的 `<@!…>`）：Disco 同样删掉，「@机器人 绑定 1234」「/help」才认得出 | ✚ST:QQ 绑定码把 QQ 群连上，发码的人算本人（用真实格式 `<@!102> 绑定 …`）, UT:disco-qq parses_group_messages |
+| QQ 状态与诊断 `qq_status` `diagnose` | 设置 → QQ 显示连接阶段（取 token / 取网关地址 / 连网关 / 鉴权 / 在线 / 重试中 / 已停止）、最近收到的事件（类型、时间、数量）、最近错误、最近发送失败、私聊主人状态；一键诊断加「QQ 机器人凭据 / QQ access_token / QQ 实时连接（后台没在线时单独连一次到 READY）/ QQ 收到的事件 / QQ 私聊主人 / QQ 发送」；READY、连接错误、诊断结果、私聊主人变更、非主人私聊都记审计 | ✚ST:QQ 一键诊断：凭据、token、实时连接、收到的事件、私聊主人, UI:Q10 |
 
 ## Agent 私聊同步到 QQ（v1.11.0）
 
@@ -139,7 +143,7 @@ v1.6.5 基线新增的 selftest 检查在下表中用 ★ 标出；v1.8.0 跨设
 |---|---|---|
 | 导入时选同步位置 `add_agent`（`sync`） | 绑了 QQ 机器人后，添加 Agent 页顶部有「同步到 Discord / QQ」分段选择（快速导入、全部导入、展开表单添加都用这一个选择，全部导入整批一个选择）；没绑 QQ 时不出现、`sync` 为空。默认：上次的选择（QQ 只在机器人仍绑定时），否则看连了什么，两个都连时 Discord；明确选过才记住（`sync_last`）。每个 agent 存 `sync/<名字>`；选 Discord = 以前的行为（连着 Discord 就建自己的频道）；选 QQ 不建 Discord 频道，Discord 连上/同步时也跳过它，会话里写一条用法说明；没绑 QQ 却要求 QQ 时报错 | ◎ST:QQ 私聊：导入时选 QQ，不建 Discord 频道，记住选择；Discord 的 agent 不变, ◎ST:QQ 解绑群和机器人（之后选 QQ 被拒）, UI:S0–S3 |
 | 之后改 `set_agent_sync` | agent 信息「本对话」里的「同步到」分段选择（绑了 QQ 或它已同步到 QQ 时出现）。改成 QQ：放开它的 Discord 频道（频道留在 Discord 不删，发一句说明，不再同步）；改回 Discord：重新建/找回频道。改名、删除 agent 时选择跟着走 | ◎ST:QQ 私聊：agent 发文件到私聊；改回 Discord 后不再同步, UI:S4 |
-| QQ 私聊收发 | 所有同步到 QQ 的 agent 共用机器人和主人（扫码绑定的人，`qq_owner` = 绑定结果里的 openid）的一个 C2C 私聊。agent 的回复以 `**名字**：` 发过去（失败原因也发）；主人发的消息：以 `@名字` 开头 → 给该 agent 并设为当前；否则给当前 agent（默认第一个 QQ agent）；只写 `@名字` 只切换；`/help` 列出 agent。只认主人的 openid，别人的私聊忽略（记审计）；重复投递只处理一次。被动回复：对最新消息 60 分钟内最多 5 条，带 msg_id + msg_seq，超出或被拒时改发主动消息 | ◎ST:QQ 私聊：主人的消息给当前 agent，回复带「**名字**：」、是被动回复，审批卡片也发到私聊, ◎ST:QQ 私聊：@名字 换 agent，之后的消息也给它；别人的私聊被忽略, UT:qq::picks_the_named_agent, UT:qq::codes_relays_and_reply_slots；手动验证：手机 QQ 给机器人发私聊，确认回复、@切换、主动消息额度 |
+| QQ 私聊收发 | 所有同步到 QQ 的 agent 共用机器人和主人（扫码绑定的人，`qq_owner` = 绑定结果里的 openid）的一个 C2C 私聊。agent 的回复以 `**名字**：` 发过去（失败原因也发）；主人发的消息：以 `@名字` 开头 → 给该 agent 并设为当前；否则给当前 agent（默认第一个 QQ agent）；只写 `@名字` 只切换；`/help` 列出 agent。只认主人的 openid，别人的私聊不转给 agent（记审计，并回一句「只接主人的私聊，主人可在设置 → QQ 点『认领私聊』」，每人每次启动一次）；扫码结果没带 openid 时，绑定后第一个私聊的人算主人；设置 → QQ「认领私聊」`qq_claim_code` 给 4 位码，私聊机器人发「绑定 1234」的人成为主人；同步到 QQ 的 agent 回复时若还没连上或不知道主人，会话里写明原因；重复投递只处理一次。被动回复：对最新消息 60 分钟内最多 5 条，带 msg_id + msg_seq，超出或被拒时改发主动消息 | ◎ST:QQ 私聊：主人的消息给当前 agent，回复带「**名字**：」、是被动回复，审批卡片也发到私聊, ◎ST:QQ 私聊：@名字 换 agent，之后的消息也给它；别人的私聊被忽略, ✚ST:QQ 私聊：别人私聊会被告知怎么认领；扫码没给出主人时第一个私聊的人算主人；认领码可以换主人, UT:qq::picks_the_named_agent, UT:qq::codes_relays_and_reply_slots；手动验证：手机 QQ 给机器人发私聊，确认回复、@切换、主动消息额度 |
 | QQ 私聊附件 / 卡片 / 发文件 | 私聊里的图片/文件存进该 agent 的会话空间（同群文件），路径给 agent；它的待处理卡片（批准/提问）发到私聊，按钮只认主人；agent `send_file` 的文件上传到私聊（`/v2/users/{openid}/files` → msg_type 7） | ◎ST:QQ 私聊：附件存进 agent 的空间；卡片按钮只认主人, ◎ST:QQ 私聊：agent 发文件到私聊；改回 Discord 后不再同步, UT:disco-qq parses_group_messages（C2C 按钮、路径） |
 
 ## Agent 接入（ACP / OpenAI / A2A / 邀请码）
@@ -184,7 +188,7 @@ v1.6.5 基线新增的 selftest 检查在下表中用 ★ 标出；v1.8.0 跨设
 
 | 功能 | 行为契约 | 覆盖 |
 |---|---|---|
-| 一键诊断 `diagnose` | 返回代理、钥匙串、Discord token、Tailscale、Node.js 等检查项，每项有说明 | ★ST:一键诊断返回检查项 |
+| 一键诊断 `diagnose` | 返回代理、钥匙串、Discord token、QQ（绑了机器人时）、Tailscale、Node.js 等检查项，每项有说明 | ★ST:一键诊断返回检查项, ✚ST:QQ 一键诊断：凭据、token、实时连接、收到的事件、私聊主人 |
 | Discord 设置 `discord_settings` | 没 token 时返回 problem 不崩；允许名单只保留数字 id | ★ST:没连 Discord 时设置页不崩、给出原因 |
 | 保存 token `save_discord_token` | 不完整的 token 直接拒绝；完整的先验证再存 | ★ST:没连 Discord 时设置页不崩、给出原因（拒绝部分）；手动验证：粘贴真实 token，状态变「在线」 |
 | 重连 `discord_connect` | 没保存 token 时报错 | ★ST:没连 Discord 时设置页不崩、给出原因 |
@@ -239,6 +243,7 @@ v1.6.5 基线新增的 selftest 检查在下表中用 ★ 标出；v1.8.0 跨设
 | peer_check | ★ST:共享 chat 模式…（无群返回空）, ★ST:对方群 peer_turn … |
 | create_share, revoke_share, accept_invite | ST:共享 邀请码接入后能聊, ST:共享 撤销后被拒, ▲ST:隧道 邀请过期即拒（`days`） |
 | tunnel_status, tunnel_install, tunnel_login, tunnel_setup, tunnel_set | ▲ST:隧道 邀请码带 Access 令牌，设置往返；安装/登录/建隧道手动验证（真实 Cloudflare 账号） |
+| qq_claim_code, qq_reconnect | ✚ST:QQ 私聊：别人私聊会被告知怎么认领…, UI:Q10 |
 | qq_status, qq_bind, qq_bind_cancel, qq_unbind, qq_group_code | ●ST:QQ 扫码绑定…, ●ST:QQ 绑定码把 QQ 群连上…, ●ST:QQ 解绑群和机器人；真实扫码与 QQ 群手动验证 |
 | set_agent_sync | ◎ST:QQ 私聊：agent 发文件到私聊；改回 Discord 后不再同步, UI:S4 |
 
