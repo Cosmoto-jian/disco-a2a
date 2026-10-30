@@ -250,10 +250,11 @@ pub struct QqStatus {
 
 fn status(core: &Core) -> QqStatus {
     let qr = lock(&QR).as_ref().map(|(b, svg, _)| (svg.clone(), b.url()));
-    QqStatus {
-        bound: core.db().setting(SET_ON).as_deref() == Some("1"), status: lock(&STATUS).clone(),
-        name: core.db().setting(SET_NAME).unwrap_or_default(), url: qr.as_ref().map(|q| q.1.clone()), qr: qr.map(|q| q.0),
-    }
+    // One db() lock per statement: two in one struct literal would deadlock.
+    let bound = core.db().setting(SET_ON).as_deref() == Some("1");
+    let name = core.db().setting(SET_NAME).unwrap_or_default();
+    let status = lock(&STATUS).clone();
+    QqStatus { bound, status, name, url: qr.as_ref().map(|q| q.1.clone()), qr: qr.map(|q| q.0) }
 }
 
 /// For the overview: "" when no bot is bound.
