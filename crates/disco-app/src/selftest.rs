@@ -858,7 +858,7 @@ pub fn spawn(app: AppHandle, mock: String) {
             let v = serde_json::to_value(crate::qq::qq_status(st())).map_err(|e| e.to_string())?;
             let saved = crate::secret_get("qq_bot").unwrap_or_default();
             if v["name"] == "DiscoBot" && v["qr"].is_null() && saved.contains("\"secret\":\"sec-from-scan\"") && saved.contains("\"app_id\":\"102\"") { Ok(String::new()) } else { Err(format!("{v} {saved}")) } });
-        let qgid = within(10, crate::save_group(st(), None, None, "qq".into(), vec!["m1".into(), "m2".into()], Some("m1".into()), Some(true))).await.ok().and_then(Result::ok).unwrap_or_default();
+        let qgid = within(10, crate::save_group(st(), None, None, "qq".into(), vec!["m1".into(), "m3".into()], Some("m1".into()), Some(true))).await.ok().and_then(Result::ok).unwrap_or_default();
         let qthread = format!("group:{qgid}");
         let _ = check!("QQ 绑定码把 QQ 群连上，发码的人算本人", {
             if !qgid.starts_with("local-") { return Err(format!("QQ 群聊应是本地群：{qgid}")); }
@@ -884,11 +884,11 @@ pub fn spawn(app: AppHandle, mock: String) {
             let unique = seqs.iter().all(|s| seqs.iter().filter(|x| *x == s).count() == 1);
             if unique && seqs.iter().all(|s| (1..=5).contains(s)) { Ok(String::new()) } else { Err(format!("{seqs:?} {to_q2:?}")) } });
         let _ = check!("QQ 群里其他人 @agent：提及改写、附件存进共享空间、名字带 (QQ)", {
-            let n = count(&core, &qthread, "m2");
-            feed("GROUP_MESSAGE_CREATE", serde_json::json!({ "id": "q3", "group_openid": "G1", "content": "<@BOT> @m2 收下这个 <@U1>",
+            let n = count(&core, &qthread, "m3");
+            feed("GROUP_MESSAGE_CREATE", serde_json::json!({ "id": "q3", "group_openid": "G1", "content": "<@BOT> @m3 收下这个 <@U1>",
                 "author": { "member_openid": "U2", "username": "阿杰" }, "mentions": [{ "member_openid": "BOT", "is_you": true }, { "member_openid": "U1", "username": "我" }],
                 "attachments": [{ "url": format!("{qbase}/file.txt"), "filename": "a b.txt", "size": 7 }] }))?;
-            wait_msg(&core, &qthread, "m2", n, 30).await.map_err(|e| {
+            wait_msg(&core, &qthread, "m3", n, 30).await.map_err(|e| {
                 let tail: Vec<_> = core.db().messages(&qthread, 500).unwrap_or_default().into_iter().rev().take(4).map(|m| format!("{}: {}", m.author, m.body)).collect();
                 format!("{e} {tail:?}")
             })?;
@@ -896,7 +896,7 @@ pub fn spawn(app: AppHandle, mock: String) {
             let saved = crate::mcp::space_dir(&core, &qthread).map(|d| d.join("files").join("a b.txt")).ok().and_then(|p| std::fs::read_to_string(p).ok());
             let ov = within(5, crate::overview(st())).await??;
             let people = ov.groups.iter().find(|g| g.id == qgid).map(|g| g.people.clone()).unwrap_or_default();
-            if said.starts_with("@m2 收下这个 @我") && said.contains("📎 a b.txt") && saved.as_deref() == Some("qq file") && people.contains(&"阿杰".to_owned()) { Ok(String::new()) } else { Err(format!("{said} / {saved:?} / {people:?}")) } });
+            if said.starts_with("@m3 收下这个 @我") && said.contains("📎 a b.txt") && saved.as_deref() == Some("qq file") && people.contains(&"阿杰".to_owned()) { Ok(String::new()) } else { Err(format!("{said} / {saved:?} / {people:?}")) } });
         let _ = check!("QQ 其他 Disco 的机器人按「**名字**：」识别，别的机器人和重复消息忽略", {
             let before = core.db().messages(&qthread, 500).map(|v| v.len()).unwrap_or(0);
             feed("GROUP_MESSAGE_CREATE", serde_json::json!({ "id": "q4", "group_openid": "G1", "content": "**coder**：大家好", "author": { "member_openid": "B1", "bot": true } }))?;
