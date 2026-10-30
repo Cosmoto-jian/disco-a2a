@@ -1049,8 +1049,8 @@ pub fn spawn(app: AppHandle, mock: String) {
             let hint = |b: &serde_json::Value| b["msg_id"] == "a1" && b["markdown"]["content"].as_str().unwrap_or_default().contains("还没连到 Disco")
                 && b["markdown"]["content"].as_str().unwrap_or_default().contains("绑定群 ");
             until(10, || qlog("msg:G2").iter().any(hint)).await.map_err(|e| format!("{e} {:?}", qlog("msg:G2")))?;
-            let said = qlog("msg:G2").into_iter().find(|b| b["msg_id"] == "a1").map(|b| b["markdown"]["content"].as_str().unwrap_or_default().to_owned()).unwrap_or_default();
-            let code = said.split_whitespace().find(|w| w.len() == 4 && w.bytes().all(|b| b.is_ascii_digit())).map(str::to_owned)
+            let said = qlog("msg:G2").into_iter().find(|b| hint(b)).map(|b| b["markdown"]["content"].as_str().unwrap_or_default().to_owned()).unwrap_or_default();
+            let code = said.split_once("绑定群 ").map(|(_, r)| r.chars().take(4).collect::<String>()).filter(|c| c.len() == 4 && c.bytes().all(|b| b.is_ascii_digit()))
                 .ok_or_else(|| format!("提示里没有 4 位绑定码：{said}"))?;
             // The owner redeems it in the bot's private chat: a new Disco group is made and tied.
             feed("C2C_MESSAGE_CREATE", serde_json::json!({ "id": "c9", "content": format!("绑定群 {code}"), "author": { "user_openid": "OWNER" } }))?;
@@ -1088,7 +1088,7 @@ pub fn spawn(app: AppHandle, mock: String) {
             if st2["diag"]["event"] != "GROUP_ADD_ROBOT" { return Err(format!("{}", st2["diag"])); }
             if st2["unbound"].as_array().is_none_or(|v| !v.iter().any(|u| u["openid"] == "G3")) { return Err(format!("未绑定群列表：{}", st2["unbound"])); }
             // Settings → QQ「绑定到新群聊」: one click ties it to a brand-new Disco group.
-            let s = serde_json::to_value(crate::qq::qq_bind_group(st(), "G3".into(), None)).map_err(|e| e.to_string())?;
+            let s = serde_json::to_value(crate::qq::qq_bind_group(st(), "G3".into(), None)?).map_err(|e| e.to_string())?;
             if s["unbound"].as_array().is_none_or(|v| v.iter().any(|u| u["openid"] == "G3")) { return Err(format!("绑定后还在未绑定列表：{}", s["unbound"])); }
             let ov = within(5, crate::overview(st())).await??;
             let made = ov.groups.iter().find(|g| g.qq && g.name.starts_with("QQ群") && g.id != qgid).map(|g| (g.id.clone(), g.name.clone())).ok_or("没有新建群聊")?;
