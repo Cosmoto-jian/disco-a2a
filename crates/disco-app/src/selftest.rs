@@ -911,8 +911,9 @@ pub fn spawn(app: AppHandle, mock: String) {
             if !mine.contains("调用工具") { return Err(format!("Disco 里应保留工具过程：{mine:?}")); }
             let said = |b: &serde_json::Value| b["msg_id"] == "qt1" && b["markdown"]["content"].as_str().unwrap_or_default().contains("**m1**");
             until(10, || qlog("msg:G1").iter().any(said)).await?;
+            // The answer itself (the approval card「🔐 … 请求执行」is a card, not tool trace).
             let out: Vec<String> = qlog("msg:G1").into_iter().filter(|b| b["msg_id"] == "qt1")
-                .map(|b| b["markdown"]["content"].as_str().unwrap_or_default().to_owned()).collect();
+                .map(|b| b["markdown"]["content"].as_str().unwrap_or_default().to_owned()).filter(|t| t.starts_with("**m1**")).collect();
             // … QQ only gets the answer: no 调用工具 line, no tool title.
             if out.iter().any(|t| t.contains("调用工具") || t.contains("rm -rf build")) { return Err(format!("QQ 不该收到工具过程：{out:?}")); }
             if !out.iter().any(|t| t.contains("hello from mock")) { return Err(format!("QQ 没收到答案：{out:?}")); }
@@ -961,7 +962,9 @@ pub fn spawn(app: AppHandle, mock: String) {
             tokio::time::sleep(Duration::from_millis(600)).await;
             let seen = count(&core, &qthread, "me");
             if seen != n + 1 { return Err(format!("重复投递处理了两次：{seen} 条（应是 {} 条）", n + 1)); }
-            if qlog("msg:G1").iter().filter(|b| b["msg_id"] == "dup1").count() > 1 { return Err("重复投递回了两条".into()); }
+            // One answer (an approval card for the same turn is not a second answer).
+            let answers = qlog("msg:G1").iter().filter(|b| b["msg_id"] == "dup1" && b["markdown"]["content"].as_str().unwrap_or_default().starts_with("**")).count();
+            if answers > 1 { return Err(format!("重复投递回了 {answers} 条回答")); }
             Ok(String::new()) });
         let _ = check!("QQ 群里其他人 @agent：提及改写、附件存进共享空间、名字带 (QQ)", {
             let n = count(&core, &qthread, "m3");
