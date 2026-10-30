@@ -813,12 +813,13 @@ pub fn spawn(app: AppHandle, mock: String) {
             let thread = format!("peer:{other}");
             let before = count(&core, &thread, "隧道文件");
             let body = serde_json::json!({ "jsonrpc": "2.0", "id": 1, "method": a2a::methods::SEND_MESSAGE, "params": req });
-            let r = within(40, http.post(format!("http://127.0.0.1:{tport}/a/{other}/jsonrpc")).bearer_auth(&tok).json(&body).send()).await?.map_err(|e| e.to_string())?;
+            let r = within(40, http.post(format!("http://127.0.0.1:{tport}/a/{other}/jsonrpc")).bearer_auth(&tok).header("a2a-version", "1.0").json(&body).send()).await?.map_err(|e| e.to_string())?;
             let status = r.status().as_u16();
+            let reply = r.text().await.unwrap_or_default();
             let got = wait_msg(&core, &thread, "隧道文件", before, 20).await;
             let saved = crate::mcp::space_dir(&core, &thread).map(|d| d.join("files").join("隧道.txt")).ok().and_then(|p| std::fs::read(p).ok());
             crate::share::revoke_share(st(), other);
-            if status == 200 && saved.as_deref() == Some(b"tunnel file".as_slice()) { Ok(got.unwrap_or_default()) } else { Err(format!("{status} {got:?} {saved:?}")) } });
+            if status == 200 && saved.as_deref() == Some(b"tunnel file".as_slice()) { Ok(got.unwrap_or_default()) } else { Err(format!("{status} {got:?} {saved:?} {}", reply.chars().take(300).collect::<String>())) } });
         let _ = check!("隧道 邀请过期即拒（隧道和本机都一样）", {
             let mut sh = core.shares().into_iter().find(|(i, _)| *i == tshare).map(|(_, s)| s).ok_or("找不到共享")?;
             sh.expires = chrono::Utc::now().timestamp() - 1;
