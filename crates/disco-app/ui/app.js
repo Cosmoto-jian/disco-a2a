@@ -1627,10 +1627,22 @@ async function loadQQ(sec, q) {
     };
     rows.push(grow("私聊", h("span", { id: "qq-owner", class: `val${q.owner && !d.stranger ? "" : " err"}` },
       d.stranger ? `收到 …${d.stranger} 的私聊，但不是已认定的你` : q.owner ? "已认定你的 QQ" : "给机器人发一条私聊，就会认定是你"), claim));
+    // Groups the bot is in but that are not tied to a Disco group: one click ties one.
+    for (const u of q.unbound || []) {
+      const tail = String(u.openid || "").slice(-6);
+      const b = h("button", { type: "button", class: "btn sm" }, "绑定到新群聊");
+      b.onclick = async () => {
+        try { const s = await invoke("qq_bind_group", { openid: u.openid }); loadQQ(sec, s); toast(`已为 QQ 群 …${tail} 新建一个 Disco 群聊并连上`, 5000); }
+        catch (e) { toast(e, 8000); }
+      };
+      rows.push(grow("未绑定的 QQ 群", h("span", { id: `qq-unbound-${tail}`, class: "val err", title: `QQ 群 openid ${u.openid}` },
+        `群 …${tail} · ${u.at ? ago(u.at) : "刚刚"}${u.who ? ` · ${u.who}` : ""}`), b));
+    }
+    if (d.gate) rows.push(grow("群消息", h("span", { id: "qq-gate", class: "val err", title: d.gate }, `${d.gate} · ${ago(d.gate_at || 0)}`)));
     rows.push(grow("解绑", h("button", { type: "button", class: "btn sm danger", onclick: async () => {
       if (await ask("解绑 QQ 机器人？已连上的 QQ 群会停止同步，重新扫码接入后自动恢复。", "解绑")) { await redo(invoke("qq_unbind")); S.ov.qq_status = ""; renderList(); }
     } }, "解绑")));
-    foot = "把机器人拉进 QQ 群，再到 群聊 → 新建群聊 打开「同步到 QQ 群」，按提示在群里发绑定码。QQ 群里要 @机器人 说话（QQ 只把 @机器人 的消息推给 Disco），写 @agent 名字可以点名；没点名就交给组长。消息过不去时点 通用与更新 → 一键诊断，看「QQ 实时连接」那几行。";
+    foot = "把机器人拉进 QQ 群，再到 群聊 → 新建群聊 打开「同步到 QQ 群」，按提示在群里发绑定码；也可以直接在群里 @我 一句话，我会给群主一个绑定码（按提示私聊发「绑定群 1234」就自动建群连上），上面的「未绑定的 QQ 群」也能一键绑定。QQ 群里要 @机器人 说话（QQ 只把 @机器人 的消息推给 Disco），写 @agent 名字可以点名；没点名就交给组长。消息过不去时点 通用与更新 → 一键诊断，看「QQ 实时连接」那几行。";
   }
   sec.replaceChildren(head, h("div", { class: "glist" }, ...rows), h("p", { class: "foot" }, foot));
 }

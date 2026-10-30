@@ -41,8 +41,8 @@
     discord_status: "在线 · MyBot#0001",
     qq_status: "",
     // QQ bot: not bound; `qq_bind` shows a QR code, `STUB.qq_scan()` simulates the scan in mobile QQ.
-    qq: { bound: false, status: "", name: "", qr: null, url: null, owner: false, groups: 0,
-      diag: { stage: "", ready: false, proxy: false, ready_at: 0, error: "", error_at: 0, event: "", event_at: 0, events: 0, send_error: "", send_error_at: 0, stranger: "" } },
+    qq: { bound: false, status: "", name: "", qr: null, url: null, owner: false, groups: 0, unbound: [],
+      diag: { stage: "", ready: false, proxy: false, ready_at: 0, error: "", error_at: 0, event: "", event_at: 0, events: 0, send_error: "", send_error_at: 0, stranger: "", gate: "", gate_at: 0 } },
     qq_codes: [],
     // Where new agents' 1:1 chats sync (backend: last choice, else what is connected, Discord if both).
     sync_last: null,
@@ -167,6 +167,14 @@
       if (!g.id.startsWith("local-")) throw "这个群聊已经同步到 Discord 频道，QQ 群请新建一个群聊绑定";
       if (!STUB.qq.bound) throw "先在设置里扫码绑定 QQ 机器人";
       const code = String(1234 + STUB.qq_codes.length); STUB.qq_codes.push([code, g.id]); return code;
+    },
+    // One click in Settings → QQ: make a Disco group for a QQ group the bot is in and tie them.
+    qq_bind_group: (a) => {
+      if (!STUB.qq.bound) throw "先在设置里扫码接入 QQ 机器人";
+      const id = "local-b" + (STUB.groups.length + 1);
+      STUB.groups.push({ id, name: `QQ群 ${String(a.openid || "").slice(-6)}`, guild_id: "", lead: "claude", members: ["claude", "codex"], people: [], guests: [], qq: true });
+      STUB.qq.unbound = STUB.qq.unbound.filter((u) => u.openid !== a.openid);
+      return clone(STUB.qq);
     },
     delete_group: (a) => { STUB.groups = STUB.groups.filter((g) => g.id !== a.id); return null; },
     restore_group: (a) => { STUB.groups.push({ id: a.id, name: a.name, guild_id: a.guildId, lead: a.lead, members: a.members, people: [], guests: [] }); return null; },

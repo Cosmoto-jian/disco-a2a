@@ -169,6 +169,10 @@ pub type Button = (String, String, bool);
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum To { Group(String), User(String) }
 
+/// What a message answers: a passive reply (`msg_id`) or an event-triggered one (`event_id`).
+#[derive(Clone, Copy)]
+enum Ref<'a> { Msg(&'a str), Event(&'a str) }
+
 impl To {
     fn path(&self, what: &str) -> String {
         match self { To::Group(g) => format!("/v2/groups/{g}/{what}"), To::User(u) => format!("/v2/users/{u}/{what}") }
@@ -284,17 +288,29 @@ impl Rest {
 
     /// Like [`Rest::send_group`], to a group or to one user's private (C2C) chat with the bot.
     pub async fn send(&self, to: &To, text: &str, reply: Option<&str>, buttons: &[Button]) -> Result<(), String> {
+        self.say(to, text, reply.map(Ref::Msg), buttons).await
+    }
+
+    /// A message QQ asked for by event (GROUP_ADD_ROBOT and friends): `event_id` instead of
+    /// the replied-to `msg_id`. QQ allows one such message per event.
+    pub async fn send_event(&self, to: &To, text: &str, event_id: &str) -> Result<(), String> {
+        self.say(to, text, Some(Ref::Event(event_id)), &[]).await
+    }
+
+    async fn say(&self, to: &To, text: &str, reply: Option<Ref<'_>>, buttons: &[Button]) -> Result<(), String> {
         let parts = chunk(text);
         let n = parts.len();
         let path = to.path("messages");
         for (i, part) in parts.into_iter().enumerate() {
             let mut body = json!({ "msg_type": 2, "markdown": { "content": part }, "msg_seq": next_seq() });
-            if let Some(id) = reply { body["msg_id"] = json!(id); }
+            if let Some(Ref::Msg(id)) = reply { body["msg_id"] = json!(id); }
+            if let Some(Ref::Event(id)) = reply { body["event_id"] = json!(id); }
             if i + 1 == n && !buttons.is_empty() { body["keyboard"] = keyboard(buttons); }
             if let Err(e) = self.call(reqwest::Method::POST, &path, Some(body)).await {
                 // No markdown permission: plain text (buttons need markdown, so they go).
                 let mut plain = json!({ "msg_type": 0, "content": part, "msg_seq": next_seq() });
-                if let Some(id) = reply { plain["msg_id"] = json!(id); }
+                if let Some(Ref::Msg(id)) = reply { plain["msg_id"] = json!(id); }
+                if let Some(Ref::Event(id)) = reply { plain["event_id"] = json!(id); }
                 self.call(reqwest::Method::POST, &path, Some(plain)).await.map_err(|e2| format!("{e2}（markdown：{e}）"))?;
             }
         }
@@ -439,7 +455,10 @@ pub fn chunk(text: &str) -> Vec<String> {
 // ---------------------------------------------------------------- gateway events
 
 #[derive(Debug, Clone, PartialEq)]
-pub enum Kind { Group, Direct, Press, Added, Removed }
+pub enum Kind { Group, Direct, Press, Added, Removed,
+    /// QQ stopped (true) or resumed (false) delivering the bot's messages in a group:
+    /// GROUP_MSG_REJECT / GROUP_MSG_RECEIVE.
+    Gate(bool) }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Attachment { pub url: String, pub name: String, pub size: u64 }
@@ -495,7 +514,9 @@ pub fn parse(t: &str, d: &Value) -> Option<Incoming> {
                 let url = if url.starts_with("//") { format!("https:{url}") } else if url.starts_with("http") { url } else { format!("https://{url}") };
                 Some(Attachment { url, name: x["filename"].as_str().filter(|n| !n.is_empty()).unwrap_or("file").to_owned(), size: x["size"].as_u64().unwrap_or(0) })
             }).collect()).unwrap_or_default();
-            let (kind, group) = if t == "C2C_MESSAGE_CREATE" { (Kind::Direct, s(&a["user_openid"])) } else { (Kind::Group, s(&d["group_openid"])) };
+            // `group_openid` is what the official SDK reads; group events also carry `group_id`.
+            let group = [&d["group_openid"], &d["group_id"]].into_iter().find_map(|v| v.as_str().filter(|s| !s.is_empty())).unwrap_or_default().to_owned();
+            let (kind, group) = if t == "C2C_MESSAGE_CREATE" { (Kind::Direct, s(&a["user_openid"])) } else { (Kind::Group, group) };
             let author_id = [&a["member_openid"], &a["user_openid"], &a["id"]].into_iter().find_map(|v| v.as_str().filter(|s| !s.is_empty())).unwrap_or_default().to_owned();
             let tail: String = author_id.chars().rev().take(4).collect::<Vec<_>>().into_iter().rev().collect();
             let author = [&a["username"], &a["nickname"]].into_iter().find_map(|v| v.as_str().filter(|s| !s.is_empty())).map_or_else(|| format!("QQ 用户{tail}"), str::to_owned);
@@ -508,16 +529,33 @@ pub fn parse(t: &str, d: &Value) -> Option<Incoming> {
         }
         "GROUP_ADD_ROBOT" => Some(Incoming { author_id: s(&d["op_member_openid"]), ..base(Kind::Added) }),
         "GROUP_DEL_ROBOT" => Some(Incoming { author_id: s(&d["op_member_openid"]), ..base(Kind::Removed) }),
+        "GROUP_MSG_REJECT" => Some(base(Kind::Gate(true))),
+        "GROUP_MSG_RECEIVE" => Some(base(Kind::Gate(false))),
         _ => None,
     }
 }
 
-/// Remove leftover `<@…>` / `<@!…>` mention markers (and the space after each).
+/// Remove leftover mention markers (and the space after each): `<@…>` / `<@!…>` (the
+/// official SDK drops any that are left over) and QQ's `<qqbot-at-user …/>`, which never
+/// appears in `mentions`.
 fn strip_markers(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
-    while let Some(i) = rest.find("<@") {
+    loop {
+        let at = rest.find("<@");
+        let tag = rest.find("<qqbot-at-user");
+        let i = match (at, tag) {
+            (Some(a), Some(t)) => a.min(t),
+            (Some(a), None) => a,
+            (None, Some(t)) => t,
+            (None, None) => break,
+        };
         let Some(j) = rest[i..].find('>') else { break };
+        if tag == Some(i) {
+            out.push_str(&rest[..i]);
+            rest = rest[i + j + 1..].trim_start_matches(' ');
+            continue;
+        }
         let id = rest[i + 2..i + j].trim_start_matches('!');
         if id.is_empty() || id.contains(char::is_whitespace) { out.push_str(&rest[..i + 2]); rest = &rest[i + 2..]; continue; }
         out.push_str(&rest[..i]);
@@ -766,6 +804,15 @@ mod tests {
         assert_eq!(raw.content, "绑定 1234");
         assert_eq!(strip_markers("<@1020304>/help"), "/help");
         assert_eq!(strip_markers("a <@ b> c"), "a <@ b> c");
+        // QQ also writes the bot's own @ as a `<qqbot-at-user …/>` tag (never in `mentions`).
+        assert_eq!(strip_markers("<qqbot-at-user id=\"102\" /> 绑定 1234"), "绑定 1234");
+        assert_eq!(strip_markers("<qqbot-at-user id=\"102\"/> /help"), "/help");
+        assert_eq!(strip_markers("hi <qqbot-at-user id=\"102\"/>"), "hi ");
+        // Older group events carry `group_id` instead of `group_openid`.
+        let old = parse("GROUP_AT_MESSAGE_CREATE", &json!({ "id": "m6", "group_id": "G7", "content": "hi", "author": { "id": "U1" } })).unwrap();
+        assert_eq!((old.kind, old.group.as_str(), old.author_id.as_str(), old.at_me), (Kind::Group, "G7", "U1", true));
+        assert_eq!(parse("GROUP_MSG_REJECT", &json!({ "group_openid": "G1" })).map(|m| (m.kind, m.group)), Some((Kind::Gate(true), "G1".into())));
+        assert_eq!(parse("GROUP_MSG_RECEIVE", &json!({ "group_openid": "G1" })).map(|m| m.kind), Some(Kind::Gate(false)));
     }
 
     #[test]
@@ -804,6 +851,9 @@ mod tests {
                 } else if line.starts_with("GET /gateway") {
                     lg.lock().unwrap().push(format!("gateway {} {}", header("authorization"), header("x-union-appid")));
                     if header("authorization").starts_with("QQBot tok") { (200, format!(r#"{{"url":"{ws}"}}"#)) } else { (401, r#"{"code":11244,"message":"AccessToken无效或过期"}"#.to_owned()) }
+                } else if line.starts_with("POST /v2/groups/") {
+                    lg.lock().unwrap().push(format!("msg {}", req.split("\r\n\r\n").nth(1).unwrap_or_default()));
+                    (200, r#"{"id":"sent"}"#.to_owned())
                 } else { (404, "{}".to_owned()) };
                 let _ = s.write_all(format!("HTTP/1.1 {code} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await;
             }
@@ -867,6 +917,29 @@ mod tests {
         assert!(seen.iter().any(|s| matches!(s, Status::Retry(e, _) if e.contains("op 9") || e.contains("4004"))), "{seen:?}");
         assert!(seen.contains(&Status::Event("C2C_MESSAGE_CREATE".into())), "{seen:?}");
         assert!(!seen.iter().any(|s| matches!(s, Status::Fatal(_))), "{seen:?}");
+    }
+
+    /// Passive replies carry `msg_id`, event-triggered ones `event_id`, active messages
+    /// neither; every one gets its own `msg_seq`.
+    #[tokio::test]
+    async fn group_send_uses_msg_id_or_event_id() {
+        let (api, log) = mock_platform("ws://127.0.0.1:1/websocket/".into()).await;
+        let rest = Rest::new(Creds { app_id: "102".into(), secret: "sec".into() },
+            Endpoints { api: api.clone(), token: format!("{api}/app/getAppAccessToken"), proxy: None });
+        let g = To::Group("G1".into());
+        rest.send(&g, "被动回复", Some("m1"), &[]).await.unwrap();
+        rest.send_event(&g, "进群欢迎", "E1").await.unwrap();
+        rest.send(&g, "主动消息", None, &[]).await.unwrap();
+        let log = log.lock().unwrap().clone();
+        let sent: Vec<Value> = log.iter().filter_map(|l| l.strip_prefix("msg ")).filter_map(|b| serde_json::from_str(b).ok()).collect();
+        assert_eq!(sent.len(), 3, "{log:?}");
+        assert_eq!(sent[0]["msg_id"], json!("m1"));
+        assert!(sent[0].get("event_id").is_none() && sent[0]["markdown"]["content"] == json!("被动回复"));
+        assert_eq!(sent[1]["event_id"], json!("E1"));
+        assert!(sent[1].get("msg_id").is_none());
+        assert!(sent[2].get("msg_id").is_none() && sent[2].get("event_id").is_none());
+        let seqs: Vec<u64> = sent.iter().filter_map(|b| b["msg_seq"].as_u64()).collect();
+        assert!(seqs.iter().all(|s| (1..=65535).contains(s)) && seqs.len() == 3, "{seqs:?}");
     }
 
     #[test]

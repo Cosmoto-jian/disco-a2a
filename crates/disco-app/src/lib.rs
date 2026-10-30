@@ -1855,7 +1855,7 @@ pub fn run() {
             stop_all, resume, save_discord_token, discord_connect, discord_settings, discord_sync, diagnose, open_url, reveal_path, discord_channels, save_group, delete_group, restore_group, memory_restore, set_memory, agent_commands,
             check_update, install_update, space, todo_new, todo_set, todo_remove, doc_save, reveal_doc, share::share_status, share::peer_check, share::create_share, share::share_invite, share::revoke_share, share::accept_invite,
             tunnel::tunnel_status, tunnel::tunnel_install, tunnel::tunnel_login, tunnel::tunnel_setup, tunnel::tunnel_set,
-            qq::qq_status, qq::qq_bind, qq::qq_bind_cancel, qq::qq_unbind, qq::qq_group_code, qq::qq_claim_code, qq::qq_reconnect, set_agent_sync
+            qq::qq_status, qq::qq_bind, qq::qq_bind_cancel, qq::qq_unbind, qq::qq_group_code, qq::qq_bind_group, qq::qq_claim_code, qq::qq_reconnect, set_agent_sync
         ])
         .build(tauri::generate_context!())
         .expect("error while running Disco")

@@ -33,6 +33,10 @@ const GROUP: &str = "qq_group/";
 const OF: &str = "qq_of/";
 /// QQ group openid → the owner's member openid in it (learned from the bind code).
 const ME: &str = "qq_me/";
+/// QQ groups the bot is in that are NOT tied to a Disco group: openid → a JSON [`Seen`]
+/// (when it was last talked to, who, what). Listed in Settings → QQ so a group the bot was
+/// @'ed in never looks dead.
+const UNSEEN: &str = "qq_seen/";
 /// The bot's owner: the scanner's openid from the bind (the only one heard in private chat).
 const OWNER: &str = "qq_owner";
 /// The agent the owner's private QQ messages go to when they name none.
@@ -92,12 +96,16 @@ pub struct Diag {
     send_error_at: u64,
     /// Someone other than the owner wrote to the bot privately (the tail of their openid).
     stranger: String,
+    /// GROUP_MSG_REJECT / GROUP_MSG_RECEIVE: QQ stopped (or resumed) taking the bot's
+    /// messages in a group.
+    gate: String,
+    gate_at: u64,
 }
 
 impl Diag {
     const fn new() -> Self {
         Self { stage: String::new(), ready: false, proxy: false, ready_at: 0, error: String::new(), error_at: 0, event: String::new(), event_at: 0, events: 0,
-            send_error: String::new(), send_error_at: 0, stranger: String::new() }
+            send_error: String::new(), send_error_at: 0, stranger: String::new(), gate: String::new(), gate_at: 0 }
     }
 }
 
@@ -113,6 +121,63 @@ fn note_send_error(e: &str) {
 }
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> { m.lock().unwrap_or_else(|p| p.into_inner()) }
+
+/// One QQ group the bot was talked to (or added to) in, while it is not tied to a Disco group.
+#[derive(Clone, Serialize, serde::Deserialize, Default)]
+struct Seen {
+    at: u64,
+    /// The member openid of whoever came last (the owner, if they are the one who @'d).
+    member: String,
+    name: String,
+    last: String,
+}
+
+/// Remember a QQ group the bot heard from that is not tied to a Disco group yet
+/// (Settings → QQ lists them; v1.11.2: @机器人 in a fresh group used to be silent).
+fn note_seen(core: &Core, m: &Incoming) {
+    if m.group.is_empty() { return; }
+    let s = Seen { at: now_ms(), member: m.author_id.clone(), name: m.author.clone(), last: m.content.chars().take(60).collect() };
+    if let Ok(j) = serde_json::to_string(&s) { let _ = core.db().set_setting(&format!("{UNSEEN}{}", m.group), &j); }
+}
+
+/// QQ groups the bot is in that are not tied to a Disco group, newest first (at most 8).
+fn unbound(core: &Core) -> Vec<QqSeen> {
+    let seen = core.db().settings_with_prefix(UNSEEN).unwrap_or_default();
+    let tied: Vec<String> = core.db().settings_with_prefix(OF).unwrap_or_default().into_iter().filter(|(_, v)| !v.is_empty()).map(|(k, _)| k).collect();
+    let mut out: Vec<QqSeen> = seen.into_iter().filter(|(k, _)| !k.is_empty() && !tied.contains(k))
+        .map(|(k, v)| (k, serde_json::from_str::<Seen>(&v).unwrap_or_default())).map(|(openid, s)| QqSeen { openid, at: s.at, who: s.name, member: s.member })
+        .collect();
+    out.sort_by_key(|a| std::cmp::Reverse(a.at));
+    out.truncate(8);
+    out
+}
+
+/// The pending code for one QQ group: the same group always gets the same one, so a
+/// repeated @ never mints a second code.
+fn group_code(openid: &str, member: &str) -> String {
+    let target = format!("q:{openid}/{member}");
+    let mut codes = lock(&CODES);
+    codes.retain(|c| c.2.elapsed() < CODE_TTL);
+    if let Some(c) = codes.iter().find(|c| c.1 == target).map(|c| c.0.clone()) { return c; }
+    let n = new_code(&codes);
+    codes.push((n.clone(), target, Instant::now()));
+    n
+}
+
+/// A 4-digit code no pending code uses.
+fn new_code(codes: &[(String, String, Instant)]) -> String {
+    let mut n = (uuid::Uuid::new_v4().as_u128() % 9000 + 1000) as u32;
+    while codes.iter().any(|c| c.0 == n.to_string()) { n = n % 9000 + 1000 + 1; }
+    n.to_string()
+}
+
+/// Use up a pending code: what it was for (None = no such code left).
+/// The target is "" (claim the private chat), "g:<Disco group>" or "q:<openid>/<member>".
+fn take_code(code: &str, pick: impl Fn(&str) -> bool) -> Option<String> {
+    let mut codes = lock(&CODES);
+    codes.retain(|c| c.2.elapsed() < CODE_TTL);
+    codes.iter().position(|c| c.0 == code && pick(&c.1)).map(|i| codes.remove(i).1)
+}
 
 #[cfg(debug_assertions)]
 pub(crate) fn use_endpoints(api: &str, bind_host: &str) {
@@ -247,6 +312,17 @@ pub(crate) async fn post_file(rest: &Rest, to: &To, name: &str, bytes: &[u8]) ->
     deliver(to, 1, |slot| async move { rest.send_file(to, name, bytes, slot.as_deref()).await }).await
 }
 
+/// An event-triggered message (QQ allows one per event, e.g. after GROUP_ADD_ROBOT):
+/// `event_id` in place of a replied-to message. Falls back to an active message, which
+/// needs the group's 主动消息 permission; either way a failure is kept for Settings → QQ.
+pub(crate) async fn post_event(rest: &Rest, to: &To, text: &str, event_id: &str) -> Result<(), String> {
+    if let Err(e) = rest.send_event(to, text, event_id).await {
+        note_send_error(&e);
+        return rest.send(to, text, None, &[]).await.map_err(|e2| { note_send_error(&e2); format!("{e2}（事件消息：{e}）") });
+    }
+    Ok(())
+}
+
 /// A card with buttons (an inbox item).
 pub(crate) async fn post_card(rest: &Rest, to: &To, text: &str, buttons: &[disco_qq::Button]) -> Result<(), String> {
     let n = disco_qq::chunk(text).len() as u32;
@@ -348,6 +424,38 @@ fn bind_code(text: &str) -> Option<&str> {
     (code.len() == 4 && code.bytes().all(|b| b.is_ascii_digit())).then_some(code)
 }
 
+/// `绑定群 1234` (also `/绑定群 1234`): redeem, in the bot's private chat, the code the bot
+/// gave out in a QQ group.
+fn group_bind_code(text: &str) -> Option<&str> {
+    let t = text.trim();
+    let code = t.strip_prefix("绑定群").or_else(|| t.strip_prefix("/绑定群")).or_else(|| t.strip_prefix("/bindgroup"))?.trim();
+    (code.len() == 4 && code.bytes().all(|b| b.is_ascii_digit())).then_some(code)
+}
+
+/// A new local Disco group for a QQ group: named "QQ群 xxxx", with the agents whose 1:1 chat
+/// syncs to QQ (every agent when none does); the first one leads.
+fn new_group_for(core: &Core, openid: &str) -> Result<String, String> {
+    let members = qq_agents(core);
+    let members = if members.is_empty() { core.db().list_agents().map_err(err)?.into_iter().map(|a| a.name).collect::<Vec<_>>() } else { members };
+    if members.is_empty() { return Err("Disco 里还没有 agent：先添加一个 agent，再绑定这个 QQ 群".into()); }
+    let lead = members.first().cloned();
+    let id = format!("local-{}", uuid::Uuid::new_v4().simple());
+    core.db().upsert_group(&crate::GroupRow { id: id.clone(), guild_id: String::new(), name: format!("QQ群 {}", tail(openid)), lead_agent: lead, webhook_ref: None, members }).map_err(err)?;
+    Ok(id)
+}
+
+/// Tie a Disco group and a QQ group together. `member` ("" when unknown) is the person who
+/// counts as the owner in that QQ group (openids are per context: a group's member_openid is
+/// never the same as the owner's private-chat openid).
+fn tie(core: &Core, gid: &str, openid: &str, member: &str) -> Result<(), String> {
+    if let Some(other) = group_of(core, openid) && other != gid { return Err("这个 QQ 群已经连到另一个 Disco 群聊".into()); }
+    core.db().set_setting(&format!("{GROUP}{gid}"), openid).map_err(err)?;
+    core.db().set_setting(&format!("{OF}{openid}"), gid).map_err(err)?;
+    core.db().set_setting(&format!("{ME}{openid}"), member).map_err(err)?;
+    let _ = core.db().audit("qq", None, "qq.bind", &format!("{gid} ↔ QQ 群 …{}", tail(openid)));
+    Ok(())
+}
+
 /// `**Name**：text` from another Disco's bot.
 fn relayed(text: &str) -> Option<(&str, &str)> {
     let (name, rest) = text.strip_prefix("**")?.split_once("**：")?;
@@ -377,32 +485,99 @@ impl Core {
                     self.agents_changed();
                 }
             }
+            // Pulled into a group: say hello (QQ allows one message per event) and remember
+            // the group, so Settings → QQ can tie it even before anyone @'s the bot.
+            // No event id: never dedupe (a fixed "added" key would greet only the first group).
+            Kind::Added if m.id.is_empty() || first_time(&format!("added{}", m.id)) => {
+                note_seen(self, &m);
+                let _ = self.db().audit("qq", None, "qq.added", &format!("QQ 群 …{}{}", tail(&m.group), if m.author_id.is_empty() { String::new() } else { format!("，由 …{}", tail(&m.author_id)) }));
+                let _ = self.app.emit("qq", "");
+                tauri::async_runtime::spawn(async move { c.qq_welcome(m).await });
+            }
+            Kind::Gate(refused) => {
+                let what = if refused { "GROUP_MSG_REJECT" } else { "GROUP_MSG_RECEIVE" };
+                lock(&DIAG).gate = format!("{} · QQ 群 …{}", if refused { "QQ 已拒收本机器人在该群的消息" } else { "QQ 恢复接收" }, tail(&m.group));
+                lock(&DIAG).gate_at = now_ms();
+                let _ = self.db().audit("qq", None, "qq.gate", &format!("{what} {}", m.group));
+                let _ = self.app.emit("qq", "");
+            }
             Kind::Group if first_time(&m.id) => { tauri::async_runtime::spawn(async move { c.qq_group_message(m).await }); }
             Kind::Direct if first_time(&m.id) => { tauri::async_runtime::spawn(async move { c.qq_direct(m).await }); }
             _ => {}
         }
     }
 
+    /// Pulled into a QQ group: one welcome (as an event-triggered message when the event
+    /// carries an id), saying how to tie the group to Disco. A failure is recorded, never
+    /// swallowed (QQ may not allow either kind of message in that group).
+    async fn qq_welcome(self: &Arc<Self>, m: Incoming) {
+        let Some(rest) = rest() else { return };
+        let to = To::Group(m.group.clone());
+        let text = "大家好，我是 Disco 的 QQ 机器人。\n请在 Disco 里新建群聊并打开「同步到 QQ 群」，把那里的 4 位绑定码发到本群；或者直接 @我 说话，我会给群主一个绑定码。";
+        let r = if m.id.is_empty() { post(&rest, &to, "", text).await }
+            else { post_event(&rest, &to, text, &m.id).await };
+        if let Err(e) = &r {
+            let _ = self.db().audit("qq", None, "qq.error", &format!("进群欢迎发送失败：{e}"));
+            note_send_error(e);
+        }
+    }
+
+    /// Redeem a group code from the bot's private chat: make a Disco group for that QQ
+    /// group, tie them, and say so in both places. Returns what to tell the sender.
+    async fn qq_bind_by_code(self: &Arc<Self>, openid: &str, member: &str) -> String {
+        // Already tied (a second code redeemed): say so instead of leaving an orphan group behind.
+        if group_of(self, openid).is_some() { return "这个 QQ 群已经连到 Disco 群聊了，回群里 @我 说话就行。".into(); }
+        match new_group_for(self, openid).and_then(|gid| tie(self, &gid, openid, member).map(|()| gid)) {
+            Err(e) => { let _ = self.db().audit("qq", None, "qq.error", &e); e }
+            Ok(gid) => {
+                let name = self.db().list_groups().ok().and_then(|gs| gs.into_iter().find(|g| g.id == gid)).map(|g| g.name).unwrap_or_default();
+                self.post_message(&format!("group:{gid}"), "system", &format!("已和 QQ 群 …{} 连上。在 QQ 群里 @机器人 并写 @agent 名字来叫 agent。", tail(openid)));
+                self.agents_changed();
+                let _ = self.app.emit("qq", "");
+                // Say it in the QQ group too: an active message, so it needs that group's 主动消息 permission.
+                if let Some(rest) = rest() {
+                    let (g, text) = (To::Group(openid.to_owned()), format!("已和 Disco 群聊「{name}」连上 ✅\n@我 说话，组长会回答；想叫某个 agent，就在话里写 @它的名字。\n/help 查看用法"));
+                    tauri::async_runtime::spawn(async move { if let Err(e) = post(&rest, &g, "", &text).await { note_send_error(&e); } });
+                }
+                format!("好了，这个 QQ 群已经连到新建的 Disco 群聊「{name}」。回群里 @我 说话就行。")
+            }
+        }
+    }
+
+    /// @'ed in a QQ group that is not tied to a Disco group: say how to tie it and hand out
+    /// a code the owner can redeem from the bot's private chat (`绑定群 1234`). Before
+    /// v1.11.2 this said nothing at all, so a freshly added bot looked dead.
+    async fn qq_unbound(self: &Arc<Self>, m: Incoming) {
+        let Some(rest) = rest() else { return };
+        let code = group_code(&m.group, &m.author_id);
+        let text = format!("这个 QQ 群还没连到 Disco。\n· 群主可以在 Disco 里「新建群聊」→ 打开「同步到 QQ 群」，把那里的 4 位绑定码发到本群；\n· 或者用手机 QQ 私聊我发「绑定群 {code}」，我会在 Disco 里新建一个群聊并连上本群（10 分钟内有效，发这条消息的人算作群主本人）。");
+        if let Err(e) = post(&rest, &To::Group(m.group.clone()), "", &text).await {
+            let _ = self.db().audit("qq", None, "qq.error", &format!("未绑定群提示发送失败：{e}"));
+        }
+    }
+
     async fn qq_group_message(self: &Arc<Self>, m: Incoming) {
         lock(&REPLY).get_or_insert_with(HashMap::new).insert(To::Group(m.group.clone()), (m.id.clone(), Instant::now(), 1));
         let Some(gid) = group_of(self, &m.group) else {
-            // Not tied to a Disco group yet: only a bind code means anything here.
-            let Some(code) = bind_code(&m.content) else { return };
-            let found = {
-                let mut codes = lock(&CODES);
-                codes.retain(|c| c.2.elapsed() < CODE_TTL);
-                codes.iter().position(|c| c.0 == code && !c.1.is_empty()).map(|i| codes.remove(i).1)
-            };
-            let Some(gid) = found else { return };
-            let name = self.db().list_groups().ok().and_then(|gs| gs.into_iter().find(|g| g.id == gid)).map(|g| g.name).unwrap_or_default();
-            let _ = self.db().set_setting(&format!("{GROUP}{gid}"), &m.group);
-            let _ = self.db().set_setting(&format!("{OF}{}", m.group), &gid);
-            let _ = self.db().set_setting(&format!("{ME}{}", m.group), &m.author_id);
-            self.post_message(&format!("group:{gid}"), "system", &format!("已和 QQ 群连上，绑定人 {} 算作你本人。在 QQ 群里 @机器人 并写 @agent 名字来叫 agent。", m.author));
-            self.agents_changed();
-            if let Some(rest) = rest() {
-                let _ = post(&rest, &To::Group(m.group.clone()), "", &format!("已和 Disco 群聊「{name}」连上 ✅\n@我 说话，组长会回答；想叫某个 agent，就在话里写 @它的名字。\n/help 查看用法")).await;
+            // Not tied to a Disco group yet: a bind code ties it (from Disco's own
+            // 「获取绑定码」), anything else gets a hint instead of silence.
+            if let Some(code) = bind_code(&m.content) && let Some(gid) = take_code(code, |t| t.starts_with("g:")).map(|t| t[2..].to_owned()) {
+                let name = self.db().list_groups().ok().and_then(|gs| gs.into_iter().find(|g| g.id == gid)).map(|g| g.name).unwrap_or_default();
+                if let Err(e) = tie(self, &gid, &m.group, &m.author_id) {
+                    let _ = self.db().audit("qq", None, "qq.error", &e);
+                    return;
+                }
+                self.post_message(&format!("group:{gid}"), "system", &format!("已和 QQ 群连上，绑定人 {} 算作你本人。在 QQ 群里 @机器人 并写 @agent 名字来叫 agent。", m.author));
+                self.agents_changed();
+                if let Some(rest) = rest() {
+                    let _ = post(&rest, &To::Group(m.group.clone()), "", &format!("已和 Disco 群聊「{name}」连上 ✅\n@我 说话，组长会回答；想叫某个 agent，就在话里写 @它的名字。\n/help 查看用法")).await;
+                }
+                return;
             }
+            // Remember the group (Settings → QQ lists it) and, when @'ed, say how to tie it.
+            note_seen(self, &m);
+            let _ = self.app.emit("qq", "");
+            if m.at_me && !m.bot { self.qq_unbound(m).await; }
             return;
         };
         let (author, mut text) = if m.bot {
@@ -442,11 +617,8 @@ impl Core {
         let say = |text: String| { let to = to.clone(); async move { if let Some(r) = rest() { let _ = post(&r, &to, "", &text).await; } } };
         let me = owner(self);
         // `绑定 1234` with the code from Settings → QQ「认领私聊」: this sender is the owner.
-        let claimed = bind_code(&m.content).is_some_and(|code| {
-            let mut codes = lock(&CODES);
-            codes.retain(|c| c.2.elapsed() < CODE_TTL);
-            codes.iter().position(|c| c.0 == code && c.1.is_empty()).map(|i| codes.remove(i)).is_some()
-        });
+        let code = bind_code(&m.content);
+        let claimed = code.is_some_and(|code| take_code(code, |t| t.is_empty()).is_some());
         if claimed || me.is_none() {
             // The scan did not say who scanned (or the owner re-claims): this sender is the owner.
             let _ = self.db().set_setting(OWNER, &m.author_id);
@@ -463,6 +635,27 @@ impl Core {
             let first = { let mut t = lock(&TOLD); let f = !t.contains(&m.author_id); if f { t.push(m.author_id.clone()); } f };
             if first { say("这个机器人连着别人的 Disco，只接主人的私聊。如果你就是主人：在 Disco 设置 → QQ 点「认领私聊」，把显示的「绑定 1234」发给我。".into()).await; }
             return;
+        }
+        // `绑定群 1234` (or `绑定 1234` with a group code): the code the bot gave out in a
+        // QQ group. Ties that group to a new Disco group and makes the person who @'d there
+        // the owner in it.
+        let group_code_text = group_bind_code(&m.content).or(code.filter(|_| !claimed));
+        if let Some(got) = group_code_text {
+            match take_code(got, |t| t.starts_with("q:")) {
+                Some(target) => {
+                    let (openid, member) = target[2..].split_once('/').map(|(o, m)| (o.to_owned(), m.to_owned()))
+                        .unwrap_or_else(|| (target[2..].to_owned(), String::new()));
+                    let said = self.qq_bind_by_code(&openid, &member).await;
+                    say(said).await;
+                    return;
+                }
+                // A code we do not know (and did not just claim): only say so when they asked to bind a group.
+                None if group_bind_code(&m.content).is_some() => {
+                    say("这个绑定码不对或已经过期。在 QQ 群里 @机器人 一句话，它会给一个新的。".into()).await;
+                    return;
+                }
+                None => {}
+            }
         }
         let agents = qq_agents(self);
         if agents.is_empty() {
@@ -532,7 +725,22 @@ pub struct QqStatus {
     owner: bool,
     /// QQ groups tied to Disco groups.
     groups: usize,
+    /// QQ groups the bot is in that are not tied to one (Settings → QQ lists them).
+    unbound: Vec<QqSeen>,
     diag: Diag,
+}
+
+/// A QQ group the bot was talked to (or added to) in, without a Disco group behind it.
+#[derive(Clone, Serialize)]
+pub struct QqSeen {
+    /// The group's openid.
+    openid: String,
+    /// When it was last heard from (Unix ms).
+    at: u64,
+    /// Who spoke last (their QQ name in that group, "" when unknown).
+    who: String,
+    /// Their member openid in that group (the one who would count as the owner).
+    member: String,
 }
 
 fn status(core: &Core) -> QqStatus {
@@ -544,7 +752,8 @@ fn status(core: &Core) -> QqStatus {
     let groups = core.db().settings_with_prefix(GROUP).map(|v| v.iter().filter(|(_, g)| !g.is_empty()).count()).unwrap_or(0);
     let status = lock(&STATUS).clone();
     let diag = lock(&DIAG).clone();
-    QqStatus { bound, status, name, url: qr.as_ref().map(|q| q.1.clone()), qr: qr.map(|q| q.0), owner, groups, diag }
+    let unbound = unbound(core);
+    QqStatus { bound, status, name, url: qr.as_ref().map(|q| q.1.clone()), qr: qr.map(|q| q.0), owner, groups, unbound, diag }
 }
 
 /// For the overview: "" when no bot is bound.
@@ -649,11 +858,10 @@ pub fn qq_group_code(core: St<'_>, group: String, unbind: Option<bool>) -> CmdRe
     if core.db().setting(SET_ON).as_deref() != Some("1") { return Err("先在设置里扫码绑定 QQ 机器人".into()); }
     let code = {
         let mut codes = lock(&CODES);
-        codes.retain(|c| c.2.elapsed() < CODE_TTL && c.1 != group);
-        let mut n = (uuid::Uuid::new_v4().as_u128() % 9000 + 1000) as u32;
-        while codes.iter().any(|c| c.0 == n.to_string()) { n = n % 9000 + 1000 + 1; }
-        codes.push((n.to_string(), group.clone(), Instant::now()));
-        n.to_string()
+        codes.retain(|c| c.2.elapsed() < CODE_TTL && c.1 != format!("g:{group}"));
+        let n = new_code(&codes);
+        codes.push((n.clone(), format!("g:{group}"), Instant::now()));
+        n
     };
     core.post_message(&format!("group:{group}"), "system", &format!("把 QQ 机器人拉进你的 QQ 群，在群里 @机器人 发送：绑定 {code}\n（10 分钟内有效；发送的人会被当作你本人）"));
     Ok(code)
@@ -664,12 +872,47 @@ pub fn qq_group_code(core: St<'_>, group: String, unbind: Option<bool>) -> CmdRe
 #[tauri::command]
 pub fn qq_claim_code(core: St<'_>) -> CmdResult<String> {
     if !bound(&core) { return Err("先在设置里扫码接入 QQ 机器人".into()); }
-    let mut codes = lock(&CODES);
-    codes.retain(|c| c.2.elapsed() < CODE_TTL && !c.1.is_empty());
-    let mut n = (uuid::Uuid::new_v4().as_u128() % 9000 + 1000) as u32;
-    while codes.iter().any(|c| c.0 == n.to_string()) { n = n % 9000 + 1000 + 1; }
-    codes.push((n.to_string(), String::new(), Instant::now()));
-    Ok(n.to_string())
+    let code = {
+        let mut codes = lock(&CODES);
+        codes.retain(|c| c.2.elapsed() < CODE_TTL && !c.1.is_empty());
+        let n = new_code(&codes);
+        codes.push((n.clone(), String::new(), Instant::now()));
+        n
+    };
+    Ok(code)
+}
+
+/// Tie a QQ group the bot is in (but that is not tied yet) to a Disco group in one click:
+/// a new local group "QQ群 xxxx" with the QQ-synced agents, unless `group` names one.
+/// The person who last @'d the bot there counts as the owner in that group.
+#[tauri::command]
+pub fn qq_bind_group(core: St<'_>, openid: String, group: Option<String>) -> CmdResult<QqStatus> {
+    if !bound(&core) { return Err("先在设置里扫码接入 QQ 机器人".into()); }
+    let openid = openid.trim().to_owned();
+    if openid.is_empty() { return Err("没有这个 QQ 群".into()); }
+    let gid = match group.filter(|g| !g.is_empty()) {
+        Some(gid) => {
+            let ok = core.db().list_groups().map_err(err)?.into_iter().any(|g| g.id == gid && g.id.starts_with("local-"));
+            if !ok { return Err("这个群聊已经同步到 Discord 频道，QQ 群请新建一个群聊绑定".into()); }
+            gid
+        }
+        None => {
+            if group_of(&core, &openid).is_some() { return Err("这个 QQ 群已经连到 Disco 群聊了".into()); }
+            new_group_for(&core, &openid)?
+        }
+    };
+    let member = core.db().setting(&format!("{UNSEEN}{openid}")).and_then(|j| serde_json::from_str::<Seen>(&j).ok()).map(|s| s.member).unwrap_or_default();
+    tie(&core, &gid, &openid, &member)?;
+    let name = core.db().list_groups().map_err(err)?.into_iter().find(|g| g.id == gid).map(|g| g.name).unwrap_or_default();
+    core.post_message(&format!("group:{gid}"), "system", &format!("已和 QQ 群 …{} 连上{}。在 QQ 群里 @机器人 并写 @agent 名字来叫 agent。", tail(&openid),
+        if member.is_empty() { String::new() } else { "，在群里 @ 过机器人的那个人算作你本人".to_owned() }));
+    // Confirm in the QQ group (an active message: it needs that group's 主动消息 permission).
+    if let Some(rest) = rest() {
+        let (g, text) = (To::Group(openid.clone()), format!("已和 Disco 群聊「{name}」连上 ✅\n@我 说话，组长会回答；想叫某个 agent，就在话里写 @它的名字。\n/help 查看用法"));
+        tauri::async_runtime::spawn(async move { if let Err(e) = post(&rest, &g, "", &text).await { note_send_error(&e); } });
+    }
+    core.agents_changed();
+    Ok(status(&core))
 }
 
 /// Drop the connection and connect again (fresh token, fresh session).
@@ -730,6 +973,12 @@ pub(crate) async fn diagnose(core: &Core) -> Vec<(String, Result<String, String>
         (None, _) => Err("还不知道你的 QQ：用手机 QQ 给机器人发一条私聊".into()),
     }));
     out.push(("QQ 发送".into(), if d.send_error.is_empty() { Ok("没有失败记录".into()) } else { Err(format!("{}：{}", ago(d.send_error_at), d.send_error)) }));
+    let unb = unbound(core);
+    out.push(("QQ 未绑定的群".into(), if unb.is_empty() { Ok("没有".into()) } else {
+        Err(format!("{} 个群里 @ 了机器人但还没连上（…{}）：到设置 → QQ 点「绑定到新群聊」，或在群里 @我 后按提示私聊「绑定群 1234」",
+            unb.len(), unb.iter().map(|u| tail(&u.openid)).collect::<Vec<_>>().join("、")))
+    }));
+    if !d.gate.is_empty() { out.push(("QQ 群消息".into(), Err(format!("{}（{}）", d.gate, ago(d.gate_at))))); }
     let summary: Vec<String> = out.iter().map(|(n, r)| format!("{n}={}", if r.is_ok() { "ok" } else { "fail" })).collect();
     let _ = core.db().audit("qq", None, "qq.diagnose", &summary.join(" "));
     out
@@ -761,6 +1010,27 @@ mod tests {
         lock(&REPLY).get_or_insert_with(HashMap::new).insert(u.clone(), ("c1".into(), Instant::now() - Duration::from_secs(3600), 1));
         assert_eq!(reply_slot(&u, 1), None);
         assert!(first_time("x-1") && !first_time("x-1") && first_time(""));
+    }
+
+    /// Bind codes: `绑定群 1234` (a QQ group, redeemed privately) vs `绑定 1234` (a Disco
+    /// group, sent in the group) vs a bare code (claim the private chat).
+    #[test]
+    fn codes_and_bind_targets() {
+        assert_eq!(group_bind_code("绑定群 1234"), Some("1234"));
+        assert_eq!(group_bind_code(" /绑定群 0042 "), Some("0042"));
+        assert_eq!(group_bind_code("/bindgroup 0042"), Some("0042"));
+        assert_eq!(group_bind_code("绑定群 12345"), None);
+        assert_eq!(bind_code("绑定群 1234"), None, "a group code is never an owner-claim code");
+        lock(&CODES).clear();
+        let g = group_code("G-x", "U-x");
+        assert_eq!(g.len(), 4);
+        assert_eq!(group_code("G-x", "U-x"), g, "one group keeps one code");
+        assert_ne!(group_code("G-y", "U-y"), g);
+        assert_eq!(take_code(&g, |t| t.starts_with("q:")), Some("q:G-x/U-x".to_owned()));
+        assert_eq!(take_code(&g, |t| t.starts_with("q:")), None, "a code is used up once");
+        let n = { let mut codes = lock(&CODES); let n = new_code(&codes); codes.push((n.clone(), "g:local-1".into(), Instant::now())); n };
+        assert_eq!(take_code(&n, |t| t.starts_with("g:")), Some("g:local-1".to_owned()));
+        assert_eq!(take_code(&n, |t| t.is_empty()), None);
     }
 
     #[test]

@@ -1055,6 +1055,28 @@ class Audit:
         await self.js("STUB.qq.status = '在线 · DiscoBot'; Object.assign(STUB.qq.diag, { error: '', send_error: '', stranger: '' })")
         await self.fire("qq", "")
         await pg.wait_for_function("document.querySelector('#qq-status')?.textContent === '在线 · DiscoBot'")
+        # every dispatch type is shown, group @ messages included
+        await self.js("Object.assign(STUB.qq.diag, { event: 'GROUP_AT_MESSAGE_CREATE', event_at: Date.now() - 2000, events: 7 })")
+        await self.fire("qq", "")
+        await pg.wait_for_function("document.querySelector('#qq-event')?.textContent.includes('GROUP_AT_MESSAGE_CREATE')")
+        self.ok("Q10 group @ message shown as received", "共 7 个" in await self.text("#qq-event"))
+        # GROUP_MSG_REJECT / GROUP_MSG_RECEIVE come through as a row too
+        await self.js("Object.assign(STUB.qq.diag, { gate: 'QQ 已拒收本机器人在该群的消息 · QQ 群 …G9ABCD', gate_at: Date.now() - 30000 })")
+        await self.fire("qq", "")
+        self.ok("Q10 group message gate shown", await self.wait("#qq-gate") and "拒收" in await self.text("#qq-gate"))
+        await self.js("Object.assign(STUB.qq.diag, { gate: '', gate_at: 0 })")
+        await self.fire("qq", "")
+        # v1.11.2: a group the bot was @'ed in but that is not tied yet → one-click bind
+        await self.js("STUB.qq.unbound = [{ openid: 'G9ABCDEF', at: Date.now() - 120000, who: '阿杰', member: 'U9' }]")
+        await self.step("qq reload 3", lambda: self.fire("qq", ""))
+        row = f"{sec} .grow-row:has(.gl:text-is('未绑定的 QQ 群'))"
+        self.ok("Q11 unbound group listed", await self.wait(row) and "ABCDEF" in await self.text(row) and "阿杰" in await self.text(row))
+        m = await self.mark()
+        await self.step("bind to a new group", lambda: pg.click(f"{row} button:text-is('绑定到新群聊')"))
+        await self.expect("Q11 绑定到新群聊", "qq_bind_group", m, lambda a: a.get("openid") == "G9ABCDEF")
+        self.ok("Q11 row gone once tied", await self.wait(row, state="detached"))
+        self.ok("Q11 no button inside a label", await self.js("document.querySelectorAll('#set-qq label button').length") == 0)
+        await self.js("STUB.qq.unbound = []")
         # group editor: new group for a QQ group
         await self.tab("groups")
         m = await self.mark()

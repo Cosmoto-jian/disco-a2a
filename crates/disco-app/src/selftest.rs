@@ -1037,6 +1037,65 @@ pub fn spawn(app: AppHandle, mock: String) {
             until(10, || qlog("c2c:OWNER").iter().any(ack)).await?;
             let st2 = serde_json::to_value(crate::qq::qq_status(st())).map_err(|e| e.to_string())?;
             if told && st2["owner"] == true && st2["diag"]["stranger"] == "" { Ok(String::new()) } else { Err(format!("told={told} {st2}")) } });
+        // v1.11.2: a QQ group the bot was just pulled into — @机器人 there used to be silent.
+        let _ = check!("QQ 未绑定的群：@机器人 得到提示和绑定码，私聊「绑定群 1234」一键连上", {
+            // As the real gateway delivers it (reference GroupMessageEvent): group_openid +
+            // group_id, author.member_openid, the bot's own mention in `mentions`.
+            let pushed = push_qq(serde_json::json!({ "op": 0, "t": "GROUP_AT_MESSAGE_CREATE", "d": { "id": "a1",
+                "content": "你好", "timestamp": "2026-10-30T16:00:00+08:00", "group_openid": "G2", "group_id": "G2",
+                "author": { "id": "U2", "member_openid": "U2", "username": "阿杰" },
+                "mentions": [{ "member_openid": "102", "is_you": true }], "message_scene": { "source": "group" } } }));
+            if !pushed { return Err("模拟网关没有连接".into()); }
+            let hint = |b: &serde_json::Value| b["msg_id"] == "a1" && b["markdown"]["content"].as_str().unwrap_or_default().contains("还没连到 Disco")
+                && b["markdown"]["content"].as_str().unwrap_or_default().contains("绑定群 ");
+            until(10, || qlog("msg:G2").iter().any(hint)).await.map_err(|e| format!("{e} {:?}", qlog("msg:G2")))?;
+            let said = qlog("msg:G2").into_iter().find(|b| b["msg_id"] == "a1").map(|b| b["markdown"]["content"].as_str().unwrap_or_default().to_owned()).unwrap_or_default();
+            let code = said.split_whitespace().find(|w| w.len() == 4 && w.bytes().all(|b| b.is_ascii_digit())).map(str::to_owned)
+                .ok_or_else(|| format!("提示里没有 4 位绑定码：{said}"))?;
+            // The owner redeems it in the bot's private chat: a new Disco group is made and tied.
+            feed("C2C_MESSAGE_CREATE", serde_json::json!({ "id": "c9", "content": format!("绑定群 {code}"), "author": { "user_openid": "OWNER" } }))?;
+            let tied = |b: &serde_json::Value| b["markdown"]["content"].as_str().unwrap_or_default().contains("已和 Disco 群聊");
+            until(10, || qlog("msg:G2").iter().any(tied)).await.map_err(|e| format!("{e} {:?}", qlog("msg:G2")))?;
+            let ack = |b: &serde_json::Value| b["msg_id"] == "c9" && b["markdown"]["content"].as_str().unwrap_or_default().contains("已经连到新建的 Disco 群聊");
+            until(10, || c2c().iter().any(ack)).await.map_err(|e| format!("{e} {:?}", c2c()))?;
+            let ov = within(5, crate::overview(st())).await??;
+            let made = ov.groups.iter().find(|g| g.qq && g.name.starts_with("QQ群")).map(|g| (g.id.clone(), g.members.first().cloned().unwrap_or_default())).ok_or("没有为 QQ 群新建 Disco 群聊")?;
+            if crate::qq::openid_of(&core, &made.0).as_deref() != Some("G2") { return Err(format!("{:?}", crate::qq::openid_of(&core, &made.0))); }
+            // The person who @'d there is the owner in that group now, and @bot reaches the lead.
+            let lead = made.1.clone();
+            let thread2 = format!("group:{}", made.0);
+            let n = count(&core, &thread2, &lead);
+            let pushed = push_qq(serde_json::json!({ "op": 0, "t": "GROUP_AT_MESSAGE_CREATE", "d": { "id": "a2", "content": "你好",
+                "timestamp": "2026-10-30T16:01:00+08:00", "group_openid": "G2", "author": { "id": "U2", "member_openid": "U2", "username": "阿杰" } } }));
+            if !pushed { return Err("模拟网关没有连接".into()); }
+            wait_msg(&core, &thread2, &lead, n, 30).await?;
+            let mine = last_from(&core, &thread2, "me").unwrap_or_default();
+            if mine != format!("@{lead} 你好") { return Err(format!("{mine:?} lead={lead}")); }
+            // An unbound group that nobody @'ed (G9, earlier) is listed but left alone.
+            let st2 = serde_json::to_value(crate::qq::qq_status(st())).map_err(|e| e.to_string())?;
+            if !qlog("msg:G9").is_empty() { return Err(format!("没 @ 的未绑定群不该收到回复：{:?}", qlog("msg:G9"))); }
+            if st2["unbound"].as_array().is_none_or(|v| !v.iter().any(|u| u["openid"] == "G9")) { return Err(format!("未绑定群列表：{}", st2["unbound"])); }
+            Ok(made.0)
+        });
+        let _ = check!("QQ 机器人被拉进群（GROUP_ADD_ROBOT）：打招呼，并记进未绑定列表", {
+            let pushed = push_qq(serde_json::json!({ "op": 0, "t": "GROUP_ADD_ROBOT", "d": { "id": "E1", "group_openid": "G3",
+                "op_member_openid": "U3", "timestamp": "2026-10-30T16:02:00+08:00" } }));
+            if !pushed { return Err("模拟网关没有连接".into()); }
+            // One event-triggered message: `event_id` E1 in place of a replied-to msg_id.
+            let hello = |b: &serde_json::Value| b["event_id"] == "E1" && b["markdown"]["content"].as_str().unwrap_or_default().contains("绑定");
+            until(10, || qlog("msg:G3").iter().any(hello)).await.map_err(|e| format!("{e} {:?}", qlog("msg:G3")))?;
+            let st2 = serde_json::to_value(crate::qq::qq_status(st())).map_err(|e| e.to_string())?;
+            if st2["diag"]["event"] != "GROUP_ADD_ROBOT" { return Err(format!("{}", st2["diag"])); }
+            if st2["unbound"].as_array().is_none_or(|v| !v.iter().any(|u| u["openid"] == "G3")) { return Err(format!("未绑定群列表：{}", st2["unbound"])); }
+            // Settings → QQ「绑定到新群聊」: one click ties it to a brand-new Disco group.
+            let s = serde_json::to_value(crate::qq::qq_bind_group(st(), "G3".into(), None)).map_err(|e| e.to_string())?;
+            if s["unbound"].as_array().is_none_or(|v| v.iter().any(|u| u["openid"] == "G3")) { return Err(format!("绑定后还在未绑定列表：{}", s["unbound"])); }
+            let ov = within(5, crate::overview(st())).await??;
+            let made = ov.groups.iter().find(|g| g.qq && g.name.starts_with("QQ群") && g.id != qgid).map(|g| (g.id.clone(), g.name.clone())).ok_or("没有新建群聊")?;
+            if crate::qq::openid_of(&core, &made.0).as_deref() != Some("G3") { return Err(format!("{:?}", crate::qq::openid_of(&core, &made.0))); }
+            until(10, || qlog("msg:G3").iter().any(|b| b["markdown"]["content"].as_str().unwrap_or_default().contains("已和 Disco 群聊"))).await?;
+            Ok(made.1)
+        });
         let _ = check!("QQ 一键诊断：凭据、token、实时连接、收到的事件、私聊主人", {
             let rows = crate::qq::diagnose(&core).await;
             let get = |n: &str| rows.iter().find(|(k, _)| k == n).map(|(_, r)| r.clone());
