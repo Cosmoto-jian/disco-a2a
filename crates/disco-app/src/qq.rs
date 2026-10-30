@@ -49,6 +49,7 @@ const REPLY_MAX: u32 = 5;
 
 struct Conn { rest: Rest, stop: watch::Sender<bool> }
 static CONN: Mutex<Option<Conn>> = Mutex::new(None);
+static CONN_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static STATUS: Mutex<String> = Mutex::new(String::new());
 /// The bind task on screen: (task, its QR code as SVG, generation).
 static QR: Mutex<Option<(Bind, String, u64)>> = Mutex::new(None);
@@ -327,7 +328,11 @@ pub(crate) fn connect(core: &Arc<Core>) {
     if let Some(old) = lock(&CONN).replace(Conn { rest: rest.clone(), stop: stop_tx }) { let _ = old.stop.send(true); }
     let (tx, mut rx) = mpsc::channel::<Incoming>(64);
     let c = core.clone();
-    tauri::async_runtime::spawn(disco_qq::run_gateway(rest, tx, stop_rx, move |s| on_gateway(&c, s)));
+    // Only the newest connection may set the status (a replaced one still reports "stopped").
+    let generation = CONN_GEN.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+    tauri::async_runtime::spawn(disco_qq::run_gateway(rest, tx, stop_rx, move |s| {
+        if CONN_GEN.load(std::sync::atomic::Ordering::SeqCst) == generation { on_gateway(&c, s); }
+    }));
     let c = core.clone();
     tauri::async_runtime::spawn(async move { while let Some(m) = rx.recv().await { c.on_qq(m); } });
 }
