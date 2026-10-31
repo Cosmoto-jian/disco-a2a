@@ -1018,9 +1018,11 @@ impl Core {
             }
         }
         if text.trim().is_empty() { return; }
-        // @ the bot without naming an agent = ask the lead.
+        // @ the bot without naming an agent = ask the lead; a bot dedicated to an agent of
+        // this group asks that agent instead (it speaks for nobody else).
         let group = self.db().list_groups().ok().and_then(|gs| gs.into_iter().find(|g| g.id == gid));
-        let lead = group.as_ref().and_then(|g| g.lead_agent.clone().or_else(|| g.members.first().cloned())).unwrap_or_default();
+        let own = bot_agent(self, app).filter(|a| group.as_ref().is_some_and(|g| g.members.contains(a)));
+        let lead = own.or_else(|| group.as_ref().and_then(|g| g.lead_agent.clone().or_else(|| g.members.first().cloned()))).unwrap_or_default();
         // A `/command` in the QQ group: Disco answers /help /agents /tools /new /stop
         // itself; anything else goes to the agent as typed.
         if !m.bot && let Some(g) = &group && let Some(reply) = slash(self, &g.members, &lead, &format!("group:{gid}"), &text).await {

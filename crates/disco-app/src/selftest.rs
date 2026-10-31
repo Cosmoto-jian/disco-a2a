@@ -1250,7 +1250,10 @@ pub fn spawn(app: AppHandle, mock: String) {
             until(10, || { let tie = core.db().setting(&key); tie.as_deref() == Some("H1") }).await.map_err(|e| { let tie = core.db().setting(&key); format!("{e} {tie:?}") })?;
             let ack = |b: &serde_json::Value| b["_app"] == "103" && md(b).contains(&format!("已经连到 Disco 群聊「{label}」"));
             until(10, || qlog("c2c:OWNER3").iter().any(ack)).await.map_err(|e| format!("{e} {:?}", qlog("c2c:OWNER3")))?;
-            // @ the dedicated bot in that QQ group: the lead (mq) answers, through bot 103, unsigned.
+            // @ the dedicated bot in that QQ group: its agent (mq) answers, not the group's lead
+            // (made m1 here), through bot 103, unsigned.
+            let row = core.db().list_groups().map_err(|e| e.to_string())?.into_iter().find(|g| g.id == gid).ok_or("群聊不见了")?;
+            core.db().upsert_group(&disco_store::GroupRow { lead_agent: Some("m1".into()), members: vec!["m1".into(), "mq".into()], ..row }).map_err(|e| e.to_string())?;
             let thread = format!("group:{gid}");
             let shared_before: usize = ["msg:G2", "msg:G3"].iter().map(|k| qlog(k).len()).sum();
             let n = count(&core, &thread, "mq");
@@ -1267,8 +1270,9 @@ pub fn spawn(app: AppHandle, mock: String) {
             let shared_after: usize = ["msg:G2", "msg:G3"].iter().map(|k| qlog(k).len()).sum();
             let routed = crate::qq::target_for(&core, &thread, Some("mq")).map(|r| r.app).unwrap_or_default();
             let others = crate::qq::target_for(&core, &thread, Some("m1")).map(|r| r.app).unwrap_or_default();
-            if mine_said == "@mq 在吗" && plain && shared_after == shared_before && routed == "103" && others == "102" { Ok(label) }
-            else { Err(format!("me={mine_said:?} plain={plain} shared {shared_before}->{shared_after} routed={routed} others={others}")) } });
+            let lead_quiet = count(&core, &thread, "m1") == 0;
+            if mine_said == "@mq 在吗" && plain && shared_after == shared_before && routed == "103" && others == "102" && lead_quiet { Ok(label) }
+            else { Err(format!("me={mine_said:?} plain={plain} shared {shared_before}->{shared_after} routed={routed} others={others} lead_quiet={lead_quiet}")) } });
         let _ = check!("QQ 多机器人：删掉专用机器人，agent 回到共享机器人；删掉共享机器人，剩下的接替", {
             let s = serde_json::to_value(crate::qq::qq_remove_bot(st(), "103".into())?).map_err(|e| e.to_string())?;
             let n = s["bots"].as_array().map_or(0, Vec::len);
@@ -1288,12 +1292,14 @@ pub fn spawn(app: AppHandle, mock: String) {
             if crate::qq::openid_of(&core, &qgid).is_none() && s["bound"] == false && crate::secret_get("qq_bot").is_none() && refused && crate::qq::owner(&core).is_none() { Ok(String::new()) } else { Err(format!("{s} refused={refused}")) } });
         let _ = check!("QQ 老版本（单机器人）设置升级时静默迁移", {
             // A v1.12 install: qq_on + the "qq_bot" keychain entry, tie keys without an AppID.
-            for k in ["qq_bots", "qq_legacy"] { core.db().set_setting(k, "").map_err(|e| e.to_string())?; }
+            // Everything a v1.12 install has first, the v1.13 rows dropped last: the app's own UI
+            // may read QQ state at any moment (and would record "no bots" in between).
             crate::secret_set("qq_bot", &serde_json::json!({ "app_id": "102", "secret": "sec-old" }).to_string())?;
             let gid = "local-legacy";
             for (k, v) in [("qq_on", "1"), ("qq_owner", "OWNER"), ("qq_name", "OldBot"), ("qq_group/local-legacy", "GL"), ("qq_of/GL", gid), ("qq_me/GL", "UL")] {
                 core.db().set_setting(k, v).map_err(|e| e.to_string())?;
             }
+            for k in ["qq_legacy", "qq_bots"] { core.db().set_setting(k, "").map_err(|e| e.to_string())?; }
             let v = serde_json::to_value(crate::qq::qq_status(st())).map_err(|e| e.to_string())?;
             let row = v["bots"][0].clone();
             // One db() lock per statement.
