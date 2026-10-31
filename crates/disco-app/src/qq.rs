@@ -25,17 +25,27 @@ use tokio::sync::{mpsc, watch};
 use crate::{CmdResult, Core, St, err, secret_del, secret_get, secret_set};
 
 const VAULT: &str = "qq_bot";
+/// Every bot but the first keeps its credentials under `"qq_bot:<AppID>"`: the first one
+/// bound (and every install bound before v1.13) stays on the legacy "qq_bot" account.
+const LEGACY: &str = "qq_legacy";
 /// "1" once a bot is bound (the keychain is only read when this is set).
 const SET_ON: &str = "qq_on";
+/// All bound bots, oldest first: JSON of [`Vec<BotRow>`].
+const BOTS: &str = "qq_bots";
 const SET_NAME: &str = "qq_name";
-/// Disco group id → QQ group openid, and back.
+/// The bot's name / owner, per bot but the first (which keeps the keys above).
+const NAME_OF: &str = "qq_name/";
+const OWNER_OF: &str = "qq_owner/";
+/// Disco group id + AppID → QQ group openid, and back: a QQ group openid only means
+/// something to the bot that sees it, and one Disco group may be tied to one QQ group
+/// per bot.
 const GROUP: &str = "qq_group/";
 const OF: &str = "qq_of/";
-/// QQ group openid → the owner's member openid in it (learned from the bind code).
+/// AppID + QQ group openid → the owner's member openid in it (learned from the bind code).
 const ME: &str = "qq_me/";
-/// QQ groups the bot is in that are NOT tied to a Disco group: openid → a JSON [`Seen`]
-/// (when it was last talked to, who, what). Listed in Settings → QQ so a group the bot was
-/// @'ed in never looks dead.
+/// AppID + QQ group openid → a JSON [`Seen`] of a QQ group the bot is in that is NOT tied
+/// to a Disco group (when it was last talked to, who, what). Listed in Settings → QQ so a
+/// group the bot was @'ed in never looks dead.
 const UNSEEN: &str = "qq_seen/";
 /// The bot's owner: the scanner's openid from the bind (the only one heard in private chat).
 const OWNER: &str = "qq_owner";
@@ -54,28 +64,35 @@ const CODE_TTL: Duration = Duration::from_secs(600);
 /// a private chat: `To::reply_window`).
 const REPLY_MAX: u32 = 5;
 
-struct Conn { rest: Rest, stop: watch::Sender<bool> }
-static CONN: Mutex<Option<Conn>> = Mutex::new(None);
+/// One bot's live connection: every bot has its own token, gateway session and reply slots.
+#[derive(Clone)]
+struct Conn { rest: Rest, stop: watch::Sender<bool>, born: u64 }
+static CONN: Mutex<Option<HashMap<String, Conn>>> = Mutex::new(None);
 static CONN_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-static STATUS: Mutex<String> = Mutex::new(String::new());
+/// What each bot's connection last said, by AppID. It or a later connection may still be open.
+static STATUS: Mutex<Option<HashMap<String, String>>> = Mutex::new(None);
 /// The bind task on screen: (task, its QR code as SVG, generation).
 static QR: Mutex<Option<(Bind, String, u64)>> = Mutex::new(None);
+/// What the last scan did ("已添加…" for a bot added before), shown once in Settings → QQ.
+static NOTICE: Mutex<String> = Mutex::new(String::new());
 static QR_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// Bind codes waiting to be sent in a QQ group: (code, Disco group id, issued).
 static CODES: Mutex<Vec<(String, String, Instant)>> = Mutex::new(Vec::new());
-/// Per QQ group / private chat: the newest message to reply to, when it came, the next sequence number.
-type Replies = HashMap<To, (String, Instant, u32)>;
+/// Per bot and QQ group / private chat: the newest message to reply to, when it came, the
+/// next sequence number.
+type Replies = HashMap<(String, To), (String, Instant, u32)>;
 static REPLY: Mutex<Option<Replies>> = Mutex::new(None);
 /// Message ids already handled (QQ may deliver one twice).
 static SEEN: Mutex<VecDeque<String>> = Mutex::new(VecDeque::new());
 /// Test endpoints (selftest only): API + token, and the bind host.
 static AT: Mutex<Option<(Endpoints, String)>> = Mutex::new(None);
-/// What the connection has been doing, for Settings → QQ and the diagnostics.
-static DIAG: Mutex<Diag> = Mutex::new(Diag::new());
-/// Private-chat senders already told they are not the owner (told once per launch).
+/// What each bot's connection has been doing, for Settings → QQ and the diagnostics.
+static DIAG: Mutex<Option<HashMap<String, Diag>>> = Mutex::new(None);
+/// Private-chat senders already told they are not the owner (once per bot per launch):
+/// "<AppID>/<openid>".
 static TOLD: Mutex<Vec<String>> = Mutex::new(Vec::new());
-/// The bot's name as READY gave it.
-static READY_NAME: Mutex<Option<String>> = Mutex::new(None);
+/// The bots' names as READY gave them, by AppID.
+static READY_NAME: Mutex<Option<HashMap<String, String>>> = Mutex::new(None);
 
 /// The QQ connection's recent history (times are Unix milliseconds, 0 = never).
 #[derive(Clone, Serialize, Default)]
@@ -105,25 +122,132 @@ pub struct Diag {
     gate_at: u64,
 }
 
-impl Diag {
-    const fn new() -> Self {
-        Self { stage: String::new(), ready: false, proxy: false, ready_at: 0, error: String::new(), error_at: 0, event: String::new(), event_at: 0, events: 0,
-            send_error: String::new(), send_error_at: 0, stranger: String::new(), gate: String::new(), gate_at: 0 }
-    }
-}
 
 fn now_ms() -> u64 { std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64) }
 
 fn tail(id: &str) -> String { id.chars().rev().take(6).collect::<Vec<_>>().into_iter().rev().collect() }
 
 /// A message could not be sent to QQ: keep the reason for the status page.
-pub(crate) fn note_send_error(e: &str) {
-    let mut d = lock(&DIAG);
-    d.send_error = e.to_owned();
-    d.send_error_at = now_ms();
+pub(crate) fn note_send_error(app: &str, e: &str) {
+    with_diag(app, |d| {
+        d.send_error = e.to_owned();
+        d.send_error_at = now_ms();
+    });
 }
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> { m.lock().unwrap_or_else(|p| p.into_inner()) }
+
+/// The static maps hold an `Option<HashMap>`: `HashMap::new()` is not const, so a static
+/// cannot start from it. These are the whole vocabulary they need.
+fn map_get<T: Clone>(m: &Mutex<Option<HashMap<String, T>>>, app: &str) -> Option<T> { lock(m).as_ref().and_then(|x| x.get(app).cloned()) }
+
+fn map_put<T>(m: &Mutex<Option<HashMap<String, T>>>, app: &str, v: T) -> Option<T> { lock(m).get_or_insert_with(HashMap::new).insert(app.to_owned(), v) }
+
+fn map_del<T>(m: &Mutex<Option<HashMap<String, T>>>, app: &str) { if let Some(x) = lock(m).as_mut() { x.remove(app); } }
+
+/// One bot's diagnostics (empty when that bot never connected).
+fn diag(app: &str) -> Diag { map_get(&DIAG, app).unwrap_or_default() }
+
+fn with_diag<R>(app: &str, f: impl FnOnce(&mut Diag) -> R) -> R { f(lock(&DIAG).get_or_insert_with(HashMap::new).entry(app.to_owned()).or_default()) }
+
+/// One bound bot, as stored in the `qq_bots` setting.
+#[derive(Clone, Serialize, serde::Deserialize, Debug, PartialEq)]
+struct BotRow {
+    /// QQ AppID: every openid (group and private) only means something to this bot.
+    app: String,
+    /// The agent this bot answers for, with no `**名字**：` prefix; None = the bot shared
+    /// by every QQ-synced agent (the default bot).
+    agent: Option<String>,
+    /// When it was added (Unix ms; 0 for the one migrated from a pre-v1.13 install).
+    at: u64,
+}
+
+/// The AppID whose credentials live under the legacy "qq_bot" keychain account.
+fn legacy_app(core: &Core) -> Option<String> { core.db().setting(LEGACY).filter(|s| !s.is_empty()) }
+
+/// Where this bot's credentials are kept (see [`VAULT`]).
+fn vault_of(core: &Core, app: &str) -> String {
+    match legacy_app(core).as_deref() {
+        Some(a) if a == app => VAULT.to_owned(),
+        _ => format!("{VAULT}:{app}"),
+    }
+}
+
+/// Where this bot's name is kept (the first bot keeps the pre-v1.13 key).
+fn name_key(core: &Core, app: &str) -> String {
+    match legacy_app(core).as_deref() { Some(a) if a == app => SET_NAME.to_owned(), _ => format!("{NAME_OF}{app}") }
+}
+
+/// Where this bot's owner openid is kept.
+fn owner_key(core: &Core, app: &str) -> String {
+    match legacy_app(core).as_deref() { Some(a) if a == app => OWNER.to_owned(), _ => format!("{OWNER_OF}{app}") }
+}
+
+/// Every bot bound to this Disco, oldest first (an install bound before v1.13 becomes one
+/// row here the first time it is read).
+fn bots(core: &Core) -> Vec<BotRow> { migrate(core) }
+
+fn save_bots(core: &Core, rows: &[BotRow]) -> Result<(), String> {
+    let json = serde_json::to_string(rows).map_err(err)?;
+    core.db().set_setting(BOTS, &json).map_err(err)?;
+    core.db().set_setting(SET_ON, if rows.is_empty() { "" } else { "1" }).map_err(err)?;
+    Ok(())
+}
+
+/// The bot QQ-synced agents speak through when they have no bot of their own: the first
+/// one bound, whichever that is.
+fn default_app(core: &Core) -> Option<String> {
+    let rows = bots(core);
+    rows.iter().find(|b| b.agent.is_none()).or_else(|| rows.first()).map(|b| b.app.clone())
+}
+
+/// The event's bot: the gateway always knows it, a hand-built event (a test) means the
+/// default bot.
+fn app_of(core: &Core, app: &str) -> String {
+    if app.is_empty() { default_app(core).unwrap_or_default() } else { app.to_owned() }
+}
+
+/// The agent `app` is dedicated to (None = it speaks for every QQ-synced agent).
+fn bot_agent(core: &Core, app: &str) -> Option<String> {
+    bots(core).into_iter().find(|b| b.app == app).and_then(|b| b.agent).filter(|a| !a.is_empty())
+}
+
+/// A v1.13 install's first read: the single bot of a pre-v1.13 install becomes the first
+/// row of `qq_bots`, and every tie key gets its AppID in it (see [`GROUP`], [`OF`]).
+fn migrate(core: &Core) -> Vec<BotRow> {
+    let saved = core.db().setting(BOTS);
+    if let Some(j) = saved { return serde_json::from_str::<Vec<BotRow>>(&j).unwrap_or_default(); }
+    let on = core.db().setting(SET_ON).as_deref() == Some("1");
+    let app = if on { secret_get(VAULT).and_then(|j| serde_json::from_str::<Creds>(&j).ok()).map(|c| c.app_id) } else { None };
+    let rows = match app {
+        Some(app) => {
+            migrate_keys(core, &app);
+            let _ = core.db().set_setting(LEGACY, &app);
+            vec![BotRow { app, agent: None, at: 0 }]
+        }
+        None => Vec::new(),
+    };
+    let _ = save_bots(core, &rows);
+    rows
+}
+
+/// Put the first bot's AppID in every tie key (a QQ group openid means nothing without it).
+fn migrate_keys(core: &Core, app: &str) {
+    let ties = core.db().settings_with_prefix(GROUP).unwrap_or_default();
+    for (gid, openid) in ties {
+        if gid.contains('/') || openid.is_empty() { continue; }
+        let _ = core.db().set_setting(&format!("{GROUP}{gid}/{app}"), &openid);
+        let _ = core.db().set_setting(&format!("{GROUP}{gid}"), "");
+    }
+    for prefix in [OF, ME, UNSEEN] {
+        let rows = core.db().settings_with_prefix(prefix).unwrap_or_default();
+        for (openid, value) in rows {
+            if openid.contains('/') { continue; }
+            let _ = core.db().set_setting(&format!("{prefix}{app}/{openid}"), &value);
+            let _ = core.db().set_setting(&format!("{prefix}{openid}"), "");
+        }
+    }
+}
 
 /// One QQ group the bot was talked to (or added to) in, while it is not tied to a Disco group.
 #[derive(Clone, Serialize, serde::Deserialize, Default)]
@@ -135,30 +259,34 @@ struct Seen {
     last: String,
 }
 
-/// Remember a QQ group the bot heard from that is not tied to a Disco group yet
+/// Remember a QQ group one of the bots heard from that is not tied to a Disco group yet
 /// (Settings → QQ lists them; v1.11.2: @机器人 in a fresh group used to be silent).
-fn note_seen(core: &Core, m: &Incoming) {
+fn note_seen(core: &Core, app: &str, m: &Incoming) {
     if m.group.is_empty() { return; }
     let s = Seen { at: now_ms(), member: m.author_id.clone(), name: m.author.clone(), last: m.content.chars().take(60).collect() };
-    if let Ok(j) = serde_json::to_string(&s) { let _ = core.db().set_setting(&format!("{UNSEEN}{}", m.group), &j); }
+    if let Ok(j) = serde_json::to_string(&s) { let _ = core.db().set_setting(&format!("{UNSEEN}{app}/{}", m.group), &j); }
 }
 
-/// QQ groups the bot is in that are not tied to a Disco group, newest first (at most 8).
+/// QQ groups any bot is in that are not tied to a Disco group, newest first (at most 8).
 fn unbound(core: &Core) -> Vec<QqSeen> {
     let seen = core.db().settings_with_prefix(UNSEEN).unwrap_or_default();
     let tied: Vec<String> = core.db().settings_with_prefix(OF).unwrap_or_default().into_iter().filter(|(_, v)| !v.is_empty()).map(|(k, _)| k).collect();
     let mut out: Vec<QqSeen> = seen.into_iter().filter(|(k, _)| !k.is_empty() && !tied.contains(k))
-        .map(|(k, v)| (k, serde_json::from_str::<Seen>(&v).unwrap_or_default())).map(|(openid, s)| QqSeen { openid, at: s.at, who: s.name, member: s.member })
+        .map(|(k, v)| {
+            let (app, openid) = k.split_once('/').unwrap_or(("", k.as_str()));
+            (app.to_owned(), openid.to_owned(), serde_json::from_str::<Seen>(&v).unwrap_or_default())
+        })
+        .map(|(app, openid, s)| QqSeen { app, openid, at: s.at, who: s.name, member: s.member })
         .collect();
     out.sort_by_key(|a| std::cmp::Reverse(a.at));
     out.truncate(8);
     out
 }
 
-/// The pending code for one QQ group: the same group always gets the same one, so a
-/// repeated @ never mints a second code.
-fn group_code(openid: &str, member: &str) -> String {
-    let target = format!("q:{openid}/{member}");
+/// The pending code for one QQ group of one bot: the same group always gets the same one,
+/// so a repeated @ never mints a second code.
+fn group_code(app: &str, openid: &str, member: &str) -> String {
+    let target = format!("q:{app}/{openid}/{member}");
     let mut codes = lock(&CODES);
     codes.retain(|c| c.2.elapsed() < CODE_TTL);
     if let Some(c) = codes.iter().find(|c| c.1 == target).map(|c| c.0.clone()) { return c; }
@@ -175,7 +303,8 @@ fn new_code(codes: &[(String, String, Instant)]) -> String {
 }
 
 /// Use up a pending code: what it was for (None = no such code left).
-/// The target is "" (claim the private chat), "g:<Disco group>" or "q:<openid>/<member>".
+/// The target is "o:<AppID>" (claim that bot's private chat), "g:<Disco group>" or
+/// "q:<AppID>/<openid>/<member>" (tie an unbound QQ group of that bot).
 fn take_code(code: &str, pick: impl Fn(&str) -> bool) -> Option<String> {
     let mut codes = lock(&CODES);
     codes.retain(|c| c.2.elapsed() < CODE_TTL);
@@ -193,23 +322,47 @@ fn endpoints() -> Endpoints {
 }
 fn bind_host() -> Option<String> { lock(&AT).as_ref().map(|a| a.1.clone()) }
 
-pub(crate) fn rest() -> Option<Rest> { lock(&CONN).as_ref().map(|c| c.rest.clone()) }
+/// One bot's REST client, while it is connected.
+fn rest_of(app: &str) -> Option<Rest> { map_get(&CONN, app).map(|c| c.rest.clone()) }
 
-/// The QQ group a Disco group is tied to.
-pub(crate) fn openid_of(core: &Core, group: &str) -> Option<String> {
-    core.db().setting(&format!("{GROUP}{group}")).filter(|s| !s.is_empty())
+/// Where a thread's messages go in QQ, and through which bot (see [`target`]).
+#[derive(Clone)]
+pub(crate) struct Route { pub(crate) app: String, rest: Rest, to: To }
+
+/// The QQ group of one bot a Disco group is tied to, and the bot itself (the shared bot's
+/// tie first: a Disco group may be tied to one QQ group per bot).
+fn tie_of(core: &Core, gid: &str) -> Option<(String, String)> {
+    let mut ties: Vec<(String, String)> = core.db().settings_with_prefix(&format!("{GROUP}{gid}/")).unwrap_or_default()
+        .into_iter().filter(|(_, openid)| !openid.is_empty()).collect();
+    if ties.is_empty() { return None; }
+    let shared = default_app(core);
+    let pick = ties.iter().position(|(app, _)| shared.as_deref() == Some(app.as_str())).unwrap_or(0);
+    Some(ties.swap_remove(pick))
 }
 
-fn group_of(core: &Core, openid: &str) -> Option<String> {
-    core.db().setting(&format!("{OF}{openid}")).filter(|s| !s.is_empty())
+/// The QQ group a Disco group is tied to (the shared bot's tie first).
+pub(crate) fn openid_of(core: &Core, group: &str) -> Option<String> { tie_of(core, group).map(|(_, openid)| openid) }
+
+/// The Disco group one bot's QQ group is tied to.
+fn group_of(core: &Core, app: &str, openid: &str) -> Option<String> {
+    core.db().setting(&format!("{OF}{app}/{openid}")).filter(|s| !s.is_empty())
 }
 
-/// The bot's owner (whose private chat QQ-synced agents use), once known.
-pub(crate) fn owner(core: &Core) -> Option<String> {
-    core.db().setting(OWNER).filter(|s| !s.is_empty())
+/// Who counts as the owner inside one bot's QQ group ("" when nobody has claimed it).
+fn me_in(core: &Core, app: &str, openid: &str) -> String {
+    core.db().setting(&format!("{ME}{app}/{openid}")).unwrap_or_default()
 }
 
-fn bound(core: &Core) -> bool { core.db().setting(SET_ON).as_deref() == Some("1") }
+/// One bot's owner (whose private chat QQ-synced agents use), once known.
+fn owner_of(core: &Core, app: &str) -> Option<String> {
+    let key = owner_key(core, app);
+    core.db().setting(&key).filter(|s| !s.is_empty())
+}
+
+/// The owner of the shared bot's private chat.
+pub(crate) fn owner(core: &Core) -> Option<String> { default_app(core).and_then(|app| owner_of(core, &app)) }
+
+fn bound(core: &Core) -> bool { !bots(core).is_empty() }
 
 /// Where an agent's 1:1 chat syncs: "qq" or "discord".
 pub(crate) fn agent_sync(core: &Core, agent: &str) -> &'static str {
@@ -247,8 +400,14 @@ pub(crate) fn set_sync(core: &Core, names: &[String], to: &str, remember: bool) 
     Ok(())
 }
 
-/// A renamed (`Some(new)`) or removed agent: its sync choice and "current" mark follow it.
+/// A renamed (`Some(new)`) or removed agent: its sync choice, its dedicated bot and the
+/// "current" mark follow it.
 pub(crate) fn agent_follow(core: &Core, old: &str, new: Option<&str>) {
+    let rows = bots(core);
+    if rows.iter().any(|b| b.agent.as_deref() == Some(old)) {
+        let rows: Vec<BotRow> = rows.into_iter().map(|mut b| { if b.agent.as_deref() == Some(old) { b.agent = new.map(str::to_owned); } b }).collect();
+        let _ = save_bots(core, &rows);
+    }
     let was = core.db().setting(&format!("{SYNC}{old}")).filter(|v| !v.is_empty());
     if let Some(v) = was {
         let _ = core.db().set_setting(&format!("{SYNC}{old}"), "");
@@ -267,22 +426,51 @@ pub(crate) fn qq_agents(core: &Core) -> Vec<String> {
 
 /// Where to post a thread's messages in QQ: the bot, and the QQ group (group chats) or
 /// the owner's private chat (an agent whose 1:1 chat syncs to QQ).
-pub(crate) fn target(core: &Core, thread: &str) -> Option<(Rest, To)> {
+pub(crate) fn target(core: &Core, thread: &str) -> Option<Route> { target_for(core, thread, thread.strip_prefix("dm:")) }
+
+/// Like [`target`], for one agent's message: its own bot when it has one.
+pub(crate) fn target_for(core: &Core, thread: &str, agent: Option<&str>) -> Option<Route> {
     if let Some(g) = thread.strip_prefix("group:") {
-        let openid = openid_of(core, g)?;
-        return Some((rest()?, To::Group(openid)));
+        let (app, openid) = pick_tie(core, g, agent)?;
+        return Some(Route { rest: rest_of(&app)?, app, to: To::Group(openid) });
     }
-    let agent = thread.strip_prefix("dm:")?;
-    if agent_sync(core, agent) != "qq" { return None; }
-    let owner = owner(core)?;
-    Some((rest()?, To::User(owner)))
+    let agent = agent.or_else(|| thread.strip_prefix("dm:"))?;
+    // An agent with a bot of its own always reaches QQ through it (that is what owning a
+    // bot means); everybody else shares the default bot, and only if it syncs to QQ.
+    let app = dedicated_of(core, agent);
+    if app.is_none() && agent_sync(core, agent) != "qq" { return None; }
+    let app = app.or_else(|| default_app(core))?;
+    let owner = owner_of(core, &app)?;
+    Some(Route { rest: rest_of(&app)?, app, to: To::User(owner) })
+}
+
+/// The QQ group of one bot that a Disco group is tied to, and the bot itself: `agent`'s own
+/// bot first (so it answers in the group of the bot that speaks for it), else the shared
+/// bot's tie, else whichever tie belongs to a bot that is online.
+fn pick_tie(core: &Core, gid: &str, agent: Option<&str>) -> Option<(String, String)> {
+    let ties: Vec<(String, String)> = core.db().settings_with_prefix(&format!("{GROUP}{gid}/")).unwrap_or_default()
+        .into_iter().filter(|(_, openid)| !openid.is_empty()).collect();
+    if ties.is_empty() { return None; }
+    let shared = default_app(core);
+    let want = agent.and_then(|a| dedicated_of(core, a));
+    let rank = |app: &str| if want.as_deref() == Some(app) { 0 }
+        else if shared.as_deref() == Some(app) { 1 }
+        else if rest_of(app).is_some() { 2 } else { 3 };
+    let pick = ties.iter().enumerate().min_by_key(|(_, (app, _))| rank(app)).map(|(i, _)| i)?;
+    let mut ties = ties;
+    Some(ties.swap_remove(pick))
+}
+
+/// The bot dedicated to `agent` (an agent may only ever have one).
+fn dedicated_of(core: &Core, agent: &str) -> Option<String> {
+    bots(core).into_iter().find(|b| b.agent.as_deref() == Some(agent)).map(|b| b.app)
 }
 
 /// Reserve up to `n` passive replies to the newest message there: (the message id, how
 /// many QQ will still take). None = the window is over (send an active message).
-fn reply_slot(to: &To, n: u32) -> Option<(String, u32)> {
+fn reply_slot(app: &str, to: &To, n: u32) -> Option<(String, u32)> {
     let mut g = lock(&REPLY);
-    let e = g.get_or_insert_with(HashMap::new).get_mut(to)?;
+    let e = g.get_or_insert_with(HashMap::new).get_mut(&(app.to_owned(), to.clone()))?;
     if e.1.elapsed() > to.reply_window() { return None; }
     let left = REPLY_MAX + 1 - e.2.min(REPLY_MAX + 1);
     let take = n.min(left);
@@ -293,15 +481,15 @@ fn reply_slot(to: &To, n: u32) -> Option<(String, u32)> {
 /// Send with a passive reply when one is left; a refused passive reply (the message got
 /// too old on QQ's clock, or its replies are used up) is sent again as an active
 /// message. A failure is kept for Settings → QQ and the diagnostics.
-async fn deliver<F, Fut>(to: &To, n: u32, send: F) -> Result<(), String>
+async fn deliver<F, Fut>(route: &Route, n: u32, send: F) -> Result<(), String>
 where F: Fn(Option<String>, u32) -> Fut, Fut: std::future::Future<Output = Result<(), String>> {
-    let (slot, allowed) = reply_slot(to, n).map(|(id, k)| (Some(id), k)).unwrap_or((None, 0));
+    let (slot, allowed) = reply_slot(&route.app, &route.to, n).map(|(id, k)| (Some(id), k)).unwrap_or((None, 0));
     let passive = slot.is_some();
     let r = match send(slot, allowed).await {
         Err(e) if passive => send(None, 0).await.map_err(|e2| format!("{e2}（被动回复：{e}）")),
         r => r,
     };
-    if let Err(e) = &r { note_send_error(e); }
+    if let Err(e) = &r { note_send_error(&route.app, e); }
     r
 }
 
@@ -339,33 +527,45 @@ pub(crate) fn mirror_text(core: &Core, text: &str) -> String {
     if show_tools(core) { text.to_owned() } else { trace_filtered(text) }
 }
 
-/// Post as `**who**：text` (or just `text` when `who` is empty).
-pub(crate) async fn post(rest: &Rest, to: &To, who: &str, text: &str) -> Result<(), String> {
+/// One bot's own target: the connection is up, or there is nowhere to post.
+fn route_of(app: &str, to: &To) -> Option<Route> { Some(Route { app: app.to_owned(), rest: rest_of(app)?, to: to.clone() }) }
+
+/// Whether a message through `route` is signed `**who**：`: a bot dedicated to that one
+/// agent speaks for it alone, everything else goes out with the agent's name (the shared
+/// bot does, so several agents in one chat stay apart).
+pub(crate) fn named(core: &Core, route: &Route, who: &str) -> bool { !who.is_empty() && bot_agent(core, &route.app).as_deref() != Some(who) }
+
+/// Post through `route` as `**who**：text` (or just `text` when `who` is empty).
+pub(crate) async fn post(route: &Route, who: &str, text: &str) -> Result<(), String> {
     let body = if who.is_empty() { text.to_owned() } else { format!("**{who}**：{text}") };
+    let (rest, to) = (&route.rest, &route.to);
     let n = disco_qq::chunk(&body).len() as u32;
-    deliver(to, n, |slot, allowed| { let body = &body; async move { rest.send_split(to, body, slot.as_deref(), &[], allowed as usize).await } }).await
+    deliver(route, n, |slot, allowed| { let body = &body; async move { rest.send_split(to, body, slot.as_deref(), &[], allowed as usize).await } }).await
 }
 
 /// A file.
-pub(crate) async fn post_file(rest: &Rest, to: &To, name: &str, bytes: &[u8]) -> Result<(), String> {
-    deliver(to, 1, |slot, _| async move { rest.send_file(to, name, bytes, slot.as_deref()).await }).await
+pub(crate) async fn post_file(route: &Route, name: &str, bytes: &[u8]) -> Result<(), String> {
+    let (rest, to) = (&route.rest, &route.to);
+    deliver(route, 1, |slot, _| async move { rest.send_file(to, name, bytes, slot.as_deref()).await }).await
 }
 
 /// An event-triggered message (QQ allows one per event, e.g. after GROUP_ADD_ROBOT):
 /// `event_id` in place of a replied-to message. Falls back to an active message, which
 /// needs the group's 主动消息 permission; either way a failure is kept for Settings → QQ.
-pub(crate) async fn post_event(rest: &Rest, to: &To, text: &str, event_id: &str) -> Result<(), String> {
-    if let Err(e) = rest.send_event(to, text, event_id).await {
-        note_send_error(&e);
-        return rest.send(to, text, None, &[]).await.map_err(|e2| { note_send_error(&e2); format!("{e2}（事件消息：{e}）") });
+pub(crate) async fn post_event(route: &Route, text: &str, event_id: &str) -> Result<(), String> {
+    let to = &route.to;
+    if let Err(e) = route.rest.send_event(to, text, event_id).await {
+        note_send_error(&route.app, &e);
+        return route.rest.send(to, text, None, &[]).await.map_err(|e2| { note_send_error(&route.app, &e2); format!("{e2}（事件消息：{e}）") });
     }
     Ok(())
 }
 
 /// A card with buttons (an inbox item).
-pub(crate) async fn post_card(rest: &Rest, to: &To, text: &str, buttons: &[disco_qq::Button]) -> Result<(), String> {
+pub(crate) async fn post_card(route: &Route, text: &str, buttons: &[disco_qq::Button]) -> Result<(), String> {
+    let (rest, to) = (&route.rest, &route.to);
     let n = disco_qq::chunk(text).len() as u32;
-    deliver(to, n, |slot, allowed| async move { rest.send_split(to, text, slot.as_deref(), buttons, allowed as usize).await }).await
+    deliver(route, n, |slot, allowed| async move { rest.send_split(to, text, slot.as_deref(), buttons, allowed as usize).await }).await
 }
 
 /// A `/command` typed in QQ (a group or the bot's private chat): the text QQ gets back,
@@ -454,82 +654,109 @@ fn pick<'a>(text: &'a str, agents: &[String]) -> Option<(String, &'a str)> {
     Some((a.clone(), t[a.len()..].trim_start_matches([' ', '\u{3000}', ':', '：', ',', '，']).trim()))
 }
 
-fn set_status(core: &Core, s: String) {
-    *lock(&STATUS) = s.clone();
-    let _ = core.app.emit("qq", s);
+/// What Settings → QQ shows for all bots at once: the shared bot's own line while there is
+/// only one, else how many are online.
+fn summary(rows: &[BotRow]) -> String {
+    match rows {
+        [] => String::new(),
+        [one] => status_of(one),
+        many => {
+            let ready = many.iter().filter(|b| diag(&b.app).ready).count();
+            format!("{} 个机器人 · {} 个在线", many.len(), ready)
+        }
+    }
 }
 
-/// One step of the gateway client: the status line, the diagnostics, the audit log.
-fn on_gateway(core: &Core, s: Status) {
+/// One bot's own status line ("连接中…" before its gateway has said anything).
+fn status_of(bot: &BotRow) -> String {
+    let said = map_get(&STATUS, &bot.app).unwrap_or_default();
+    if said.is_empty() { "连接中…".to_owned() } else { said }
+}
+
+fn set_status(core: &Core, app: &str, s: String) {
+    map_put(&STATUS, app, s);
+    let rows = bots(core);
+    let _ = core.app.emit("qq", summary(&rows));
+}
+
+/// One step of one bot's gateway client: the status line, the diagnostics, the audit log.
+fn on_gateway(core: &Core, app: &str, s: Status) {
     let now = now_ms();
-    let mut audit = None;
+    let mut audit: Option<(&'static str, String)> = None;
     let mut fresh_name = None;
-    let line = {
-        let mut d = lock(&DIAG);
-        match s {
-            Status::Event(t) => { d.event = t; d.event_at = now; d.events += 1; return; }
-            Status::Step(step) => { d.stage = step.into(); d.ready = false; format!("连接中：{step}…") }
-            Status::Ready(name, proxy) => {
-                d.stage = "在线".into();
-                d.ready = true;
-                d.proxy = proxy;
-                d.ready_at = now;
-                audit = Some(("qq.ready", if proxy { "READY（经系统代理）" } else { "READY" }.to_owned()));
-                let mut known = lock(&READY_NAME);
-                if let Some(n) = name.filter(|n| !n.is_empty()) { *known = Some(n.clone()); fresh_name = Some(n); }
-                format!("在线 · {}", known.clone().unwrap_or_else(|| "QQ 机器人".into()))
-            }
-            Status::Retry(e, secs) => {
+    let line = match s {
+        Status::Event(t) => { with_diag(app, |d| { d.event = t; d.event_at = now; d.events += 1; }); return; }
+        Status::Step(step) => { with_diag(app, |d| { d.stage = step.into(); d.ready = false; }); format!("连接中：{step}…") }
+        Status::Ready(name, proxy) => {
+            with_diag(app, |d| { d.stage = "在线".into(); d.ready = true; d.proxy = proxy; d.ready_at = now; });
+            audit = Some(("qq.ready", if proxy { "READY（经系统代理）" } else { "READY" }.to_owned()));
+            if let Some(n) = name.filter(|n| !n.is_empty()) { map_put(&READY_NAME, app, n.clone()); fresh_name = Some(n); }
+            let known = map_get(&READY_NAME, app);
+            format!("在线 · {}", known.unwrap_or_else(|| "QQ 机器人".into()))
+        }
+        Status::Retry(e, secs) => {
+            let fresh = with_diag(app, |d| {
                 d.stage = "重试中".into();
                 d.ready = false;
-                if d.error != e { audit = Some(("qq.error", e.clone())); }
+                let fresh = d.error != e;
                 d.error = e.clone();
                 d.error_at = now;
-                format!("{e}，{secs} 秒后重试")
-            }
-            Status::Fatal(e) => {
-                d.stage = "已停止".into();
-                d.ready = false;
-                audit = Some(("qq.error", e.clone()));
-                d.error = e.clone();
-                d.error_at = now;
-                format!("已停止：{e}")
-            }
-            Status::Stopped => { d.stage = "已断开".into(); d.ready = false; "已断开".into() }
+                fresh
+            });
+            if fresh { audit = Some(("qq.error", e.clone())); }
+            format!("{e}，{secs} 秒后重试")
         }
+        Status::Fatal(e) => {
+            with_diag(app, |d| { d.stage = "已停止".into(); d.ready = false; d.error = e.clone(); d.error_at = now; });
+            audit = Some(("qq.error", e.clone()));
+            format!("已停止：{e}")
+        }
+        Status::Stopped => { with_diag(app, |d| { d.stage = "已断开".into(); d.ready = false; }); "已断开".into() }
     };
-    if let Some((action, detail)) = audit { let _ = core.db().audit("qq", None, action, &detail); }
+    let many = bots(core).len() > 1;
+    if let Some((action, detail)) = audit {
+        let detail = if many { format!("{detail}（AppID …{app}）", app = tail(app)) } else { detail };
+        let _ = core.db().audit("qq", None, action, &detail);
+    }
     // The bot's name from READY (binding may not have been able to read it). One db() per statement.
     if let Some(n) = fresh_name {
-        let saved = core.db().setting(SET_NAME);
-        if saved.is_some_and(|s| !s.is_empty() && s != n) { let _ = core.db().set_setting(SET_NAME, &n); }
+        let (key, saved) = { let key = name_key(core, app); let saved = core.db().setting(&key); (key, saved) };
+        if saved.is_some_and(|s| !s.is_empty() && s != n) { let _ = core.db().set_setting(&key, &n); }
     }
-    set_status(core, line);
+    set_status(core, app, line);
 }
 
-/// Connect the bound bot's gateway (again); called at launch and after binding.
+/// Connect every bound bot's gateway (again); called at launch and after binding.
 pub(crate) fn connect(core: &Arc<Core>) {
-    if core.db().setting(SET_ON).as_deref() != Some("1") { return; }
-    let Some(creds) = secret_get(VAULT).and_then(|j| serde_json::from_str::<Creds>(&j).ok()) else {
-        set_status(core, "读不到 QQ 机器人凭据：请重新扫码绑定".into());
+    for bot in bots(core) { connect_one(core, &bot.app); }
+}
+
+/// Connect one bot's gateway (again).
+fn connect_one(core: &Arc<Core>, app: &str) {
+    let key = vault_of(core, app);
+    let creds = secret_get(&key).and_then(|j| serde_json::from_str::<Creds>(&j).ok());
+    let Some(creds) = creds else {
+        set_status(core, app, "读不到 QQ 机器人凭据：请重新扫码绑定".into());
         return;
     };
     let rest = Rest::new(creds, endpoints());
     let (stop_tx, stop_rx) = watch::channel(false);
-    if let Some(old) = lock(&CONN).replace(Conn { rest: rest.clone(), stop: stop_tx }) { let _ = old.stop.send(true); }
-    let (tx, mut rx) = mpsc::channel::<Incoming>(64);
-    let c = core.clone();
-    // Only the newest connection may set the status (a replaced one still reports "stopped").
+    // Only the newest connection of this bot may set the status (a replaced one still
+    // reports "stopped").
     let generation = CONN_GEN.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+    if let Some(old) = map_put(&CONN, app, Conn { rest: rest.clone(), stop: stop_tx, born: generation }) { let _ = old.stop.send(true); }
+    let (tx, mut rx) = mpsc::channel::<Incoming>(64);
+    let (c, app1) = (core.clone(), app.to_owned());
     tauri::async_runtime::spawn(disco_qq::run_gateway(rest, tx, stop_rx, move |s| {
-        if CONN_GEN.load(std::sync::atomic::Ordering::SeqCst) == generation { on_gateway(&c, s); }
+        if map_get(&CONN, &app1).is_some_and(|c| c.born == generation) { on_gateway(&c, &app1, s); }
     }));
     let c = core.clone();
     tauri::async_runtime::spawn(async move { while let Some(m) = rx.recv().await { c.on_qq(m); } });
 }
 
 fn disconnect() {
-    if let Some(old) = lock(&CONN).take() { let _ = old.stop.send(true); }
+    let all: Vec<Conn> = lock(&CONN).take().map(|m| m.into_values().collect()).unwrap_or_default();
+    for c in all { let _ = c.stop.send(true); }
 }
 
 /// `绑定 1234` (also `/bind 1234`) → the code.
@@ -547,10 +774,17 @@ fn group_bind_code(text: &str) -> Option<&str> {
     (code.len() == 4 && code.bytes().all(|b| b.is_ascii_digit())).then_some(code)
 }
 
-/// A new local Disco group for a QQ group: named "QQ群 xxxx", with the agents whose 1:1 chat
-/// syncs to QQ (every agent when none does); the first one leads.
-fn new_group_for(core: &Core, openid: &str) -> Result<String, String> {
-    let members = qq_agents(core);
+/// A bare number (`2`, `0`) typed as the answer to 「选哪个 Disco 群聊」.
+fn pick_number(text: &str) -> Option<usize> {
+    let t = text.trim();
+    (!t.is_empty() && t.len() <= 2 && t.bytes().all(|b| b.is_ascii_digit())).then(|| t.parse().ok()).flatten()
+}
+
+/// A new local Disco group for one bot's QQ group: named "QQ群 xxxx", with the agent the bot
+/// is dedicated to, else the agents whose 1:1 chat syncs to QQ (every agent when none does);
+/// the first one leads.
+fn new_group_for(core: &Core, app: &str, openid: &str) -> Result<String, String> {
+    let members = match bot_agent(core, app) { Some(one) => vec![one], None => qq_agents(core) };
     let members = if members.is_empty() { core.db().list_agents().map_err(err)?.into_iter().map(|a| a.name).collect::<Vec<_>>() } else { members };
     if members.is_empty() { return Err("Disco 里还没有 agent：先添加一个 agent，再绑定这个 QQ 群".into()); }
     let lead = members.first().cloned();
@@ -559,14 +793,15 @@ fn new_group_for(core: &Core, openid: &str) -> Result<String, String> {
     Ok(id)
 }
 
-/// Tie a Disco group and a QQ group together. `member` ("" when unknown) is the person who
-/// counts as the owner in that QQ group (openids are per context: a group's member_openid is
-/// never the same as the owner's private-chat openid).
-fn tie(core: &Core, gid: &str, openid: &str, member: &str) -> Result<(), String> {
-    if let Some(other) = group_of(core, openid) && other != gid { return Err("这个 QQ 群已经连到另一个 Disco 群聊".into()); }
-    core.db().set_setting(&format!("{GROUP}{gid}"), openid).map_err(err)?;
-    core.db().set_setting(&format!("{OF}{openid}"), gid).map_err(err)?;
-    core.db().set_setting(&format!("{ME}{openid}"), member).map_err(err)?;
+/// Tie a Disco group and one bot's QQ group together. `member` ("" when unknown) is the
+/// person who counts as the owner in that QQ group (openids are per context: a group's
+/// member_openid is never the same as the owner's private-chat openid, and every bot sees
+/// its own openids).
+fn tie(core: &Core, app: &str, gid: &str, openid: &str, member: &str) -> Result<(), String> {
+    if let Some(other) = group_of(core, app, openid) && other != gid { return Err("这个 QQ 群已经连到另一个 Disco 群聊".into()); }
+    core.db().set_setting(&format!("{GROUP}{gid}/{app}"), openid).map_err(err)?;
+    core.db().set_setting(&format!("{OF}{app}/{openid}"), gid).map_err(err)?;
+    core.db().set_setting(&format!("{ME}{app}/{openid}"), member).map_err(err)?;
     let _ = core.db().audit("qq", None, "qq.bind", &format!("{gid} ↔ QQ 群 …{}", tail(openid)));
     Ok(())
 }
@@ -577,25 +812,29 @@ fn relayed(text: &str) -> Option<(&str, &str)> {
     (!name.is_empty() && !name.contains('\n')).then_some((name, rest))
 }
 
-fn first_time(id: &str) -> bool {
+/// True the first time this bot delivers this id (QQ may deliver one twice).
+fn first_time(app: &str, id: &str) -> bool {
     if id.is_empty() { return true; }
+    let id = format!("{app}/{id}");
     let mut s = lock(&SEEN);
-    if s.iter().any(|x| x == id) { return false; }
+    if s.iter().any(|x| x == &id) { return false; }
     s.push_back(id.to_owned());
     if s.len() > 512 { s.pop_front(); }
     true
 }
 
 impl Core {
-    /// One event from the QQ gateway (or a test).
+    /// One event from one bot's QQ gateway (or a test).
     pub(crate) fn on_qq(self: &Arc<Self>, m: Incoming) {
+        let app = app_of(self, &m.app);
         let c = self.clone();
         match m.kind {
-            Kind::Press => { tauri::async_runtime::spawn(async move { c.qq_press(m).await }); }
+            Kind::Press => { let a = app.clone(); tauri::async_runtime::spawn(async move { c.qq_press(&a, m).await }); }
             Kind::Removed => {
-                if let Some(g) = group_of(self, &m.group) {
-                    let _ = self.db().set_setting(&format!("{GROUP}{g}"), "");
-                    let _ = self.db().set_setting(&format!("{OF}{}", m.group), "");
+                let openid = m.group.clone();
+                if let Some(g) = group_of(self, &app, &openid) {
+                    let _ = self.db().set_setting(&format!("{GROUP}{g}/{app}"), "");
+                    let _ = self.db().set_setting(&format!("{OF}{app}/{openid}"), "");
                     self.post_message(&format!("group:{g}"), "system", "QQ 机器人已被移出 QQ 群，这个群聊不再同步到 QQ。");
                     self.agents_changed();
                 }
@@ -603,21 +842,24 @@ impl Core {
             // Pulled into a group: say hello (QQ allows one message per event) and remember
             // the group, so Settings → QQ can tie it even before anyone @'s the bot.
             // No event id: never dedupe (a fixed "added" key would greet only the first group).
-            Kind::Added if m.id.is_empty() || first_time(&format!("added{}", m.id)) => {
-                note_seen(self, &m);
+            Kind::Added if m.id.is_empty() || first_time(&app, &format!("added{}", m.id)) => {
+                note_seen(self, &app, &m);
                 let _ = self.db().audit("qq", None, "qq.added", &format!("QQ 群 …{}{}", tail(&m.group), if m.author_id.is_empty() { String::new() } else { format!("，由 …{}", tail(&m.author_id)) }));
                 let _ = self.app.emit("qq", "");
-                tauri::async_runtime::spawn(async move { c.qq_welcome(m).await });
+                let a = app.clone();
+                tauri::async_runtime::spawn(async move { c.qq_welcome(&a, m).await });
             }
             Kind::Gate(refused) => {
                 let what = if refused { "GROUP_MSG_REJECT" } else { "GROUP_MSG_RECEIVE" };
-                lock(&DIAG).gate = format!("{} · QQ 群 …{}", if refused { "QQ 已拒收本机器人在该群的消息" } else { "QQ 恢复接收" }, tail(&m.group));
-                lock(&DIAG).gate_at = now_ms();
+                with_diag(&app, |d| {
+                    d.gate = format!("{} · QQ 群 …{}", if refused { "QQ 已拒收本机器人在该群的消息" } else { "QQ 恢复接收" }, tail(&m.group));
+                    d.gate_at = now_ms();
+                });
                 let _ = self.db().audit("qq", None, "qq.gate", &format!("{what} {}", m.group));
                 let _ = self.app.emit("qq", "");
             }
-            Kind::Group if first_time(&m.id) => { tauri::async_runtime::spawn(async move { c.qq_group_message(m).await }); }
-            Kind::Direct if first_time(&m.id) => { tauri::async_runtime::spawn(async move { c.qq_direct(m).await }); }
+            Kind::Group if first_time(&app, &m.id) => { let a = app.clone(); tauri::async_runtime::spawn(async move { c.qq_group_message(&a, m).await }); }
+            Kind::Direct if first_time(&app, &m.id) => { let a = app.clone(); tauri::async_runtime::spawn(async move { c.qq_direct(&a, m).await }); }
             _ => {}
         }
     }
@@ -625,24 +867,26 @@ impl Core {
     /// Pulled into a QQ group: one welcome (as an event-triggered message when the event
     /// carries an id), saying how to tie the group to Disco. A failure is recorded, never
     /// swallowed (QQ may not allow either kind of message in that group).
-    async fn qq_welcome(self: &Arc<Self>, m: Incoming) {
-        let Some(rest) = rest() else { return };
-        let to = To::Group(m.group.clone());
+    async fn qq_welcome(self: &Arc<Self>, app: &str, m: Incoming) {
+        let Some(to) = route_of(app, &To::Group(m.group.clone())) else { return };
         let text = "大家好，我是 Disco 的 QQ 机器人。\n请在 Disco 里新建群聊并打开「同步到 QQ 群」，把那里的 4 位绑定码发到本群；或者直接 @我 说话，我会给群主一个绑定码。";
-        let r = if m.id.is_empty() { post(&rest, &to, "", text).await }
-            else { post_event(&rest, &to, text, &m.id).await };
+        let r = if m.id.is_empty() { post(&to, "", text).await }
+            else { post_event(&to, text, &m.id).await };
         if let Err(e) = &r {
             let _ = self.db().audit("qq", None, "qq.error", &format!("进群欢迎发送失败：{e}"));
-            note_send_error(e);
+            note_send_error(app, e);
         }
     }
 
-    /// Redeem a group code from the bot's private chat: make a Disco group for that QQ
-    /// group, tie them, and say so in both places. Returns what to tell the sender.
-    async fn qq_bind_by_code(self: &Arc<Self>, openid: &str, member: &str) -> String {
+    /// Redeem a group code from this bot's private chat: tie that QQ group to `existing`
+    /// (a local Disco group the owner picked) or to a new Disco group, and say so in both
+    /// places. Returns what to tell the sender.
+    async fn qq_bind_by_code(self: &Arc<Self>, app: &str, openid: &str, member: &str, existing: Option<String>) -> String {
         // Already tied (a second code redeemed): say so instead of leaving an orphan group behind.
-        if group_of(self, openid).is_some() { return "这个 QQ 群已经连到 Disco 群聊了，回群里 @我 说话就行。".into(); }
-        match new_group_for(self, openid).and_then(|gid| tie(self, &gid, openid, member).map(|()| gid)) {
+        if group_of(self, app, openid).is_some() { return "这个 QQ 群已经连到 Disco 群聊了，回群里 @我 说话就行。".into(); }
+        let fresh = existing.is_none();
+        let made = match existing { Some(gid) => Ok(gid), None => new_group_for(self, app, openid) };
+        match made.and_then(|gid| tie(self, app, &gid, openid, member).map(|()| gid)) {
             Err(e) => { let _ = self.db().audit("qq", None, "qq.error", &e); e }
             Ok(gid) => {
                 let name = self.db().list_groups().ok().and_then(|gs| gs.into_iter().find(|g| g.id == gid)).map(|g| g.name).unwrap_or_default();
@@ -650,49 +894,102 @@ impl Core {
                 self.agents_changed();
                 let _ = self.app.emit("qq", "");
                 // Say it in the QQ group too: an active message, so it needs that group's 主动消息 permission.
-                if let Some(rest) = rest() {
-                    let (g, text) = (To::Group(openid.to_owned()), format!("已和 Disco 群聊「{name}」连上 ✅\n@我 说话，组长会回答；想叫某个 agent，就在话里写 @它的名字。\n/help 查看用法"));
-                    tauri::async_runtime::spawn(async move { if let Err(e) = post(&rest, &g, "", &text).await { note_send_error(&e); } });
+                if let Some(to) = route_of(app, &To::Group(openid.to_owned())) {
+                    let a = app.to_owned();
+                    let text = format!("已和 Disco 群聊「{name}」连上 ✅\n@我 说话，组长会回答；想叫某个 agent，就在话里写 @它的名字。\n/help 查看用法");
+                    tauri::async_runtime::spawn(async move { if let Err(e) = post(&to, "", &text).await { note_send_error(&a, &e); } });
                 }
-                format!("好了，这个 QQ 群已经连到新建的 Disco 群聊「{name}」。回群里 @我 说话就行。")
+                if fresh { format!("好了，这个 QQ 群已经连到新建的 Disco 群聊「{name}」。回群里 @我 说话就行。") }
+                else { format!("好了，这个 QQ 群已经连到 Disco 群聊「{name}」。回群里 @我 说话就行。") }
             }
         }
     }
 
+    /// A dedicated bot's group code redeemed while its agent is already in local Disco
+    /// groups: a card with those groups (newest first, at most 5) and 「新建」, answered by a
+    /// button or by typing the number. None = nothing to choose from (make a new group).
+    fn qq_offer_groups(&self, app: &str, openid: &str, member: &str) -> Option<(String, Vec<disco_qq::Button>)> {
+        let agent = bot_agent(self, app)?;
+        let groups = self.db().list_groups().ok()?;
+        let mine: Vec<(String, String)> = groups.into_iter()
+            .filter(|g| g.id.starts_with("local-") && g.members.iter().any(|a| a == &agent))
+            .filter(|g| { let key = format!("{GROUP}{}/{app}", g.id); self.db().setting(&key).is_none() })
+            .map(|g| (g.id, g.name)).rev().take(5).collect();
+        if mine.is_empty() { return None; }
+        let token = {
+            let mut codes = lock(&CODES);
+            codes.retain(|c| c.2.elapsed() < CODE_TTL && !c.1.starts_with(&format!("p:{app}/")));
+            let n = new_code(&codes);
+            let ids: Vec<&str> = mine.iter().map(|(id, _)| id.as_str()).collect();
+            codes.push((n.clone(), format!("p:{app}/{openid}/{member}|{}", ids.join(",")), Instant::now()));
+            n
+        };
+        let mut text = format!("把这个 QQ 群连到哪个 Disco 群聊？{agent} 已在这些群聊里：\n");
+        let mut buttons: Vec<disco_qq::Button> = Vec::new();
+        for (i, (_, name)) in mine.iter().enumerate() {
+            text.push_str(&format!("{}. {name}\n", i + 1));
+            buttons.push((format!("qqbind:{token}:{}", i + 1), name.chars().take(16).collect(), false));
+        }
+        text.push_str("0. 新建一个群聊\n点下面的按钮，或回复数字（10 分钟内有效）。");
+        buttons.push((format!("qqbind:{token}:0"), "新建".into(), true));
+        Some((text, buttons))
+    }
+
+    /// The owner's answer to [`Self::qq_offer_groups`]: `n` = 1… an offered group, 0 = a new
+    /// one. `token` None = the pending choice of this bot, if any (a typed number). None =
+    /// no such choice pending (the number was just a message).
+    async fn qq_pick_group(self: &Arc<Self>, app: &str, token: Option<&str>, n: usize) -> Option<String> {
+        let prefix = format!("p:{app}/");
+        let target = match token {
+            Some(t) => take_code(t, |x| x.starts_with(&prefix))?,
+            None => {
+                let mut codes = lock(&CODES);
+                codes.retain(|c| c.2.elapsed() < CODE_TTL);
+                let i = codes.iter().position(|c| c.1.starts_with(&prefix))?;
+                codes.remove(i).1
+            }
+        };
+        let (who, ids) = target.strip_prefix(&prefix)?.split_once('|')?;
+        let (openid, member) = who.split_once('/').unwrap_or((who, ""));
+        let ids: Vec<&str> = ids.split(',').filter(|s| !s.is_empty()).collect();
+        let existing = if n == 0 { None } else { Some(ids.get(n - 1)?.to_string()) };
+        Some(self.qq_bind_by_code(app, openid, member, existing).await)
+    }
+
     /// @'ed in a QQ group that is not tied to a Disco group: say how to tie it and hand out
-    /// a code the owner can redeem from the bot's private chat (`绑定群 1234`). Before
+    /// a code the owner can redeem from this bot's private chat (`绑定群 1234`). Before
     /// v1.11.2 this said nothing at all, so a freshly added bot looked dead.
-    async fn qq_unbound(self: &Arc<Self>, m: Incoming) {
-        let Some(rest) = rest() else { return };
-        let code = group_code(&m.group, &m.author_id);
+    async fn qq_unbound(self: &Arc<Self>, app: &str, m: Incoming) {
+        let Some(to) = route_of(app, &To::Group(m.group.clone())) else { return };
+        let code = group_code(app, &m.group, &m.author_id);
         let text = format!("这个 QQ 群还没连到 Disco。\n· 群主可以在 Disco 里「新建群聊」→ 打开「同步到 QQ 群」，把那里的 4 位绑定码发到本群；\n· 或者用手机 QQ 私聊我发「绑定群 {code}」，我会在 Disco 里新建一个群聊并连上本群（10 分钟内有效，发这条消息的人算作群主本人）。");
-        if let Err(e) = post(&rest, &To::Group(m.group.clone()), "", &text).await {
+        if let Err(e) = post(&to, "", &text).await {
             let _ = self.db().audit("qq", None, "qq.error", &format!("未绑定群提示发送失败：{e}"));
         }
     }
 
-    async fn qq_group_message(self: &Arc<Self>, m: Incoming) {
-        lock(&REPLY).get_or_insert_with(HashMap::new).insert(To::Group(m.group.clone()), (m.id.clone(), Instant::now(), 1));
-        let Some(gid) = group_of(self, &m.group) else {
+    async fn qq_group_message(self: &Arc<Self>, app: &str, m: Incoming) {
+        lock(&REPLY).get_or_insert_with(HashMap::new).insert((app.to_owned(), To::Group(m.group.clone())), (m.id.clone(), Instant::now(), 1));
+        let Some(gid) = group_of(self, app, &m.group) else {
             // Not tied to a Disco group yet: a bind code ties it (from Disco's own
             // 「获取绑定码」), anything else gets a hint instead of silence.
             if let Some(code) = bind_code(&m.content) && let Some(gid) = take_code(code, |t| t.starts_with("g:")).map(|t| t[2..].to_owned()) {
                 let name = self.db().list_groups().ok().and_then(|gs| gs.into_iter().find(|g| g.id == gid)).map(|g| g.name).unwrap_or_default();
-                if let Err(e) = tie(self, &gid, &m.group, &m.author_id) {
+                if let Err(e) = tie(self, app, &gid, &m.group, &m.author_id) {
                     let _ = self.db().audit("qq", None, "qq.error", &e);
                     return;
                 }
                 self.post_message(&format!("group:{gid}"), "system", &format!("已和 QQ 群连上，绑定人 {} 算作你本人。在 QQ 群里 @机器人 并写 @agent 名字来叫 agent。", m.author));
                 self.agents_changed();
-                if let Some(rest) = rest() {
-                    let _ = post(&rest, &To::Group(m.group.clone()), "", &format!("已和 Disco 群聊「{name}」连上 ✅\n@我 说话，组长会回答；想叫某个 agent，就在话里写 @它的名字。\n/help 查看用法")).await;
+                if let Some(to) = route_of(app, &To::Group(m.group.clone())) {
+                    let _ = post(&to, "", &format!("已和 Disco 群聊「{name}」连上 ✅\n@我 说话，组长会回答；想叫某个 agent，就在话里写 @它的名字。\n/help 查看用法")).await;
                 }
                 return;
             }
             // Remember the group (Settings → QQ lists it) and, when @'ed, say how to tie it.
-            note_seen(self, &m);
+            note_seen(self, app, &m);
             let _ = self.app.emit("qq", "");
-            if m.at_me && !m.bot { self.qq_unbound(m).await; }
+            if m.at_me && !m.bot { self.qq_unbound(app, m).await; }
             return;
         };
         let (author, mut text) = if m.bot {
@@ -700,11 +997,11 @@ impl Core {
             let Some((name, said)) = relayed(&m.content) else { return };
             (format!("{name}{}", crate::FOREIGN_TAG), said.to_owned())
         } else {
-            let me = self.db().setting(&format!("{ME}{}", m.group));
-            (if me.as_deref() == Some(m.author_id.as_str()) { "me".to_owned() } else { format!("{}{}", m.author, crate::QQ_TAG) }, m.content.clone())
+            let me = me_in(self, app, &m.group);
+            (if me == m.author_id { "me".to_owned() } else { format!("{}{}", m.author, crate::QQ_TAG) }, m.content.clone())
         };
         // Files and pictures go to the group's shared space; the agent gets their paths.
-        if !m.attachments.is_empty() && let (Some(rest), Ok(dir)) = (rest(), crate::mcp::space_dir(self, &format!("group:{gid}")).map(|d| d.join("files"))) {
+        if !m.attachments.is_empty() && let (Some(rest), Ok(dir)) = (rest_of(app), crate::mcp::space_dir(self, &format!("group:{gid}")).map(|d| d.join("files"))) {
             for a in &m.attachments {
                 match rest.download(&a.url, crate::files::MAX_SEND).await.and_then(|b| crate::files::save_new(&dir, &a.name, &b)) {
                     Ok((path, size)) => text.push_str(&format!("\n📎 {}（{}）\n{}", crate::files::safe_name(&a.name), crate::files::human_size(size), path.display())),
@@ -720,7 +1017,7 @@ impl Core {
         // itself; anything else goes to the agent as typed.
         if !m.bot && let Some(g) = &group && let Some(reply) = slash(self, &g.members, &lead, &format!("group:{gid}"), &text).await {
             self.post_message(&format!("group:{gid}"), "system", &reply);
-            if let Some(rest) = rest() { let to = To::Group(m.group.clone()); let _ = post(&rest, &to, "", &reply).await; }
+            if let Some(to) = route_of(app, &To::Group(m.group.clone())) { let _ = post(&to, "", &reply).await; }
             return;
         }
         if m.at_me && !m.bot && let Some(g) = &group && crate::mentions(&text, &g.members, None).is_empty()
@@ -731,22 +1028,25 @@ impl Core {
         self.group(gid, author, text, true).await;
     }
 
-    /// The owner's message in the bot's private chat: to the agent it names (`@name …`,
+    /// The owner's message in one bot's private chat: to the agent it names (`@name …`,
     /// which becomes the current one) or the current one. Anyone else is ignored.
-    async fn qq_direct(self: &Arc<Self>, m: Incoming) {
+    async fn qq_direct(self: &Arc<Self>, app: &str, m: Incoming) {
         let to = To::User(m.author_id.clone());
         // Every private message opens a passive-reply window, the owner's or not.
-        lock(&REPLY).get_or_insert_with(HashMap::new).insert(to.clone(), (m.id.clone(), Instant::now(), 1));
-        let say = |text: String| { let to = to.clone(); async move { if let Some(r) = rest() { let _ = post(&r, &to, "", &text).await; } } };
-        let me = owner(self);
+        lock(&REPLY).get_or_insert_with(HashMap::new).insert((app.to_owned(), to.clone()), (m.id.clone(), Instant::now(), 1));
+        let app = app.to_owned();
+        let say = |text: String| { let to = to.clone(); let app = app.clone(); async move { if let Some(r) = route_of(&app, &to) { let _ = post(&r, "", &text).await; } } };
+        let me = owner_of(self, &app);
         // `绑定 1234` with the code from Settings → QQ「认领私聊」: this sender is the owner.
         let code = bind_code(&m.content);
-        let claimed = code.is_some_and(|code| take_code(code, |t| t.is_empty()).is_some());
+        let claim = format!("o:{app}");
+        let claimed = code.is_some_and(|code| take_code(code, |t| t == claim).is_some());
         if claimed || me.is_none() {
             // The scan did not say who scanned (or the owner re-claims): this sender is the owner.
-            let _ = self.db().set_setting(OWNER, &m.author_id);
+            let key = owner_key(self, &app);
+            let _ = self.db().set_setting(&key, &m.author_id);
             let _ = self.db().audit(&format!("qq:{}", m.author_id), None, "qq.owner", if claimed { "claimed with a code" } else { "first private message after binding" });
-            lock(&DIAG).stranger.clear();
+            with_diag(&app, |d| d.stranger.clear());
             self.agents_changed();
             if claimed {
                 say("好了，这个私聊现在连着你的 Disco。发 /help 看有哪些 agent。".into()).await;
@@ -754,8 +1054,9 @@ impl Core {
             }
         } else if me.as_deref() != Some(m.author_id.as_str()) {
             let _ = self.db().audit(&format!("qq:{}", m.author_id), None, "qq.ignored", "private message from someone other than the owner");
-            lock(&DIAG).stranger = tail(&m.author_id);
-            let first = { let mut t = lock(&TOLD); let f = !t.contains(&m.author_id); if f { t.push(m.author_id.clone()); } f };
+            with_diag(&app, |d| d.stranger = tail(&m.author_id));
+            let who = format!("{app}/{}", m.author_id);
+            let first = { let mut t = lock(&TOLD); let f = !t.contains(&who); if f { t.push(who); } f };
             if first { say("这个机器人连着别人的 Disco，只接主人的私聊。如果你就是主人：在 Disco 设置 → QQ 点「认领私聊」，把显示的「绑定 1234」发给我。".into()).await; }
             return;
         }
@@ -766,9 +1067,17 @@ impl Core {
         if let Some(got) = group_code_text {
             match take_code(got, |t| t.starts_with("q:")) {
                 Some(target) => {
-                    let (openid, member) = target[2..].split_once('/').map(|(o, m)| (o.to_owned(), m.to_owned()))
-                        .unwrap_or_else(|| (target[2..].to_owned(), String::new()));
-                    let said = self.qq_bind_by_code(&openid, &member).await;
+                    // "q:<AppID>/<openid>/<member>": this bot's own group only.
+                    let tail_ = target.strip_prefix("q:").unwrap_or_default();
+                    let (openid, member) = tail_.split_once('/').map(|(o, rest)| (o.to_owned(), rest.split_once('/').map(|(_, m)| m.to_owned()).unwrap_or_default()))
+                        .unwrap_or_else(|| (String::new(), String::new()));
+                    if openid.is_empty() { return; }
+                    // A bot dedicated to one agent: offer that agent's Disco groups first.
+                    if let Some((text, buttons)) = self.qq_offer_groups(&app, &openid, &member) {
+                        if let Some(r) = route_of(&app, &to) { let _ = post_card(&r, &text, &buttons).await; }
+                        return;
+                    }
+                    let said = self.qq_bind_by_code(&app, &openid, &member, None).await;
                     say(said).await;
                     return;
                 }
@@ -780,7 +1089,17 @@ impl Core {
                 None => {}
             }
         }
-        let agents = qq_agents(self);
+        // The answer to 「选哪个 Disco 群聊」 typed as a number (QQ may show the card without buttons).
+        if let Some(n) = pick_number(&m.content) && let Some(said) = self.qq_pick_group(&app, None, n).await {
+            say(said).await;
+            return;
+        }
+        // A bot dedicated to one agent answers for it alone: every private message is
+        // that agent's, no @名字 and no **名字**： needed.
+        let agents = match bot_agent(self, &app) {
+            Some(one) => vec![one],
+            None => qq_agents(self),
+        };
         if agents.is_empty() {
             say("还没有同步到 QQ 的 agent。在 Disco 里导入 agent 时选「同步到 QQ」，或在 agent 的信息里改成 QQ。".into()).await;
             return;
@@ -800,7 +1119,7 @@ impl Core {
         if named { let _ = self.db().set_setting(CUR, &agent); }
         let thread = format!("dm:{agent}");
         // Files and pictures go to the agent's space, like group files; it gets their paths.
-        if !m.attachments.is_empty() && let (Some(rest), Ok(dir)) = (rest(), crate::mcp::space_dir(self, &thread).map(|d| d.join("files"))) {
+        if !m.attachments.is_empty() && let (Some(rest), Ok(dir)) = (rest_of(&app), crate::mcp::space_dir(self, &thread).map(|d| d.join("files"))) {
             for a in &m.attachments {
                 match rest.download(&a.url, crate::files::MAX_SEND).await.and_then(|b| crate::files::save_new(&dir, &a.name, &b)) {
                     Ok((path, size)) => text.push_str(&format!("\n📎 {}（{}）\n{}", crate::files::safe_name(&a.name), crate::files::human_size(size), path.display())),
@@ -822,13 +1141,22 @@ impl Core {
 
     /// A button on an inbox card: only the owner may answer (in a group, the member who
     /// sent the bind code; in the private chat, the bot's owner).
-    async fn qq_press(&self, m: Incoming) {
-        let Some(rest) = rest() else { return };
+    async fn qq_press(self: &Arc<Self>, app: &str, m: Incoming) {
+        let Some(rest) = rest_of(app) else { return };
         let _ = rest.ack(&m.id).await;
         let press = m.press.unwrap_or_default();
+        // 「选哪个 Disco 群聊」 card in a dedicated bot's private chat: only its owner.
+        if let Some(rest) = press.strip_prefix("qqbind:") {
+            if !m.group.is_empty() || owner_of(self, app).as_deref() != Some(m.author_id.as_str()) { return; }
+            let Some((token, pick)) = rest.split_once(':') else { return };
+            let Ok(n) = pick.parse::<usize>() else { return };
+            let said = self.qq_pick_group(app, Some(token), n).await;
+            if let (Some(said), Some(r)) = (said, route_of(app, &To::User(m.author_id.clone()))) { let _ = post(&r, "", &said).await; }
+            return;
+        }
         let mut parts = press.splitn(3, ':');
         let (Some("disco"), Some(id), Some(pick)) = (parts.next(), parts.next(), parts.next()) else { return };
-        let allowed = if m.group.is_empty() { owner(self) } else { self.db().setting(&format!("{ME}{}", m.group)) };
+        let allowed = if m.group.is_empty() { owner_of(self, app) } else { self.db().setting(&format!("{ME}{app}/{}", m.group)) };
         if allowed.as_deref() != Some(m.author_id.as_str()) { return; }
         let option = self.inbox_option(id, pick);
         let _ = self.inbox_answer(id, crate::inbox::Answer { option, text: None }, "QQ").await;
@@ -841,26 +1169,50 @@ impl Core {
 pub struct QqStatus {
     /// A bot is bound.
     bound: bool,
+    /// What all bots together are doing (one bot: its own line).
     status: String,
     name: String,
     /// While binding: the QR code (SVG) and the page it encodes.
     qr: Option<String>,
     url: Option<String>,
-    /// The bot's private chat knows who its owner is.
+    /// The shared bot's private chat knows who its owner is.
     owner: bool,
     /// QQ groups tied to Disco groups.
     groups: usize,
-    /// QQ groups the bot is in that are not tied to one (Settings → QQ lists them).
+    /// QQ groups the bots are in that are not tied to one (Settings → QQ lists them).
     unbound: Vec<QqSeen>,
     /// "1": an agent's tool trace is mirrored to QQ and Discord too.
     show_tools: bool,
+    /// The shared (default) bot's diagnostics: what this page showed before bots had friends.
     diag: Diag,
+    /// Every bound bot, oldest first.
+    bots: Vec<QqBot>,
+    /// What the last scan did (「已接入…」 / 「…已添加过，只更新了密钥」), "" otherwise.
+    notice: String,
 }
 
-/// A QQ group the bot was talked to (or added to) in, without a Disco group behind it.
+/// One bound bot, as Settings → QQ lists it.
+#[derive(Clone, Serialize)]
+pub struct QqBot {
+    /// Its QQ AppID (nothing else identifies a bot).
+    app: String,
+    name: String,
+    /// The agent it answers for (None = the bot shared by every QQ-synced agent).
+    agent: Option<String>,
+    status: String,
+    /// Its private chat knows who its owner is.
+    owner: bool,
+    ready: bool,
+    /// QQ groups of this bot tied to Disco groups.
+    groups: usize,
+}
+
+/// A QQ group one of the bots was talked to (or added to) in, without a Disco group behind it.
 #[derive(Clone, Serialize)]
 pub struct QqSeen {
-    /// The group's openid.
+    /// The bot this openid belongs to.
+    app: String,
+    /// The group's openid (only meaningful to that bot).
     openid: String,
     /// When it was last heard from (Unix ms).
     at: u64,
@@ -873,22 +1225,39 @@ pub struct QqSeen {
 fn status(core: &Core) -> QqStatus {
     let qr = lock(&QR).as_ref().map(|(b, svg, _)| (svg.clone(), b.url()));
     // One db() lock per statement: two in one struct literal would deadlock.
-    let bound = core.db().setting(SET_ON).as_deref() == Some("1");
-    let name = core.db().setting(SET_NAME).unwrap_or_default();
-    let owner = owner(core).is_some();
+    let rows = bots(core);
+    let bound = !rows.is_empty();
+    let shared = rows.iter().find(|b| b.agent.is_none()).or_else(|| rows.first()).cloned();
+    let app = shared.as_ref().map(|b| b.app.clone()).unwrap_or_default();
+    let name = if app.is_empty() { String::new() } else { let key = name_key(core, &app); core.db().setting(&key).unwrap_or_default() };
+    let owner = if app.is_empty() { false } else { owner_of(core, &app).is_some() };
     let groups = core.db().settings_with_prefix(GROUP).map(|v| v.iter().filter(|(_, g)| !g.is_empty()).count()).unwrap_or(0);
-    let status = lock(&STATUS).clone();
-    let diag = lock(&DIAG).clone();
+    let status = summary(&rows);
+    let shared_diag = if app.is_empty() { Diag::default() } else { diag(&app) };
+    let bots_view: Vec<QqBot> = rows.iter().map(|b| bot_view(core, b)).collect();
     let unbound = unbound(core);
     let show_tools = show_tools(core);
-    QqStatus { bound, status, name, url: qr.as_ref().map(|q| q.1.clone()), qr: qr.map(|q| q.0), owner, groups, unbound, show_tools, diag }
+    let notice = lock(&NOTICE).clone();
+    QqStatus { bound, status, name, url: qr.as_ref().map(|q| q.1.clone()), qr: qr.map(|q| q.0), owner, groups, unbound, show_tools, diag: shared_diag, bots: bots_view, notice }
+}
+
+/// One bot as Settings → QQ shows it.
+fn bot_view(core: &Core, b: &BotRow) -> QqBot {
+    let ties = core.db().settings_with_prefix(GROUP).map(|v| v.iter().filter(|(k, _)| k.ends_with(&format!("/{}", b.app))).count()).unwrap_or(0);
+    QqBot { app: b.app.clone(), name: bot_name(core, &b.app), agent: b.agent.clone(), status: status_of(b), owner: owner_of(core, &b.app).is_some(), ready: diag(&b.app).ready, groups: ties }
+}
+
+/// One bot's name (what READY or the scan gave).
+fn bot_name(core: &Core, app: &str) -> String {
+    let key = name_key(core, app);
+    core.db().setting(&key).unwrap_or_else(|| "QQ 机器人".into())
 }
 
 /// For the overview: "" when no bot is bound.
 pub(crate) fn overview_status(core: &Core) -> String {
-    if core.db().setting(SET_ON).as_deref() != Some("1") { return String::new(); }
-    let s = lock(&STATUS).clone();
-    if s.is_empty() { "连接中…".into() } else { s }
+    let rows = bots(core);
+    if rows.is_empty() { return String::new(); }
+    summary(&rows)
 }
 
 #[tauri::command]
@@ -904,6 +1273,7 @@ pub async fn qq_bind(core: St<'_>) -> CmdResult<QqStatus> {
     let svg = disco_qq::qr_svg(&bind.url())?;
     let id = QR_GEN.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
     *lock(&QR) = Some((bind.clone(), svg, id));
+    lock(&NOTICE).clear();
     let core2 = core.inner().clone();
     tauri::async_runtime::spawn(async move {
         let (mut bind, mut fails) = (bind, 0);
@@ -921,15 +1291,17 @@ pub async fn qq_bind(core: St<'_>) -> CmdResult<QqStatus> {
                         bind = b;
                         let _ = core2.app.emit("qq", "");
                     }
-                    Err(e) => { set_status(&core2, e); break; }
+                    Err(e) => { set_status(&core2, "", e); break; }
                 },
                 Ok(BindState::Done { creds, owner }) => {
+                    let app = creds.app_id.clone();
                     let r = save_bot(&core2, creds, owner).await;
                     *lock(&QR) = None;
-                    match r { Ok(()) => connect(&core2), Err(e) => set_status(&core2, e) }
+                    let app = r.as_ref().map(|()| app.clone()).unwrap_or_default();
+                    match r { Ok(()) => connect_one(&core2, &app), Err(e) => set_status(&core2, &app, e) }
                     return;
                 }
-                Err(e) => { fails += 1; if fails >= 5 { set_status(&core2, e); break; } }
+                Err(e) => { fails += 1; if fails >= 5 { set_status(&core2, "", e); break; } }
             }
         }
         if live() { *lock(&QR) = None; let _ = core2.app.emit("qq", ""); }
@@ -937,16 +1309,28 @@ pub async fn qq_bind(core: St<'_>) -> CmdResult<QqStatus> {
     Ok(status(&core))
 }
 
-/// Check the scanned bot works, then keep it (keychain) and its name.
+/// Check the scanned bot works, then keep it (keychain), its name and its AppID. A bot
+/// already added only gets its secret refreshed.
 async fn save_bot(core: &Core, creds: Creds, owner: Option<String>) -> Result<(), String> {
     // The credentials must give a token; the name is a nicety (READY also carries it).
     let rest = Rest::new(creds.clone(), endpoints());
     rest.token().await.map_err(|e| format!("扫码拿到的机器人用不了：{e}"))?;
     let name = rest.me().await.unwrap_or_else(|_| "QQ 机器人".into());
-    secret_set(VAULT, &serde_json::to_string(&creds).map_err(err)?)?;
-    core.db().set_setting(SET_NAME, &name).map_err(err)?;
-    core.db().set_setting(OWNER, owner.as_deref().unwrap_or_default()).map_err(err)?;
-    core.db().set_setting(SET_ON, "1").map_err(err)?;
+    let app = creds.app_id.clone();
+    let secret = serde_json::to_string(&creds).map_err(err)?;
+    let first = legacy_app(core).is_none();
+    if first { let _ = core.db().set_setting(LEGACY, &app); }
+    let key = vault_of(core, &app);
+    secret_set(&key, &secret)?;
+    let mut rows = bots(core);
+    let known = rows.iter().any(|b| b.app == app);
+    if !known { rows.push(BotRow { app: app.clone(), agent: None, at: now_ms() }); }
+    save_bots(core, &rows)?;
+    *lock(&NOTICE) = if known { format!("「{name}」已添加过，只更新了密钥") } else { format!("已接入「{name}」") };
+    let name_key = name_key(core, &app);
+    core.db().set_setting(&name_key, &name).map_err(err)?;
+    let owner_key = owner_key(core, &app);
+    core.db().set_setting(&owner_key, owner.as_deref().unwrap_or_default()).map_err(err)?;
     Ok(())
 }
 
@@ -956,17 +1340,90 @@ pub fn qq_bind_cancel(core: St<'_>) -> QqStatus {
     status(&core)
 }
 
-/// Forget the bot (the QQ groups stay tied, ready for when a bot is bound again).
+/// Forget every bot (the QQ groups stay tied, ready for when a bot is bound again).
 #[tauri::command]
 pub fn qq_unbind(core: St<'_>) -> CmdResult<QqStatus> {
     disconnect();
-    secret_del(VAULT);
-    core.db().set_setting(SET_ON, "").map_err(err)?;
-    core.db().set_setting(SET_NAME, "").map_err(err)?;
-    core.db().set_setting(OWNER, "").map_err(err)?;
-    *lock(&STATUS) = String::new();
-    *lock(&DIAG) = Diag::default();
-    *lock(&READY_NAME) = None;
+    for bot in bots(&core) {
+        let (key, n, o) = { let key = vault_of(&core, &bot.app); let n = name_key(&core, &bot.app); let o = owner_key(&core, &bot.app); (key, n, o) };
+        secret_del(&key);
+        core.db().set_setting(&n, "").map_err(err)?;
+        core.db().set_setting(&o, "").map_err(err)?;
+        forget_app(&bot.app);
+    }
+    save_bots(&core, &[])?;
+    core.agents_changed();
+    Ok(status(&core))
+}
+
+/// Drop one bot's live state (its status line, diagnostics, name from READY).
+fn forget_app(app: &str) {
+    map_del(&STATUS, app);
+    map_del(&DIAG, app);
+    map_del(&READY_NAME, app);
+}
+
+/// Every bound bot, oldest first (Settings → QQ lists these).
+#[tauri::command]
+pub fn qq_bots(core: St<'_>) -> Vec<QqBot> { bots(&core).iter().map(|b| bot_view(&core, b)).collect() }
+
+/// Add another bot: the same one-scan flow as the first (`qq_bind`).
+#[tauri::command]
+pub async fn qq_add_bot(core: St<'_>) -> CmdResult<QqStatus> { qq_bind(core).await }
+
+/// Which agent a bot speaks for (`agent` None = the shared bot every QQ-synced agent uses).
+/// One agent at most one bot, one bot at most one agent, and one bot always stays shared.
+#[tauri::command]
+pub fn qq_set_bot_agent(core: St<'_>, app: String, agent: Option<String>) -> CmdResult<QqStatus> {
+    set_bot_agent(&core, &app, agent.as_deref())?;
+    core.agents_changed();
+    Ok(status(&core))
+}
+
+/// Can a new agent get `app` as its own bot (Import → 专用机器人)? It must be a bot that
+/// speaks for nobody yet, and another bot must stay shared.
+pub(crate) fn bot_assignable(core: &Core, app: &str) -> Result<(), String> {
+    let rows = bots(core);
+    let row = rows.iter().find(|b| b.app == app).ok_or("没有这个 QQ 机器人")?;
+    if let Some(a) = &row.agent { return Err(format!("这个机器人已经是 {a} 的专用机器人")); }
+    if rows.iter().filter(|b| b.agent.is_none()).count() < 2 { return Err("至少要留一个共享机器人：这个机器人现在是共享机器人".into()); }
+    Ok(())
+}
+
+/// [`qq_set_bot_agent`] without the command around it.
+pub(crate) fn set_bot_agent(core: &Core, app: &str, agent: Option<&str>) -> Result<(), String> {
+    let rows = bots(core);
+    if !rows.iter().any(|b| b.app == app) { return Err("没有这个 QQ 机器人".into()); }
+    let want = agent.filter(|a| !a.is_empty()).unwrap_or_default();
+    if rows.len() == 1 && !want.is_empty() { return Err("只有一个机器人时它是共享机器人，先添加另一个机器人，再给它配专用 agent".into()); }
+    if !want.is_empty() {
+        let known = core.db().list_agents().map_err(err)?.into_iter().any(|a| a.name == want);
+        if !known { return Err(format!("Disco 里没有叫 {want} 的 agent")); }
+        if let Some(other) = rows.iter().find(|b| b.agent.as_deref() == Some(want) && b.app != app) {
+            return Err(format!("{want} 已经有自己的机器人（AppID …{}），一个 agent 只能有一个", tail(&other.app)));
+        }
+    }
+    let rows: Vec<BotRow> = rows.into_iter().map(|mut b| { if b.app == app { b.agent = if want.is_empty() { None } else { Some(want.to_owned()) }; } b }).collect();
+    if !rows.iter().any(|b| b.agent.is_none()) { return Err("至少要留一个共享机器人：别的 QQ 机器人要先指定自己的 agent".into()); }
+    save_bots(core, &rows)
+}
+
+/// Forget one bot (the QQ groups it was tied to stay tied, ready for when it is added again).
+#[tauri::command]
+pub fn qq_remove_bot(core: St<'_>, app: String) -> CmdResult<QqStatus> {
+    let mut rows = bots(&core);
+    let was = rows.iter().position(|b| b.app == app).ok_or("没有这个 QQ 机器人")?;
+    let was_shared = rows[was].agent.is_none();
+    if let Some(old) = { let mut m = lock(&CONN); m.as_mut().and_then(|x| x.remove(&app)) } { let _ = old.stop.send(true); }
+    let (key, n, o) = { let key = vault_of(&core, &app); let n = name_key(&core, &app); let o = owner_key(&core, &app); (key, n, o) };
+    secret_del(&key);
+    core.db().set_setting(&n, "").map_err(err)?;
+    core.db().set_setting(&o, "").map_err(err)?;
+    forget_app(&app);
+    rows.remove(was);
+    // The oldest remaining bot takes over as the shared one (there is always exactly one).
+    if was_shared && !rows.is_empty() && !rows.iter().any(|b| b.agent.is_none()) { rows[0].agent = None; }
+    save_bots(&core, &rows)?;
     core.agents_changed();
     Ok(status(&core))
 }
@@ -977,8 +1434,12 @@ pub fn qq_unbind(core: St<'_>) -> CmdResult<QqStatus> {
 pub fn qq_group_code(core: St<'_>, group: String, unbind: Option<bool>) -> CmdResult<String> {
     let g = core.db().list_groups().map_err(err)?.into_iter().find(|g| g.id == group).ok_or("没有这个群聊")?;
     if unbind == Some(true) {
-        if let Some(openid) = openid_of(&core, &group) { core.db().set_setting(&format!("{OF}{openid}"), "").map_err(err)?; }
-        core.db().set_setting(&format!("{GROUP}{group}"), "").map_err(err)?;
+        // Every bot's tie to this Disco group (one QQ group per bot).
+        let ties = core.db().settings_with_prefix(&format!("{GROUP}{group}/")).map_err(err)?;
+        for (app, openid) in ties {
+            if !openid.is_empty() { core.db().set_setting(&format!("{OF}{app}/{openid}"), "").map_err(err)?; }
+            core.db().set_setting(&format!("{GROUP}{group}/{app}"), "").map_err(err)?;
+        }
         core.agents_changed();
         return Ok(String::new());
     }
@@ -998,24 +1459,33 @@ pub fn qq_group_code(core: St<'_>, group: String, unbind: Option<bool>) -> CmdRe
 /// A 4-digit code that makes whoever sends `绑定 <code>` to the bot privately its owner
 /// (for when the scan did not say who scanned, or the owner's QQ changed).
 #[tauri::command]
-pub fn qq_claim_code(core: St<'_>) -> CmdResult<String> {
-    if !bound(&core) { return Err("先在设置里扫码接入 QQ 机器人".into()); }
+pub fn qq_claim_code(core: St<'_>, app: Option<String>) -> CmdResult<String> {
+    let rows = bots(&core);
+    let app = pick_app(&rows, app.as_deref()).ok_or("先在设置里扫码接入 QQ 机器人")?;
+    let claim = format!("o:{app}");
     let code = {
         let mut codes = lock(&CODES);
-        codes.retain(|c| c.2.elapsed() < CODE_TTL && !c.1.is_empty());
+        codes.retain(|c| c.2.elapsed() < CODE_TTL && c.1 != claim);
         let n = new_code(&codes);
-        codes.push((n.clone(), String::new(), Instant::now()));
+        codes.push((n.clone(), claim, Instant::now()));
         n
     };
     Ok(code)
+}
+
+/// One bot of the list: the one named, or the shared one.
+fn pick_app(rows: &[BotRow], app: Option<&str>) -> Option<String> {
+    if let Some(app) = app.filter(|a| rows.iter().any(|b| b.app == *a)) { return Some(app.to_owned()); }
+    rows.iter().find(|b| b.agent.is_none()).or_else(|| rows.first()).map(|b| b.app.clone())
 }
 
 /// Tie a QQ group the bot is in (but that is not tied yet) to a Disco group in one click:
 /// a new local group "QQ群 xxxx" with the QQ-synced agents, unless `group` names one.
 /// The person who last @'d the bot there counts as the owner in that group.
 #[tauri::command]
-pub fn qq_bind_group(core: St<'_>, openid: String, group: Option<String>) -> CmdResult<QqStatus> {
-    if !bound(&core) { return Err("先在设置里扫码接入 QQ 机器人".into()); }
+pub fn qq_bind_group(core: St<'_>, app: Option<String>, openid: String, group: Option<String>) -> CmdResult<QqStatus> {
+    let rows = bots(&core);
+    let app = pick_app(&rows, app.as_deref()).ok_or("先在设置里扫码接入 QQ 机器人")?;
     let openid = openid.trim().to_owned();
     if openid.is_empty() { return Err("没有这个 QQ 群".into()); }
     let gid = match group.filter(|g| !g.is_empty()) {
@@ -1025,19 +1495,20 @@ pub fn qq_bind_group(core: St<'_>, openid: String, group: Option<String>) -> Cmd
             gid
         }
         None => {
-            if group_of(&core, &openid).is_some() { return Err("这个 QQ 群已经连到 Disco 群聊了".into()); }
-            new_group_for(&core, &openid)?
+            if group_of(&core, &app, &openid).is_some() { return Err("这个 QQ 群已经连到 Disco 群聊了".into()); }
+            new_group_for(&core, &app, &openid)?
         }
     };
-    let member = core.db().setting(&format!("{UNSEEN}{openid}")).and_then(|j| serde_json::from_str::<Seen>(&j).ok()).map(|s| s.member).unwrap_or_default();
-    tie(&core, &gid, &openid, &member)?;
+    let key = format!("{UNSEEN}{app}/{openid}");
+    let member = core.db().setting(&key).and_then(|j| serde_json::from_str::<Seen>(&j).ok()).map(|s| s.member).unwrap_or_default();
+    tie(&core, &app, &gid, &openid, &member)?;
     let name = core.db().list_groups().map_err(err)?.into_iter().find(|g| g.id == gid).map(|g| g.name).unwrap_or_default();
     core.post_message(&format!("group:{gid}"), "system", &format!("已和 QQ 群 …{} 连上{}。在 QQ 群里 @机器人 并写 @agent 名字来叫 agent。", tail(&openid),
         if member.is_empty() { String::new() } else { "，在群里 @ 过机器人的那个人算作你本人".to_owned() }));
     // Confirm in the QQ group (an active message: it needs that group's 主动消息 permission).
-    if let Some(rest) = rest() {
-        let (g, text) = (To::Group(openid.clone()), format!("已和 Disco 群聊「{name}」连上 ✅\n@我 说话，组长会回答；想叫某个 agent，就在话里写 @它的名字。\n/help 查看用法"));
-        tauri::async_runtime::spawn(async move { if let Err(e) = post(&rest, &g, "", &text).await { note_send_error(&e); } });
+    if let Some(to) = route_of(&app, &To::Group(openid.clone())) {
+        let (a, text) = (app.clone(), format!("已和 Disco 群聊「{name}」连上 ✅\n@我 说话，组长会回答；想叫某个 agent，就在话里写 @它的名字。\n/help 查看用法"));
+        tauri::async_runtime::spawn(async move { if let Err(e) = post(&to, "", &text).await { note_send_error(&a, &e); } });
     }
     core.agents_changed();
     Ok(status(&core))
@@ -1054,18 +1525,24 @@ pub fn qq_set(core: St<'_>, show_tools: Option<bool>) -> CmdResult<QqStatus> {
 
 /// Drop the connection and connect again (fresh token, fresh session).
 #[tauri::command]
-pub fn qq_reconnect(core: St<'_>) -> CmdResult<QqStatus> {
-    if !bound(&core) { return Err("先在设置里扫码接入 QQ 机器人".into()); }
-    connect(core.inner());
+pub fn qq_reconnect(core: St<'_>, app: Option<String>) -> CmdResult<QqStatus> {
+    let rows = bots(&core);
+    if rows.is_empty() { return Err("先在设置里扫码接入 QQ 机器人".into()); }
+    match app.as_deref().filter(|a| rows.iter().any(|b| b.app == *a)) {
+        Some(app) => connect_one(core.inner(), app),
+        None => connect(core.inner()),
+    }
     Ok(status(&core))
 }
 
 /// Why messages of `thread` cannot reach QQ although it is meant to sync there (None = fine).
 pub(crate) fn blocked(core: &Core, thread: &str) -> Option<String> {
     let agent = thread.strip_prefix("dm:")?;
-    if agent_sync(core, agent) != "qq" { return None; }
-    if rest().is_none() { return Some("QQ 机器人没有连上，回复没发到 QQ：到设置 → QQ 看状态，或点「一键诊断」。".into()); }
-    if owner(core).is_none() { return Some("还不知道你的 QQ，回复没发到 QQ：用手机 QQ 给机器人发一条私聊（第一个私聊的人会被认作你本人）。".into()); }
+    let own = dedicated_of(core, agent);
+    if own.is_none() && agent_sync(core, agent) != "qq" { return None; }
+    let app = own.or_else(|| default_app(core)).unwrap_or_default();
+    if app.is_empty() || rest_of(&app).is_none() { return Some("QQ 机器人没有连上，回复没发到 QQ：到设置 → QQ 看状态，或点「一键诊断」。".into()); }
+    if owner_of(core, &app).is_none() { return Some("还不知道你的 QQ，回复没发到 QQ：用手机 QQ 给机器人发一条私聊（第一个私聊的人会被认作你本人）。".into()); }
     None
 }
 
@@ -1074,51 +1551,63 @@ fn ago(ms: u64) -> String {
     if s < 60 { format!("{s} 秒前") } else if s < 3600 { format!("{} 分钟前", s / 60) } else { format!("{} 小时前", s / 3600) }
 }
 
-/// Settings → 一键诊断: the QQ rows (none when no bot is bound).
+/// Settings → 一键诊断: the QQ rows, per bot (none when no bot is bound).
 pub(crate) async fn diagnose(core: &Core) -> Vec<(String, Result<String, String>)> {
     let mut out = Vec::new();
-    if !bound(core) { return out; }
-    let creds = secret_get(VAULT).and_then(|j| serde_json::from_str::<Creds>(&j).ok());
-    let Some(creds) = creds else {
-        out.push(("QQ 机器人凭据".into(), Err("钥匙串里读不到：请到设置 → QQ 解绑后重新扫码".into())));
-        return out;
-    };
-    out.push(("QQ 机器人凭据".into(), Ok(format!("AppID {}", creds.app_id))));
-    let rest = Rest::new(creds, endpoints());
-    let token = rest.token().await;
-    out.push(("QQ access_token".into(), token.as_ref().map(|_| if rest.via_proxy() { "可以取到（经系统代理）".to_owned() } else { "可以取到".to_owned() }).map_err(Clone::clone)));
-    let d = lock(&DIAG).clone();
-    let live = if d.ready {
-        Ok(format!("在线，{}连上{}", ago(d.ready_at), if d.proxy { "（经系统代理）" } else { "" }))
-    } else if token.is_ok() {
-        // The running connection is down: a separate one to READY shows where it stops.
-        match disco_qq::gateway_check(&rest, Duration::from_secs(15)).await {
-            Ok((name, took, proxy)) => Ok(format!("单独测试连上了（{name}，{} ms{}）；后台连接现在是「{}」{}", took.as_millis(), if proxy { "，经系统代理" } else { "" },
-                if d.stage.is_empty() { "未启动" } else { d.stage.as_str() }, if d.error.is_empty() { String::new() } else { format!("，上次错误：{}", d.error) })),
-            Err(e) => Err(format!("{e}{}", if d.error.is_empty() || d.error == e { String::new() } else { format!("（后台连接上次错误：{}）", d.error) })),
-        }
-    } else {
-        Err(format!("没有 access_token，连不了网关{}", if d.error.is_empty() { String::new() } else { format!("（{}）", d.error) }))
-    };
-    out.push(("QQ 实时连接".into(), live));
-    out.push(("QQ 收到的事件".into(), if d.events > 0 { Ok(format!("共 {} 个，最近 {}（{}）", d.events, d.event, ago(d.event_at))) }
-        else { Err("这次启动后还没收到任何 QQ 事件：QQ 群里要 @机器人 才会推送；私聊直接发给机器人".into()) }));
-    let own = owner(core);
-    out.push(("QQ 私聊主人".into(), match (own, d.stranger.is_empty()) {
-        (Some(o), true) => Ok(format!("已认定（openid …{}）", tail(&o))),
-        (Some(o), false) => Err(format!("收到 …{} 的私聊，但主人是 …{}：如果那就是你，在设置 → QQ 点「认领私聊」", d.stranger, tail(&o))),
-        (None, _) => Err("还不知道你的 QQ：用手机 QQ 给机器人发一条私聊".into()),
-    }));
-    out.push(("QQ 发送".into(), if d.send_error.is_empty() { Ok("没有失败记录".into()) } else { Err(format!("{}：{}", ago(d.send_error_at), d.send_error)) }));
-    let unb = unbound(core);
-    out.push(("QQ 未绑定的群".into(), if unb.is_empty() { Ok("没有".into()) } else {
-        Err(format!("{} 个群里 @ 了机器人但还没连上（…{}）：到设置 → QQ 点「绑定到新群聊」，或在群里 @我 后按提示私聊「绑定群 1234」",
-            unb.len(), unb.iter().map(|u| tail(&u.openid)).collect::<Vec<_>>().join("、")))
-    }));
-    if !d.gate.is_empty() { out.push(("QQ 群消息".into(), Err(format!("{}（{}）", d.gate, ago(d.gate_at))))); }
-    let summary: Vec<String> = out.iter().map(|(n, r)| format!("{n}={}", if r.is_ok() { "ok" } else { "fail" })).collect();
-    let _ = core.db().audit("qq", None, "qq.diagnose", &summary.join(" "));
+    let rows = bots(core);
+    if rows.is_empty() { return out; }
+    let many = rows.len() > 1;
+    for bot in rows {
+        let at = |n: &str| if many { format!("{n} · {}", bot_name(core, &bot.app)) } else { n.to_owned() };
+        let app = bot.app.clone();
+        let key = vault_of(core, &app);
+        let creds = secret_get(&key).and_then(|j| serde_json::from_str::<Creds>(&j).ok());
+        let Some(creds) = creds else {
+            out.push((at("QQ 机器人凭据"), Err("钥匙串里读不到：请到设置 → QQ 解绑后重新扫码".into())));
+            continue;
+        };
+        out.push((at("QQ 机器人凭据"), Ok(format!("AppID {}", creds.app_id))));
+        let rest = Rest::new(creds, endpoints());
+        let token = rest.token().await;
+        out.push((at("QQ access_token"), token.as_ref().map(|_| if rest.via_proxy() { "可以取到（经系统代理）".to_owned() } else { "可以取到".to_owned() }).map_err(Clone::clone)));
+        let d = diag(&app);
+        let live = if d.ready {
+            Ok(format!("在线，{}连上{}", ago(d.ready_at), if d.proxy { "（经系统代理）" } else { "" }))
+        } else if token.is_ok() {
+            // The running connection is down: a separate one to READY shows where it stops.
+            match disco_qq::gateway_check(&rest, Duration::from_secs(15)).await {
+                Ok((name, took, proxy)) => Ok(format!("单独测试连上了（{name}，{} ms{}）；后台连接现在是「{}」{}", took.as_millis(), if proxy { "，经系统代理" } else { "" },
+                    if d.stage.is_empty() { "未启动" } else { d.stage.as_str() }, if d.error.is_empty() { String::new() } else { format!("，上次错误：{}", d.error) })),
+                Err(e) => Err(format!("{e}{}", if d.error.is_empty() || d.error == e { String::new() } else { format!("（后台连接上次错误：{}）", d.error) })),
+            }
+        } else {
+            Err(format!("没有 access_token，连不了网关{}", if d.error.is_empty() { String::new() } else { format!("（{}）", d.error) }))
+        };
+        out.push((at("QQ 实时连接"), live));
+        out.push((at("QQ 收到的事件"), if d.events > 0 { Ok(format!("共 {} 个，最近 {}（{}）", d.events, d.event, ago(d.event_at))) }
+            else { Err("这次启动后还没收到任何 QQ 事件：QQ 群里要 @机器人 才会推送；私聊直接发给机器人".into()) }));
+        let own = owner_of(core, &app);
+        out.push((at("QQ 私聊主人"), match (own, d.stranger.is_empty()) {
+            (Some(o), true) => Ok(format!("已认定（openid …{}）", tail(&o))),
+            (Some(o), false) => Err(format!("收到 …{} 的私聊，但主人是 …{}：如果那就是你，在设置 → QQ 点「认领私聊」", d.stranger, tail(&o))),
+            (None, _) => Err("还不知道你的 QQ：用手机 QQ 给机器人发一条私聊".into()),
+        }));
+        out.push((at("QQ 发送"), if d.send_error.is_empty() { Ok("没有失败记录".into()) } else { Err(format!("{}：{}", ago(d.send_error_at), d.send_error)) }));
+        let unb = unbound_of(core, &app);
+        out.push((at("QQ 未绑定的群"), if unb.is_empty() { Ok("没有".into()) } else {
+            Err(format!("{} 个群里 @ 了机器人但还没连上（…{}）：到设置 → QQ 点「绑定到新群聊」，或在群里 @我 后按提示私聊「绑定群 1234」",
+                unb.len(), unb.iter().map(|u| tail(&u.openid)).collect::<Vec<_>>().join("、")))
+        }));
+        if !d.gate.is_empty() { out.push((at("QQ 群消息"), Err(format!("{}（{}）", d.gate, ago(d.gate_at))))); }
+    }
+    let line: Vec<String> = out.iter().map(|(n, r)| format!("{n}={}", if r.is_ok() { "ok" } else { "fail" })).collect();
+    let _ = core.db().audit("qq", None, "qq.diagnose", &line.join(" "));
     out
+}
+
+/// One bot's QQ groups that are not tied to a Disco group.
+fn unbound_of(core: &Core, app: &str) -> Vec<QqSeen> {
+    unbound(core).into_iter().filter(|u| u.app == app).collect()
 }
 
 #[cfg(test)]
@@ -1135,21 +1624,23 @@ mod tests {
         assert_eq!(relayed("**a\nb**：x"), None);
         assert_eq!(relayed("claude：x"), None);
         let g = To::Group("G-test".into());
-        lock(&REPLY).get_or_insert_with(HashMap::new).insert(g.clone(), ("m1".into(), Instant::now(), 1));
-        assert_eq!(reply_slot(&g, 2), Some(("m1".into(), 2)));
-        assert_eq!(reply_slot(&g, 3), Some(("m1".into(), 3)));
-        assert_eq!(reply_slot(&g, 1), Some(("m1".into(), 0)), "the quota is used up: an active message");
-        assert_eq!(reply_slot(&g, 4), Some(("m1".into(), 0)));
-        assert!(reply_slot(&g, 4).is_some(), "a used-up window still answers with the id, but nothing passive");
-        assert_eq!(reply_slot(&To::Group("nope".into()), 1), None);
+        lock(&REPLY).get_or_insert_with(HashMap::new).insert(("A1".into(), g.clone()), ("m1".into(), Instant::now(), 1));
+        assert_eq!(reply_slot("A1", &g, 2), Some(("m1".into(), 2)));
+        assert_eq!(reply_slot("A1", &g, 3), Some(("m1".into(), 3)));
+        assert_eq!(reply_slot("A1", &g, 1), Some(("m1".into(), 0)), "the quota is used up: an active message");
+        assert_eq!(reply_slot("A1", &g, 4), Some(("m1".into(), 0)));
+        assert!(reply_slot("A1", &g, 4).is_some(), "a used-up window still answers with the id, but nothing passive");
+        assert_eq!(reply_slot("A1", &To::Group("nope".into()), 1), None, "another group has no window");
+        assert_eq!(reply_slot("A2", &g, 1), None, "another bot has its own window, even for the same openid");
         // Private chats: same five, a longer window; an old message gets none.
         let u = To::User("O-test".into());
-        lock(&REPLY).get_or_insert_with(HashMap::new).insert(u.clone(), ("c1".into(), Instant::now() - Duration::from_secs(600), 1));
-        assert_eq!(reply_slot(&u, 1), Some(("c1".into(), 1)), "10 minutes is still inside the private-chat window");
-        assert_eq!(reply_slot(&u, 9), Some(("c1".into(), 4)), "only what is left of the quota");
-        lock(&REPLY).get_or_insert_with(HashMap::new).insert(u.clone(), ("c1".into(), Instant::now() - Duration::from_secs(3600), 1));
-        assert_eq!(reply_slot(&u, 1), None);
-        assert!(first_time("x-1") && !first_time("x-1") && first_time(""));
+        lock(&REPLY).get_or_insert_with(HashMap::new).insert(("A1".into(), u.clone()), ("c1".into(), Instant::now() - Duration::from_secs(600), 1));
+        assert_eq!(reply_slot("A1", &u, 1), Some(("c1".into(), 1)), "10 minutes is still inside the private-chat window");
+        assert_eq!(reply_slot("A1", &u, 9), Some(("c1".into(), 4)), "only what is left of the quota");
+        lock(&REPLY).get_or_insert_with(HashMap::new).insert(("A1".into(), u.clone()), ("c1".into(), Instant::now() - Duration::from_secs(3600), 1));
+        assert_eq!(reply_slot("A1", &u, 1), None);
+        assert!(first_time("A1", "x-1") && !first_time("A1", "x-1") && first_time("A1", ""));
+        assert!(first_time("A2", "x-1"), "one bot's dedupe never hides another's");
     }
 
     /// Bind codes: `绑定群 1234` (a QQ group, redeemed privately) vs `绑定 1234` (a Disco
@@ -1162,15 +1653,19 @@ mod tests {
         assert_eq!(group_bind_code("绑定群 12345"), None);
         assert_eq!(bind_code("绑定群 1234"), None, "a group code is never an owner-claim code");
         lock(&CODES).clear();
-        let g = group_code("G-x", "U-x");
+        let g = group_code("A1", "G-x", "U-x");
         assert_eq!(g.len(), 4);
-        assert_eq!(group_code("G-x", "U-x"), g, "one group keeps one code");
-        assert_ne!(group_code("G-y", "U-y"), g);
-        assert_eq!(take_code(&g, |t| t.starts_with("q:")), Some("q:G-x/U-x".to_owned()));
+        assert_eq!(group_code("A1", "G-x", "U-x"), g, "one group keeps one code");
+        assert_ne!(group_code("A1", "G-y", "U-y"), g);
+        assert_ne!(group_code("A2", "G-x", "U-x"), g, "another bot mints its own code for its own group");
+        assert_eq!(take_code(&g, |t| t.starts_with("q:")), Some("q:A1/G-x/U-x".to_owned()));
         assert_eq!(take_code(&g, |t| t.starts_with("q:")), None, "a code is used up once");
+        let own = { let mut codes = lock(&CODES); let n = new_code(&codes); codes.push((n.clone(), "o:A1".into(), Instant::now())); n };
+        assert_eq!(take_code(&own, |t| t == "o:A1"), Some("o:A1".to_owned()));
+        assert_eq!(take_code(&own, |t| t == "o:A2"), None, "one bot's claim code never claims another");
         let n = { let mut codes = lock(&CODES); let n = new_code(&codes); codes.push((n.clone(), "g:local-1".into(), Instant::now())); n };
         assert_eq!(take_code(&n, |t| t.starts_with("g:")), Some("g:local-1".to_owned()));
-        assert_eq!(take_code(&n, |t| t.is_empty()), None);
+        assert_eq!(take_code(&n, |t| t.starts_with("o:")), None);
     }
 
     /// An agent's answer goes out with its tool trace stripped (Settings → QQ「显示工具

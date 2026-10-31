@@ -58,7 +58,7 @@ pub fn spawn(app: AppHandle, mock: String) {
         let st = || app.state::<Arc<Core>>();
         let _ = check!("overview(空)", within(5, crate::overview(st())).await.and_then(|r| r.map(|o| format!("{} agents", o.agents.len()))));
         let spec = |name: &str| crate::NewAgent { template: "command".into(), name: name.into(), url: None, header_name: None, header_value: None,
-            command: Some(format!("\"{mock}\"")), cwd: None, count: None, worktree: None, conda: None, model: None, extra: Vec::new(), sync: None };
+            command: Some(format!("\"{mock}\"")), cwd: None, count: None, worktree: None, conda: None, model: None, extra: Vec::new(), sync: None, bot: None };
         let _ = check!("add_agent m1", within(20, crate::add_agent(st(), spec("m1"))).await.and_then(|r| r.map(|v| v.join(","))));
         let _ = check!("add_agent m2", within(20, crate::add_agent(st(), spec("m2"))).await.and_then(|r| r.map(|v| v.join(","))));
         let _ = check!("overview(2)", within(5, crate::overview(st())).await.and_then(|r| r.and_then(|o| if o.agents.len() == 2 { Ok("2 agents".into()) } else { Err(format!("{} agents", o.agents.len())) })));
@@ -187,7 +187,7 @@ pub fn spawn(app: AppHandle, mock: String) {
         let _ = check!("OpenAI 兼容 agent", {
             let base = mock_openai().await?;
             let o = crate::NewAgent { template: "openai".into(), name: "o1".into(), url: Some(format!("{base}/chat/completions")), header_name: None, header_value: None,
-                command: None, cwd: None, count: None, worktree: None, conda: None, model: None, extra: Vec::new(), sync: None };
+                command: None, cwd: None, count: None, worktree: None, conda: None, model: None, extra: Vec::new(), sync: None, bot: None };
             within(10, crate::add_agent(st(), o)).await??;
             let n = count(&core, "dm:o1", "o1");
             crate::send(st(), "dm:o1".into(), "记一个待办".into())?;
@@ -1086,7 +1086,7 @@ pub fn spawn(app: AppHandle, mock: String) {
             core.db().set_setting("qq_owner", "").map_err(|e| e.to_string())?;
             feed("C2C_MESSAGE_CREATE", serde_json::json!({ "id": "c7", "content": "hi", "author": { "user_openid": "NEWME" } }))?;
             until(10, || crate::qq::owner(&core).as_deref() == Some("NEWME")).await?;
-            let code = crate::qq::qq_claim_code(st())?;
+            let code = crate::qq::qq_claim_code(st(), None)?;
             feed("C2C_MESSAGE_CREATE", serde_json::json!({ "id": "c8", "content": format!("绑定 {code}"), "author": { "user_openid": "OWNER" } }))?;
             until(10, || crate::qq::owner(&core).as_deref() == Some("OWNER")).await?;
             let ack = |b: &serde_json::Value| b["msg_id"] == "c8" && b["markdown"]["content"].as_str().unwrap_or_default().contains("连着你的 Disco");
@@ -1144,7 +1144,7 @@ pub fn spawn(app: AppHandle, mock: String) {
             if st2["diag"]["event"] != "GROUP_ADD_ROBOT" { return Err(format!("{}", st2["diag"])); }
             if st2["unbound"].as_array().is_none_or(|v| !v.iter().any(|u| u["openid"] == "G3")) { return Err(format!("未绑定群列表：{}", st2["unbound"])); }
             // Settings → QQ「绑定到新群聊」: one click ties it to a brand-new Disco group.
-            let s = serde_json::to_value(crate::qq::qq_bind_group(st(), "G3".into(), None)?).map_err(|e| e.to_string())?;
+            let s = serde_json::to_value(crate::qq::qq_bind_group(st(), None, "G3".into(), None)?).map_err(|e| e.to_string())?;
             if s["unbound"].as_array().is_none_or(|v| v.iter().any(|u| u["openid"] == "G3")) { return Err(format!("绑定后还在未绑定列表：{}", s["unbound"])); }
             let ov = within(5, crate::overview(st())).await??;
             // The G2 check above made a "QQ群 …" group too: find the one tied to G3.
@@ -1159,11 +1159,156 @@ pub fn spawn(app: AppHandle, mock: String) {
             let ok = |n: &str| get(n).is_some_and(|r| r.is_ok());
             let live = get("QQ 实时连接").and_then(Result::ok).unwrap_or_default();
             if ok("QQ 机器人凭据") && ok("QQ access_token") && live.starts_with("在线") && ok("QQ 收到的事件") && ok("QQ 私聊主人") { Ok(String::new()) } else { Err(format!("{rows:?}")) } });
+        // v1.13.0: several QQ bots, one per agent (a second AppID on the mock platform).
+        let scan_as = |app: &str, secret: &str, owner: &str| { *QQ_SCAN.lock().unwrap_or_else(|p| p.into_inner()) = Some((app.into(), secret.into(), owner.into())); };
+        let qstatus = || serde_json::to_value(crate::qq::qq_status(st())).unwrap_or_default();
+        let bot_of = |app: &str| qstatus()["bots"].as_array().and_then(|b| b.iter().find(|x| x["app"] == app).cloned()).unwrap_or_default();
+        let md = |b: &serde_json::Value| b["markdown"]["content"].as_str().or_else(|| b["content"].as_str()).unwrap_or_default().to_owned();
+        let _ = check!("QQ 多机器人：添加第二个机器人，两个各自在线；再扫同一个 AppID 只更新密钥", {
+            scan_as("103", "sec-103", "OWNER3");
+            within(10, crate::qq::qq_add_bot(st())).await??;
+            until(15, || bot_of("103")["ready"] == true).await.map_err(|e| format!("{e} {}", bot_of("103")))?;
+            let first = bot_of("102");
+            if first["ready"] != true || !first["agent"].is_null() { return Err(format!("第一个机器人应仍是共享且在线：{first}")); }
+            let saved = crate::secret_get("qq_bot:103").unwrap_or_default();
+            let legacy = crate::secret_get("qq_bot").unwrap_or_default();
+            if !saved.contains("sec-103") || !legacy.contains("sec-from-scan") { return Err(format!("钥匙串：{saved} / {legacy}")); }
+            scan_as("103", "sec-103b", "OWNER3");
+            within(10, crate::qq::qq_add_bot(st())).await??;
+            until(15, || qstatus()["notice"].as_str().is_some_and(|n| n.contains("只更新了密钥"))).await.map_err(|e| format!("{e} {}", qstatus()["notice"]))?;
+            let v = qstatus();
+            let n = v["bots"].as_array().map_or(0, Vec::len);
+            let fresh = crate::secret_get("qq_bot:103").unwrap_or_default().contains("sec-103b");
+            until(15, || bot_of("103")["ready"] == true).await?;
+            if n == 2 && fresh && v["bound"] == true { Ok(format!("{}", v["status"])) } else { Err(format!("n={n} fresh={fresh} {v}")) } });
+        let _ = check!("QQ 多机器人：一个 agent 只能有一个专用机器人，至少留一个共享机器人", {
+            crate::qq::qq_set_bot_agent(st(), "103".into(), Some("mq".into()))?;
+            let dup = crate::qq::qq_set_bot_agent(st(), "102".into(), Some("mq".into())).err().unwrap_or_default();
+            let all_taken = crate::qq::qq_set_bot_agent(st(), "102".into(), Some("m1".into())).err().unwrap_or_default();
+            let ghost = crate::qq::qq_set_bot_agent(st(), "103".into(), Some("nobody".into())).is_err();
+            // Import with 专用机器人: a bot that already speaks for someone is refused before anything is added.
+            let taken = within(20, crate::add_agent(st(), crate::NewAgent { sync: Some("qq".into()), bot: Some("103".into()), ..spec("mq4") })).await?.is_err();
+            let ov = within(5, crate::overview(st())).await??;
+            let added = ov.agents.iter().any(|a| a.name == "mq4");
+            let ok = dup.contains("只能有一个") && all_taken.contains("共享") && ghost && taken && !added
+                && bot_of("103")["agent"] == "mq" && bot_of("102")["agent"].is_null();
+            if ok { Ok(String::new()) } else { Err(format!("dup={dup} all_taken={all_taken} ghost={ghost} taken={taken} added={added}")) } });
+        let _ = check!("QQ 专用机器人的私聊直达它的 agent，不用 @，回复走它自己的机器人且不带「**名字**：」", {
+            let n = count(&core, "dm:mq", "mq");
+            let pushed = push_qq_to("103", serde_json::json!({ "op": 0, "t": "C2C_MESSAGE_CREATE", "d": { "id": "d1", "content": "你是谁",
+                "timestamp": "Sat 2026-10-31 4:00 PM CST (UTC+08:00)", "author": { "user_openid": "OWNER3" } } }));
+            if !pushed { return Err("第二个机器人的模拟网关没有连接".into()); }
+            wait_msg(&core, "dm:mq", "mq", n, 30).await?;
+            if last_from(&core, "dm:mq", "me").as_deref() != Some("你是谁") { return Err(format!("{:?}", last_from(&core, "dm:mq", "me"))); }
+            let reply = |b: &serde_json::Value| b["msg_id"] == "d1" && b["_app"] == "103";
+            until(10, || qlog("c2c:OWNER3").iter().any(reply)).await.map_err(|e| format!("{e} {:?}", qlog("c2c:OWNER3")))?;
+            let plain = qlog("c2c:OWNER3").iter().filter(|b| reply(b)).all(|b| !md(b).starts_with("**mq**"));
+            let shared_quiet = !qlog("c2c:OWNER").iter().any(|b| b["msg_id"] == "d1");
+            // A slash command there applies to that agent alone.
+            let pushed = push_qq_to("103", serde_json::json!({ "op": 0, "t": "C2C_MESSAGE_CREATE", "d": { "id": "d1h", "content": "/agents",
+                "timestamp": "Sat 2026-10-31 4:00 PM CST (UTC+08:00)", "author": { "user_openid": "OWNER3" } } }));
+            if !pushed { return Err("模拟网关没有连接".into()); }
+            let only = |b: &serde_json::Value| b["msg_id"] == "d1h" && md(b).contains("这里的 agent：mq") && !md(b).contains("mq2");
+            until(10, || qlog("c2c:OWNER3").iter().any(only)).await.map_err(|e| format!("{e} {:?}", qlog("c2c:OWNER3")))?;
+            let routed = crate::qq::target(&core, "dm:mq").map(|r| r.app).unwrap_or_default();
+            if plain && shared_quiet && routed == "103" { Ok(String::new()) } else { Err(format!("plain={plain} shared_quiet={shared_quiet} routed={routed}")) } });
+        let _ = check!("QQ 专用机器人在未绑定群被 @：给码；私聊「绑定群」列出 agent 已在的 Disco 群聊 + 新建；群里回答走它自己的机器人", {
+            let pushed = push_qq_to("103", serde_json::json!({ "op": 0, "t": "GROUP_AT_MESSAGE_CREATE", "d": { "id": "h1", "content": "你好",
+                "timestamp": "Sat 2026-10-31 4:01 PM CST (UTC+08:00)", "group_openid": "H1", "group_id": "H1",
+                "author": { "id": "U5", "member_openid": "U5", "username": "小明" }, "mentions": [{ "member_openid": "103", "is_you": true }] } }));
+            if !pushed { return Err("模拟网关没有连接".into()); }
+            let hint = |b: &serde_json::Value| b["msg_id"] == "h1" && b["_app"] == "103" && md(b).contains("绑定群 ");
+            until(10, || qlog("msg:H1").iter().any(hint)).await.map_err(|e| format!("{e} {:?}", qlog("msg:H1")))?;
+            let said = qlog("msg:H1").into_iter().find(|b| hint(b)).map(|b| md(&b)).unwrap_or_default();
+            let code = said.split_once("绑定群 ").map(|(_, r)| r.chars().take(4).collect::<String>()).filter(|c| c.len() == 4 && c.bytes().all(|b| b.is_ascii_digit()))
+                .ok_or_else(|| format!("提示里没有 4 位绑定码：{said}"))?;
+            let pushed = push_qq_to("103", serde_json::json!({ "op": 0, "t": "C2C_MESSAGE_CREATE", "d": { "id": "d2", "content": format!("绑定群 {code}"),
+                "timestamp": "Sat 2026-10-31 4:02 PM CST (UTC+08:00)", "author": { "user_openid": "OWNER3" } } }));
+            if !pushed { return Err("模拟网关没有连接".into()); }
+            let card = |b: &serde_json::Value| b["msg_id"] == "d2" && b["keyboard"]["content"]["rows"].as_array().is_some_and(|r| !r.is_empty());
+            until(10, || qlog("c2c:OWNER3").iter().any(card)).await.map_err(|e| format!("{e} {:?}", qlog("c2c:OWNER3")))?;
+            let body = qlog("c2c:OWNER3").into_iter().find(|b| card(b)).unwrap_or_default();
+            let buttons: Vec<(String, String)> = body["keyboard"]["content"]["rows"].as_array().into_iter().flatten()
+                .flat_map(|r| r["buttons"].as_array().cloned().unwrap_or_default())
+                .map(|b| (b["action"]["data"].as_str().unwrap_or_default().to_owned(), b["render_data"]["label"].as_str().unwrap_or_default().to_owned())).collect();
+            let ov = within(5, crate::overview(st())).await??;
+            // mq is in the Disco groups made for G2 and G3 (it was the only QQ agent then).
+            let mine: Vec<&crate::GroupView> = ov.groups.iter().filter(|g| g.id.starts_with("local-") && g.members.iter().any(|m| m == "mq")).collect();
+            let offered = mine.iter().all(|g| buttons.iter().any(|(_, l)| l == &g.name)) && buttons.iter().any(|(d, l)| l == "新建" && d.ends_with(":0"));
+            if !offered || mine.is_empty() { return Err(format!("按钮：{buttons:?} 群聊：{:?}", mine.iter().map(|g| &g.name).collect::<Vec<_>>())); }
+            let (data, label) = buttons.iter().find(|(d, _)| d.starts_with("qqbind:") && !d.ends_with(":0")).cloned().ok_or("没有已有群聊的按钮")?;
+            let gid = mine.iter().find(|g| g.name == label).map(|g| g.id.clone()).unwrap_or_default();
+            // Someone else's press does nothing; the owner's ties it.
+            push_qq_to("103", serde_json::json!({ "op": 0, "t": "INTERACTION_CREATE", "d": { "id": "i8", "chat_type": 2, "user_openid": "STRANGER", "data": { "resolved": { "button_data": data } } } }));
+            until(10, || !qlog("ack:i8").is_empty()).await?;
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            let key = format!("qq_group/{gid}/103");
+            if core.db().setting(&key).is_some() { return Err("别人点的按钮也算了".into()); }
+            push_qq_to("103", serde_json::json!({ "op": 0, "t": "INTERACTION_CREATE", "d": { "id": "i9", "chat_type": 2, "user_openid": "OWNER3", "data": { "resolved": { "button_data": data } } } }));
+            until(10, || { let tie = core.db().setting(&key); tie.as_deref() == Some("H1") }).await.map_err(|e| { let tie = core.db().setting(&key); format!("{e} {tie:?}") })?;
+            let ack = |b: &serde_json::Value| b["_app"] == "103" && md(b).contains(&format!("已经连到 Disco 群聊「{label}」"));
+            until(10, || qlog("c2c:OWNER3").iter().any(ack)).await.map_err(|e| format!("{e} {:?}", qlog("c2c:OWNER3")))?;
+            // @ the dedicated bot in that QQ group: the lead (mq) answers, through bot 103, unsigned.
+            let thread = format!("group:{gid}");
+            let shared_before: usize = ["msg:G2", "msg:G3"].iter().map(|k| qlog(k).len()).sum();
+            let n = count(&core, &thread, "mq");
+            let pushed = push_qq_to("103", serde_json::json!({ "op": 0, "t": "GROUP_AT_MESSAGE_CREATE", "d": { "id": "h2", "content": "在吗",
+                "timestamp": "Sat 2026-10-31 4:03 PM CST (UTC+08:00)", "group_openid": "H1",
+                "author": { "id": "U5", "member_openid": "U5", "username": "小明" }, "mentions": [{ "member_openid": "103", "is_you": true }] } }));
+            if !pushed { return Err("模拟网关没有连接".into()); }
+            wait_msg(&core, &thread, "mq", n, 30).await?;
+            let mine_said = last_from(&core, &thread, "me").unwrap_or_default();
+            let answer = |b: &serde_json::Value| b["msg_id"] == "h2" && b["_app"] == "103";
+            until(10, || qlog("msg:H1").iter().any(answer)).await.map_err(|e| format!("{e} {:?}", qlog("msg:H1")))?;
+            let plain = qlog("msg:H1").iter().filter(|b| answer(b)).all(|b| !md(b).starts_with("**mq**"));
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            let shared_after: usize = ["msg:G2", "msg:G3"].iter().map(|k| qlog(k).len()).sum();
+            let routed = crate::qq::target_for(&core, &thread, Some("mq")).map(|r| r.app).unwrap_or_default();
+            let others = crate::qq::target_for(&core, &thread, Some("m1")).map(|r| r.app).unwrap_or_default();
+            if mine_said == "@mq 在吗" && plain && shared_after == shared_before && routed == "103" && others == "102" { Ok(label) }
+            else { Err(format!("me={mine_said:?} plain={plain} shared {shared_before}->{shared_after} routed={routed} others={others}")) } });
+        let _ = check!("QQ 多机器人：删掉专用机器人，agent 回到共享机器人；删掉共享机器人，剩下的接替", {
+            let s = serde_json::to_value(crate::qq::qq_remove_bot(st(), "103".into())?).map_err(|e| e.to_string())?;
+            let n = s["bots"].as_array().map_or(0, Vec::len);
+            let back = crate::qq::target(&core, "dm:mq").map(|r| r.app).unwrap_or_default();
+            let gone = crate::secret_get("qq_bot:103").is_none();
+            // Add it back and remove the shared one: 103 becomes the shared bot.
+            scan_as("103", "sec-103", "OWNER3");
+            within(10, crate::qq::qq_add_bot(st())).await??;
+            until(15, || bot_of("103")["ready"] == true).await?;
+            let shared_left = crate::qq::qq_remove_bot(st(), "102".into()).is_ok() && bot_of("103")["agent"].is_null()
+                && crate::qq::owner(&core).as_deref() == Some("OWNER3");
+            if n == 1 && back == "102" && gone && shared_left { Ok(String::new()) } else { Err(format!("n={n} back={back} gone={gone} shared_left={shared_left}")) } });
         let _ = check!("QQ 解绑群和机器人", {
             crate::qq::qq_group_code(st(), qgid.clone(), Some(true))?;
             let s = serde_json::to_value(crate::qq::qq_unbind(st())?).map_err(|e| e.to_string())?;
             let refused = within(20, crate::add_agent(st(), crate::NewAgent { sync: Some("qq".into()), ..spec("mq3") })).await?.is_err();
             if crate::qq::openid_of(&core, &qgid).is_none() && s["bound"] == false && crate::secret_get("qq_bot").is_none() && refused && crate::qq::owner(&core).is_none() { Ok(String::new()) } else { Err(format!("{s} refused={refused}")) } });
+        let _ = check!("QQ 老版本（单机器人）设置升级时静默迁移", {
+            // A v1.12 install: qq_on + the "qq_bot" keychain entry, tie keys without an AppID.
+            for k in ["qq_bots", "qq_legacy"] { core.db().set_setting(k, "").map_err(|e| e.to_string())?; }
+            crate::secret_set("qq_bot", &serde_json::json!({ "app_id": "102", "secret": "sec-old" }).to_string())?;
+            let gid = "local-legacy";
+            for (k, v) in [("qq_on", "1"), ("qq_owner", "OWNER"), ("qq_name", "OldBot"), ("qq_group/local-legacy", "GL"), ("qq_of/GL", gid), ("qq_me/GL", "UL")] {
+                core.db().set_setting(k, v).map_err(|e| e.to_string())?;
+            }
+            let v = serde_json::to_value(crate::qq::qq_status(st())).map_err(|e| e.to_string())?;
+            let row = v["bots"][0].clone();
+            // One db() lock per statement.
+            let tied = crate::qq::openid_of(&core, gid);
+            let of_new = core.db().setting("qq_of/102/GL");
+            let of_old = core.db().setting("qq_of/GL");
+            let me_new = core.db().setting("qq_me/102/GL");
+            let group_old = core.db().setting("qq_group/local-legacy");
+            let legacy = core.db().setting("qq_legacy");
+            let ok = v["bots"].as_array().map_or(0, Vec::len) == 1 && row["app"] == "102" && row["agent"].is_null() && row["name"] == "OldBot"
+                && v["bound"] == true && v["owner"] == true && tied.as_deref() == Some("GL")
+                && of_new.as_deref() == Some(gid) && of_old.is_none() && me_new.as_deref() == Some("UL") && group_old.is_none() && legacy.as_deref() == Some("102");
+            // Read again: nothing moves a second time.
+            let again = serde_json::to_value(crate::qq::qq_status(st())).map_err(|e| e.to_string())?;
+            let stable = again["bots"].as_array().map_or(0, Vec::len) == 1;
+            crate::qq::qq_unbind(st())?;
+            if ok && stable { Ok(String::new()) } else { Err(format!("{v}")) } });
         println!("SELFTEST {}", if fails == 0 { "OK".to_string() } else { format!("{fails} FAILED") });
         std::process::exit(if fails == 0 { 0 } else { 1 });
     });
@@ -1197,12 +1342,25 @@ async fn mock_openai() -> Result<String, String> {
 }
 
 /// The mock gateway's open connection: dispatches pushed here go out over the WebSocket.
-static QQ_PUSH: std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedSender<String>>> = std::sync::Mutex::new(None);
+/// One per bot (AppID): v1.13 connects every bound bot on its own.
+static QQ_PUSH: std::sync::Mutex<Vec<(String, tokio::sync::mpsc::UnboundedSender<String>)>> = std::sync::Mutex::new(Vec::new());
 
-/// Send one dispatch through the mock QQ gateway (false when Disco is not connected to it).
-fn push_qq(v: serde_json::Value) -> bool {
-    QQ_PUSH.lock().unwrap_or_else(|p| p.into_inner()).as_ref().is_some_and(|t| t.send(v.to_string()).is_ok())
+/// Send one dispatch through the mock QQ gateway of the first bot (AppID 102).
+fn push_qq(v: serde_json::Value) -> bool { push_qq_to("102", v) }
+
+/// Send one dispatch through the mock QQ gateway connection of bot `app` (false when it is not connected).
+fn push_qq_to(app: &str, v: serde_json::Value) -> bool {
+    QQ_PUSH.lock().unwrap_or_else(|p| p.into_inner()).iter().rev().find(|(a, _)| a == app).is_some_and(|(_, t)| t.send(v.to_string()).is_ok())
 }
+
+/// The bot a mock token belongs to: "tok" is AppID 102's, "tok<AppID>" any other bot's.
+fn qq_token_app(token: &str) -> Option<String> {
+    let t = token.strip_prefix("QQBot tok")?;
+    Some(if t.is_empty() { "102".to_owned() } else { t.to_owned() })
+}
+
+/// The next scan's bot: (AppID, AppSecret, scanner's openid); None = AppID 102.
+static QQ_SCAN: std::sync::Mutex<Option<(String, String, String)>> = std::sync::Mutex::new(None);
 
 /// A QQ gateway as the real one behaves: HELLO, then IDENTIFY (or RESUME) with
 /// `QQBot <token>` → READY (a wrong token gets INVALID_SESSION + close 4004),
@@ -1221,15 +1379,16 @@ async fn mock_qq_gateway() -> Result<String, String> {
                 let Some(Ok(Message::Text(t))) = ws.next().await else { return };
                 let v: Value = serde_json::from_str(&t).unwrap_or_default();
                 QQ_LOG.lock().unwrap_or_else(|p| p.into_inner()).push(("ident".into(), v.clone()));
-                if v["d"]["token"] != "QQBot tok" {
+                let Some(app) = qq_token_app(v["d"]["token"].as_str().unwrap_or_default()) else {
                     let _ = ws.send(Message::text(r#"{"op":9,"d":false}"#)).await;
                     let _ = ws.close(Some(CloseFrame { code: CloseCode::from(4004), reason: "Authentication fail".into() })).await;
                     return;
-                }
+                };
                 let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
-                *QQ_PUSH.lock().unwrap_or_else(|p| p.into_inner()) = Some(tx);
+                QQ_PUSH.lock().unwrap_or_else(|p| p.into_inner()).push((app.clone(), tx));
+                let who = if app == "102" { "DiscoBot".to_owned() } else { format!("Bot{app}") };
                 let first = if v["op"] == 6 { json!({ "op": 0, "s": 1, "t": "RESUMED", "d": "" }) }
-                    else { json!({ "op": 0, "s": 1, "t": "READY", "d": { "version": 1, "session_id": "S1", "user": { "id": "B", "username": "DiscoBot", "bot": true }, "shard": [0, 1] } }) };
+                    else { json!({ "op": 0, "s": 1, "t": "READY", "d": { "version": 1, "session_id": format!("S{app}"), "user": { "id": "B", "username": who, "bot": true }, "shard": [0, 1] } }) };
                 if ws.send(Message::text(first.to_string())).await.is_err() { return; }
                 let mut seq = 1;
                 loop {
@@ -1270,10 +1429,17 @@ async fn mock_qq() -> Result<String, String> {
     static KEY: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
     static POLLS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
     use axum::{http::HeaderMap, response::IntoResponse};
+    // Every entry carries the bot that sent it as "_app" (several bots since v1.13).
+    fn log_as(h: &HeaderMap, k: String, mut b: Value) {
+        if b.is_object() { b["_app"] = json!(sender(h)); }
+        QQ_LOG.lock().unwrap_or_else(|p| p.into_inner()).push((k, b));
+    }
     let log = |k: String, b: Value| QQ_LOG.lock().unwrap_or_else(|p| p.into_inner()).push((k, b));
-    // As the real API: every call needs `Authorization: QQBot <token>` and the app id.
+    fn sender(h: &HeaderMap) -> String { h.get("x-union-appid").and_then(|v| v.to_str().ok()).unwrap_or_default().to_owned() }
+    // As the real API: every call needs `Authorization: QQBot <token>` and the app id, and
+    // the token must be that bot's own.
     fn authed(h: &HeaderMap) -> bool {
-        h.get("authorization").and_then(|v| v.to_str().ok()) == Some("QQBot tok") && h.get("x-union-appid").and_then(|v| v.to_str().ok()) == Some("102")
+        h.get("authorization").and_then(|v| v.to_str().ok()).and_then(qq_token_app).is_some_and(|app| app == sender(h))
     }
     fn denied() -> axum::response::Response {
         (axum::http::StatusCode::UNAUTHORIZED, Json(json!({ "message": "鉴权失败", "code": 11201, "err_code": 40012001 }))).into_response()
@@ -1287,16 +1453,24 @@ async fn mock_qq() -> Result<String, String> {
         .route("/lite/poll_bind_result", post(|| async {
             if POLLS.fetch_add(1, std::sync::atomic::Ordering::SeqCst) < 1 { return Json(json!({ "retcode": 0, "data": { "status": 1, "bot_appid": "0", "bot_encrypt_secret": "" } })); }
             let key = KEY.lock().unwrap_or_else(|p| p.into_inner()).clone();
-            Json(json!({ "retcode": 0, "data": { "status": 2, "bot_appid": 102, "bot_encrypt_secret": disco_qq::encrypt("sec-from-scan", &key).unwrap_or_default(), "user_openid": "OWNER" } }))
+            let (app, secret, owner) = QQ_SCAN.lock().unwrap_or_else(|p| p.into_inner()).clone().unwrap_or_else(|| ("102".into(), "sec-from-scan".into(), "OWNER".into()));
+            let app: u64 = app.parse().unwrap_or(102);
+            Json(json!({ "retcode": 0, "data": { "status": 2, "bot_appid": app, "bot_encrypt_secret": disco_qq::encrypt(&secret, &key).unwrap_or_default(), "user_openid": owner } }))
         }))
-        .route("/app/getAppAccessToken", post(move |Json(b): Json<Value>| async move { log("token".into(), b); Json(json!({ "access_token": "tok", "expires_in": "7200" })) }))
-        .route("/users/@me", get(|h: HeaderMap| async move { if authed(&h) { Json(json!({ "username": "DiscoBot" })).into_response() } else { denied() } }))
+        .route("/app/getAppAccessToken", post(move |Json(b): Json<Value>| async move {
+            let app = b["appId"].as_str().unwrap_or_default().to_owned();
+            log("token".into(), b);
+            Json(json!({ "access_token": if app == "102" { "tok".to_owned() } else { format!("tok{app}") }, "expires_in": "7200" })) }))
+        .route("/users/@me", get(|h: HeaderMap| async move {
+            if !authed(&h) { return denied(); }
+            let app = sender(&h);
+            Json(json!({ "username": if app == "102" { "DiscoBot".to_owned() } else { format!("Bot{app}") } })).into_response() }))
         .route("/gateway", get(move |h: HeaderMap| { let ws = ws.clone(); async move { if authed(&h) { Json(json!({ "url": ws })).into_response() } else { denied() } } }))
         .route("/v2/groups/{g}/messages", post(move |h: HeaderMap, Path(g): Path<String>, Json(b): Json<Value>| async move {
             if !authed(&h) { return denied(); }
             // A passive reply to a message QQ no longer accepts replies to.
             if b["msg_id"] == "expired" { return (axum::http::StatusCode::BAD_REQUEST, Json(json!({ "code": 304027, "message": "消息已过期，不能被动回复" }))).into_response(); }
-            log(format!("msg:{g}"), b.clone());
+            log_as(&h, format!("msg:{g}"), b.clone());
             // Scripted trouble: (status, body) pairs, then the normal answer.
             let fail = QQ_FAIL.lock().unwrap_or_else(|p| p.into_inner()).pop_front();
             if let Some((code, body)) = fail {
@@ -1304,10 +1478,10 @@ async fn mock_qq() -> Result<String, String> {
                 return (code, Json(body)).into_response();
             }
             Json(json!({ "id": "sent", "timestamp": 0 })).into_response() }))
-        .route("/v2/groups/{g}/files", post(move |h: HeaderMap, Path(g): Path<String>, Json(b): Json<Value>| async move { if !authed(&h) { return denied(); } log(format!("file:{g}"), b); Json(json!({ "file_info": "FI" })).into_response() }))
-        .route("/v2/users/{u}/messages", post(move |h: HeaderMap, Path(u): Path<String>, Json(b): Json<Value>| async move { if !authed(&h) { return denied(); } log(format!("c2c:{u}"), b); Json(json!({ "id": "sent" })).into_response() }))
-        .route("/v2/users/{u}/files", post(move |h: HeaderMap, Path(u): Path<String>, Json(b): Json<Value>| async move { if !authed(&h) { return denied(); } log(format!("c2cfile:{u}"), b); Json(json!({ "file_info": "FI" })).into_response() }))
-        .route("/interactions/{i}", put(move |h: HeaderMap, Path(i): Path<String>| async move { if !authed(&h) { return denied(); } log(format!("ack:{i}"), json!({})); Json(json!({})).into_response() }))
+        .route("/v2/groups/{g}/files", post(move |h: HeaderMap, Path(g): Path<String>, Json(b): Json<Value>| async move { if !authed(&h) { return denied(); } log_as(&h, format!("file:{g}"), b); Json(json!({ "file_info": "FI" })).into_response() }))
+        .route("/v2/users/{u}/messages", post(move |h: HeaderMap, Path(u): Path<String>, Json(b): Json<Value>| async move { if !authed(&h) { return denied(); } log_as(&h, format!("c2c:{u}"), b); Json(json!({ "id": "sent" })).into_response() }))
+        .route("/v2/users/{u}/files", post(move |h: HeaderMap, Path(u): Path<String>, Json(b): Json<Value>| async move { if !authed(&h) { return denied(); } log_as(&h, format!("c2cfile:{u}"), b); Json(json!({ "file_info": "FI" })).into_response() }))
+        .route("/interactions/{i}", put(move |h: HeaderMap, Path(i): Path<String>| async move { if !authed(&h) { return denied(); } log_as(&h, format!("ack:{i}"), json!({})); Json(json!({})).into_response() }))
         .route("/file.txt", get(|| async { "qq file" }));
     let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.map_err(|e| e.to_string())?;
     let port = l.local_addr().map_err(|e| e.to_string())?.port();

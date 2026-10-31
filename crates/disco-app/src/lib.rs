@@ -327,7 +327,7 @@ impl Core {
         let thread = format!("dm:{agent}");
         self.post_message(&thread, &author, &text);
         if self.user_remember(&thread, &agent, &text) { return; }
-        let qq = qq::target(self, &thread);
+        let qq = qq::target_for(self, &thread, Some(&agent));
         let on_qq = qq::agent_sync(self, &agent) == "qq";
         let mirror = if on_qq { None } else { self.agent_channel(&agent).and_then(|ch| Some((self.discord_rest()?, ch))) };
         // Mirror in the background: the agent must not wait on Discord.
@@ -345,7 +345,8 @@ impl Core {
                 {
                     self.post_message(&thread, "system", &format!("Discord 发送失败：{e}"));
                 }
-                if let Some((rest, to)) = &qq && !answer.is_empty() && let Err(e) = qq::post(rest, to, &agent, &qq::mirror_text(self, answer)).await {
+                if let Some(route) = &qq && !answer.is_empty()
+                    && let Err(e) = qq::post(route, if qq::named(self, route, &agent) { &agent } else { "" }, &qq::mirror_text(self, answer)).await {
                     self.post_message(&thread, "system", &format!("QQ 发送失败：{e}"));
                 }
                 // Meant for QQ but nowhere to send it: say why instead of failing quietly.
@@ -353,9 +354,9 @@ impl Core {
             }
             Err(e) => {
                 self.report_failure(&thread, &agent, &e);
-                if let Some((rest, to)) = qq {
-                    let line = fail_line(&agent, &e);
-                    tauri::async_runtime::spawn(async move { let _ = qq::post(&rest, &to, &agent, &line).await; });
+                if let Some(route) = qq {
+                    let (who, line) = (if qq::named(self, &route, &agent) { agent.clone() } else { String::new() }, fail_line(&agent, &e));
+                    tauri::async_runtime::spawn(async move { let _ = qq::post(&route, &who, &line).await; });
                 }
             }
         }
@@ -551,9 +552,9 @@ impl Core {
             });
         }
         // A group tied to a QQ group: the bot says it there (`**name**：text`).
-        if !from_discord && let Some((rest, openid)) = qq::target(self, &thread) {
+        if !from_discord && let Some(route) = qq::target(self, &thread) {
             let (who, body) = (if owner { share::owner_name() } else { display(&author) }, text.clone());
-            tauri::async_runtime::spawn(async move { let _ = qq::post(&rest, &openid, &who, &body).await; });
+            tauri::async_runtime::spawn(async move { let _ = qq::post(&route, &who, &body).await; });
         }
         if owner && let Some(task) = team::command(&text) {
             self.team(&g, task).await;
@@ -607,8 +608,8 @@ impl Core {
                             {
                                 self.post_message(thread, "system", &format!("Discord 发送失败：{e}"));
                             }
-                            if let Some((rest, openid)) = qq::target(self, thread)
-                                && let Err(e) = qq::post(&rest, &openid, agent, &qq::mirror_text(self, &answer)).await
+                            if let Some(route) = qq::target_for(self, thread, Some(agent))
+                                && let Err(e) = qq::post(&route, if qq::named(self, &route, agent) { agent } else { "" }, &qq::mirror_text(self, &answer)).await
                             {
                                 self.post_message(thread, "system", &format!("QQ 发送失败：{e}"));
                             }
@@ -646,8 +647,8 @@ impl Core {
                     let ch = g.id.clone();
                     tauri::async_runtime::spawn(async move { let _ = d.post(&ch, help).await; });
                 }
-                if let Some((rest, openid)) = qq::target(self, thread) {
-                    tauri::async_runtime::spawn(async move { let _ = qq::post(&rest, &openid, "", help).await; });
+                if let Some(route) = qq::target(self, thread) {
+                    tauri::async_runtime::spawn(async move { let _ = qq::post(&route, "", help).await; });
                 }
                 true
             }
@@ -1136,6 +1137,9 @@ pub(crate) struct NewAgent {
     /// Where the 1:1 chat syncs: "discord" or "qq" (None / "" = the default, see `qq::sync_default`).
     #[serde(default)]
     sync: Option<String>,
+    /// QQ only: the AppID of a bot this agent gets as its own (Import → 专用机器人).
+    #[serde(default)]
+    bot: Option<String>,
 }
 
 #[tauri::command]
@@ -1143,8 +1147,12 @@ async fn add_agent(core: St<'_>, spec: NewAgent) -> CmdResult<Vec<String>> {
     // Where the new agents' 1:1 chats sync: Discord (a channel each, as always) or QQ.
     let picked = spec.sync.clone().filter(|s| !s.is_empty());
     let to = qq::sync_choice(&core, picked.as_deref())?;
+    // Its own QQ bot: checked before anything is added; the first agent added gets it.
+    let bot = spec.bot.clone().filter(|b| !b.is_empty() && to == "qq");
+    if let Some(app) = &bot { qq::bot_assignable(&core, app)?; }
     let names = add_agent_rows(&core, spec).await?;
     qq::set_sync(&core, &names, to, picked.is_some())?;
+    if let (Some(app), Some(first)) = (&bot, names.first()) { qq::set_bot_agent(&core, app, Some(first))?; }
     core.agents_changed();
     core.inner().warm(Some(names.clone()));
     if to == "qq" {
@@ -1169,12 +1177,12 @@ impl NewAgent {
     /// A remote A2A agent behind a bearer token (Disco invites).
     pub(crate) fn remote(name: String, url: String, token: String, extra: Vec<(String, String)>) -> Self {
         Self { template: "a2a".into(), name, url: Some(url), header_name: Some("authorization".into()), header_value: Some(format!("Bearer {token}")),
-            command: None, cwd: None, count: None, worktree: None, conda: None, model: None, extra, sync: None }
+            command: None, cwd: None, count: None, worktree: None, conda: None, model: None, extra, sync: None, bot: None }
     }
 }
 
 pub(crate) async fn add_agent_rows(core: &Core, spec: NewAgent) -> CmdResult<Vec<String>> {
-    let NewAgent { template, name, url, header_name, header_value, command, cwd, count, worktree, conda, model, extra, sync: _ } = spec;
+    let NewAgent { template, name, url, header_name, header_value, command, cwd, count, worktree, conda, model, extra, sync: _, bot: _ } = spec;
     let name = valid_name(&name)?;
     let kind = match template.as_str() { "a2a" => "a2a", "command" => "command", "openai" => "openai", _ => "acp" };
     let row = match kind {
@@ -1855,7 +1863,7 @@ pub fn run() {
             stop_all, resume, save_discord_token, discord_connect, discord_settings, discord_sync, diagnose, open_url, reveal_path, discord_channels, save_group, delete_group, restore_group, memory_restore, set_memory, agent_commands,
             check_update, install_update, space, todo_new, todo_set, todo_remove, doc_save, reveal_doc, share::share_status, share::peer_check, share::create_share, share::share_invite, share::revoke_share, share::accept_invite,
             tunnel::tunnel_status, tunnel::tunnel_install, tunnel::tunnel_login, tunnel::tunnel_setup, tunnel::tunnel_set,
-            qq::qq_status, qq::qq_bind, qq::qq_bind_cancel, qq::qq_unbind, qq::qq_group_code, qq::qq_bind_group, qq::qq_claim_code, qq::qq_reconnect, qq::qq_set, set_agent_sync
+            qq::qq_status, qq::qq_bind, qq::qq_add_bot, qq::qq_bind_cancel, qq::qq_unbind, qq::qq_group_code, qq::qq_bind_group, qq::qq_claim_code, qq::qq_reconnect, qq::qq_set, qq::qq_bots, qq::qq_set_bot_agent, qq::qq_remove_bot, set_agent_sync
         ])
         .build(tauri::generate_context!())
         .expect("error while running Disco")

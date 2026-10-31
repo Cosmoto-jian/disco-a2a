@@ -615,6 +615,9 @@ pub struct Attachment { pub url: String, pub name: String, pub size: u64 }
 #[derive(Debug, Clone, PartialEq)]
 pub struct Incoming {
     pub kind: Kind,
+    /// The AppID of the bot this event came in through (set by the gateway client; ""
+    /// when a caller builds the event itself).
+    pub app: String,
     /// Group openid (or the user's openid in a direct chat).
     pub group: String,
     /// The sender's openid in that group (`member_openid`), or the presser's.
@@ -637,7 +640,7 @@ fn s(v: &Value) -> String { v.as_str().unwrap_or_default().to_owned() }
 
 /// One gateway dispatch (`t`, `d`) as Disco needs it; None for anything else.
 pub fn parse(t: &str, d: &Value) -> Option<Incoming> {
-    let base = |kind| Incoming { kind, group: s(&d["group_openid"]), author_id: String::new(), author: String::new(), bot: false,
+    let base = |kind| Incoming { kind, app: String::new(), group: s(&d["group_openid"]), author_id: String::new(), author: String::new(), bot: false,
         content: String::new(), id: s(&d["id"]), at_me: false, attachments: Vec::new(), press: None };
     match t {
         "GROUP_AT_MESSAGE_CREATE" | "GROUP_MESSAGE_CREATE" | "C2C_MESSAGE_CREATE" => {
@@ -872,7 +875,9 @@ async fn session(rest: &Rest, tx: Option<&mpsc::Sender<Incoming>>, stop: &mut wa
                     on_status(Status::Ready(None, via_proxy));
                 } else {
                     on_status(Status::Event(t.to_owned()));
-                    if let (Some(tx), Some(m)) = (tx, parse(t, &v["d"])) && tx.send(m).await.is_err() { return End::Stopped; }
+                    // Every event carries the bot it belongs to: one Disco may run several.
+                    let m = tx.and_then(|_| parse(t, &v["d"])).map(|m| Incoming { app: rest.app_id().to_owned(), ..m });
+                    if let (Some(tx), Some(m)) = (tx, m) && tx.send(m).await.is_err() { return End::Stopped; }
                 }
             }
             _ => {}

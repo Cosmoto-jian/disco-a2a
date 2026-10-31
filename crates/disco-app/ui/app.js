@@ -1128,8 +1128,14 @@ async function renderGallery() {
   const todo = have.filter((t) => !S.ov.agents.some((a) => a.template === t.id));
   const all = h("button", { type: "button", class: "btn pri sm", disabled: !todo.length, onclick: () => importAll(todo, all) }, todo.length ? "全部导入" : "已全部导入");
   // One choice for everything imported from this page (全部导入 included).
-  const sync = qqBound() ? gsec(null, null, [grow("同步到", syncSeg(syncPick(), (v) => { S.syncTo = v; }))],
-    "Discord：每个 agent 一个频道。QQ：都在 QQ 机器人的私聊里，以 @名字 开头切换 agent。导入后也能在 agent 信息里改。", "sync-pick") : null;
+  // Bots nobody owns yet (not the shared one): an imported agent may take one as its own.
+  const free = qqBound() ? (await invoke("qq_bots").catch(() => []) || []).filter((b) => !b.agent).slice(1) : [];
+  if (!page.isConnected) return;
+  if (!free.some((b) => b.app === S.botPick)) S.botPick = null;
+  const botRow = free.length ? grow("专用机器人", choice([["", "不用（共享机器人）"], ...free.map((b) => [b.app, `${b.name} …${String(b.app).slice(-4)}`])], S.botPick || "", (v) => { S.botPick = v || null; })) : null;
+  if (botRow) { botRow.id = "bot-pick"; botRow.hidden = syncPick() !== "qq"; }
+  const sync = qqBound() ? gsec(null, null, [grow("同步到", syncSeg(syncPick(), (v) => { S.syncTo = v; if (botRow) botRow.hidden = v !== "qq"; })), botRow],
+    "Discord：每个 agent 一个频道。QQ：都在 QQ 机器人的私聊里，以 @名字 开头切换 agent；选了专用机器人的 agent 用它自己的机器人私聊。导入后也能在 agent 信息里改。", "sync-pick") : null;
   page.replaceChildren(...[h("h1", {}, "添加 Agent"),
     h("p", { class: "lead" }, have.length ? "导入后直接沿用终端里的登录和模型；点整行可以调目录和环境。" : `没在${here}上找到已安装的 agent，可以手动添加。`),
     sync,
@@ -1171,12 +1177,15 @@ function brandIcon(id, small = false) {
   return h("span", { class: `brand${small ? " sm" : ""}` }, ic(KIND_IC[id] ?? "robot"));
 }
 const freeName = (base) => { let name = base, i = 2; while (S.ov.agents.some((a) => a.name === name)) name = `${base}-${i++}`; return name; };
-const quickSpec = (t, name) => ({ template: t.id, name, url: null, headerName: null, headerValue: null, command: null, cwd: null, count: 1, worktree: false, conda: null, sync: syncSpec() });
+const quickSpec = (t, name) => ({ template: t.id, name, url: null, headerName: null, headerValue: null, command: null, cwd: null, count: 1, worktree: false, conda: null, sync: syncSpec(), bot: botSpec() });
 // Where an imported agent's 1:1 chat syncs: Discord (its own channel) or QQ (the bot's private chat).
 // Offered only once a QQ bot is bound; the default is the backend's (last choice, else what is connected).
 const qqBound = () => !!S.ov?.qq_status;
 const syncPick = () => S.syncTo ?? S.ov?.sync_default ?? "discord";
 const syncSpec = () => (qqBound() ? syncPick() : null);
+// Import → 专用机器人 (QQ only); one agent per bot, so it is used once and then cleared.
+const botSpec = () => (syncSpec() === "qq" ? S.botPick || null : null);
+const botUsed = (spec) => { if (spec.bot) S.botPick = null; };
 // Apple-style segmented control: Discord | QQ. `onPick(v)`; returns the element.
 function syncSeg(value, onPick) {
   const el = h("div", { class: "seg2 sync", role: "radiogroup", "aria-label": "同步到" });
@@ -1191,7 +1200,8 @@ async function quickImport(t, btn) {
   const name = freeName(t.id);
   btn.textContent = "导入中…"; btn.classList.add("busy");
   try {
-    await invoke("add_agent", { spec: quickSpec(t, name) });
+    const spec = quickSpec(t, name);
+    await invoke("add_agent", { spec }); botUsed(spec);
     await load(); setTab("chats"); openThread(`dm:${name}`); toast(`已导入 ${name}`, 2000);
   } catch (e) { btn.textContent = "导入"; btn.classList.remove("busy"); toast(e); }
 }
@@ -1201,7 +1211,8 @@ async function importAll(list, btn) {
   let n = 0, first = null;
   for (const t of list) {
     const name = freeName(t.id);
-    try { await invoke("add_agent", { spec: quickSpec(t, name) }); n++; first ??= name; await load(); } catch (e) { toast(`${t.name}：${e}`, 6000); }
+    const spec = quickSpec(t, name);
+    try { await invoke("add_agent", { spec }); botUsed(spec); n++; first ??= name; await load(); } catch (e) { toast(`${t.name}：${e}`, 6000); }
   }
   await load();
   if (n) toast(`已导入 ${n} 个 agent`, 4000, ["去聊天", () => { setTab("chats"); openThread(`dm:${first}`); }]);
@@ -1287,7 +1298,8 @@ function agentForm(t) {
     go.disabled = true; err.textContent = "";
     try {
       const added = await invoke("add_agent", { spec: { template: t.id, name: name.value, url: url?.value ?? null, headerName: hn?.value || null, headerValue: hv?.value || null,
-        command: cmd?.value ?? null, cwd: st.cwd || null, count: st.count, worktree: st.count > 1, conda: st.conda || null, model: model?.value || null, sync: syncSpec() } });
+        command: cmd?.value ?? null, cwd: st.cwd || null, count: st.count, worktree: st.count > 1, conda: st.conda || null, model: model?.value || null, sync: syncSpec(), bot: botSpec() } });
+      botUsed({ bot: botSpec() });
       if (pic) for (const n of added ?? []) await invoke("set_avatar", { agent: n, data: pic }).catch(() => {});
       await load(); setTab("chats"); openThread(`dm:${name.value.trim()}`);
     } catch (e) { err.textContent = String(e); go.disabled = false; }
@@ -1597,7 +1609,8 @@ async function loadQQ(sec, q) {
       if (++n > 450 || !sec.isConnected) { clearInterval(qqPoll); return; }
       const s = await invoke("qq_status").catch(() => null);
       if (!s) return;
-      if (s.bound) { clearInterval(qqPoll); S.ov.qq_status = S.ov.qq_status || s.status || "连接中…"; loadQQ(sec, s); renderList(); toast("QQ 机器人已接入"); }
+      // Done: the code is gone and a bot was saved (the first one, or 添加机器人 / a re-scan: notice says which).
+      if (!s.qr && s.bound && (s.notice || !q.bound)) { clearInterval(qqPoll); S.ov.qq_status = S.ov.qq_status || s.status || "连接中…"; loadQQ(sec, s); renderList(); toast(s.notice || "QQ 机器人已接入", 4000); }
       else if (s.qr !== q.qr) { clearInterval(qqPoll); loadQQ(sec, s); }
     }, 2000);
     rows.push(h("div", { class: "grow-row col qq-scan" },
@@ -1616,7 +1629,7 @@ async function loadQQ(sec, q) {
     const ago = (ms) => { const s = Math.max(0, Math.round((Date.now() - ms) / 1000)); return s < 60 ? `${s} 秒前` : s < 3600 ? `${Math.floor(s / 60)} 分钟前` : `${Math.floor(s / 3600)} 小时前`; };
     rows.push(grow("状态", h("span", { id: "qq-status", class: `status${online ? " ok" : ""}` }, h("i"), q.status || "连接中…"),
       h("button", { type: "button", class: "btn sm", title: "断开后重新取 token、连网关", onclick: () => redo(invoke("qq_reconnect")) }, "重新连接")));
-    rows.push(grow("机器人", h("span", { class: "val" }, q.name || "QQ 机器人")));
+    rows.push(...qqBotRows(q, redo));
     // Only the answer reaches QQ and Discord unless this is on: the app keeps the whole trace.
     const toolsTgl = toggle(!!q.show_tools);
     toolsTgl.id = "qq-show-tools";
@@ -1648,9 +1661,33 @@ async function loadQQ(sec, q) {
     rows.push(grow("解绑", h("button", { type: "button", class: "btn sm danger", onclick: async () => {
       if (await ask("解绑 QQ 机器人？已连上的 QQ 群会停止同步，重新扫码接入后自动恢复。", "解绑")) { await redo(invoke("qq_unbind")); S.ov.qq_status = ""; renderList(); }
     } }, "解绑")));
-    foot = "把机器人拉进 QQ 群，再到 群聊 → 新建群聊 打开「同步到 QQ 群」，按提示在群里发绑定码；也可以直接在群里 @我 一句话，我会给群主一个绑定码（按提示私聊发「绑定群 1234」就自动建群连上），上面的「未绑定的 QQ 群」也能一键绑定。QQ 群里要 @机器人 说话（QQ 只把 @机器人 的消息推给 Disco），写 @agent 名字可以点名；没点名就交给组长。消息过不去时点 通用与更新 → 一键诊断，看「QQ 实时连接」那几行。";
+    foot = "每个 agent 可以有自己的 QQ 机器人：点「添加机器人」扫码接入另一个机器人，再在它的「对应 Agent」里选一个 agent。专用机器人的私聊就是那个 agent，不用写 @名字；没有专用机器人的 agent 继续共用共享机器人。把机器人拉进 QQ 群，再到 群聊 → 新建群聊 打开「同步到 QQ 群」，按提示在群里发绑定码；也可以直接在群里 @我 一句话，我会给群主一个绑定码（按提示私聊发「绑定群 1234」就自动建群连上），上面的「未绑定的 QQ 群」也能一键绑定。QQ 群里要 @机器人 说话（QQ 只把 @机器人 的消息推给 Disco），写 @agent 名字可以点名；没点名就交给组长。消息过不去时点 通用与更新 → 一键诊断，看「QQ 实时连接」那几行。";
   }
   sec.replaceChildren(head, h("div", { class: "glist" }, ...rows), h("p", { class: "foot" }, foot));
+}
+// Settings → QQ: the bound bots. One bot: its name and 「添加机器人」. Several: one row each with
+// its status, 「对应 Agent」 (共享 = every QQ-synced agent; else that one agent alone) and 删除.
+function qqBotRows(q, redo) {
+  const bots = q.bots || [];
+  const add = h("button", { type: "button", class: "btn sm", id: "qq-add-bot", title: "扫码接入另一个 QQ 机器人，给某个 agent 专用" }, ic("plus"), "添加机器人");
+  add.onclick = () => { add.disabled = true; redo(invoke("qq_add_bot")); };
+  if (bots.length < 2) return [grow("机器人", h("span", { class: "val" }, q.name || bots[0]?.name || "QQ 机器人"), bots.length < 5 ? add : null)];
+  const names = (S.ov.agents || []).map((a) => a.name);
+  const shared = bots.find((b) => !b.agent)?.app;
+  const rows = bots.map((b) => {
+    const tail = String(b.app || "").slice(-4);
+    const pick = choice([["", "共享"], ...names.map((n) => [n, n])], b.agent || "", (v) => redo(invoke("qq_set_bot_agent", { app: b.app, agent: v || null })));
+    pick.classList.add("qq-bot-agent");
+    pick.title = "对应 Agent：共享 = 所有同步到 QQ 的 agent 共用；选一个 agent = 这个机器人只替它说话";
+    const del = h("button", { type: "button", class: "btn sm danger", title: "删除这个机器人（已连上的 QQ 群会保留，重新扫码后恢复）", onclick: async () => {
+      if (await ask(`删除机器人「${b.name}」？${b.agent ? `${b.agent} 会改用共享机器人。` : b.app === shared ? "下一个最早添加的机器人会成为共享机器人。" : ""}`, "删除")) redo(invoke("qq_remove_bot", { app: b.app }));
+    } }, "删除");
+    const row = grow(b.name || "QQ 机器人", h("span", { class: `status${b.ready ? " ok" : ""}`, title: `AppID ${b.app} · ${b.status || ""}` }, h("i"), `…${tail}${b.app === shared ? " · 默认" : ""}`), pick, del);
+    row.id = `qq-bot-${b.app}`;
+    return row;
+  });
+  if (bots.length < 5) rows.push(grow("更多机器人", h("span", { class: "val" }, "QQ 最多 5 个"), add));
+  return rows;
 }
 // Gateway status changes, a refreshed QR code, or a failed scan: re-read the real state.
 listen("qq", async ({ payload }) => {

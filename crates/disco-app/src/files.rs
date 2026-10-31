@@ -183,12 +183,12 @@ impl Core {
     /// background (QQ's one-shot upload limit is 20 MB; a bigger one is reported in
     /// Settings → QQ「发送失败」, never dropped silently).
     fn qq_file(&self, thread: &str, path: &std::path::Path, name: &str) {
-        let Some((rest, to)) = crate::qq::target(self, thread) else { return };
-        let (path, name) = (path.to_path_buf(), name.to_owned());
+        let Some(route) = crate::qq::target(self, thread) else { return };
+        let (path, name, app) = (path.to_path_buf(), name.to_owned(), route.app.clone());
         tauri::async_runtime::spawn(async move {
             match tokio::fs::read(&path).await {
-                Ok(bytes) => if let Err(e) = crate::qq::post_file(&rest, &to, &name, &bytes).await { crate::qq::note_send_error(&e); },
-                Err(e) => crate::qq::note_send_error(&format!("读文件失败：{e}")),
+                Ok(bytes) => if let Err(e) = crate::qq::post_file(&route, &name, &bytes).await { crate::qq::note_send_error(&app, &e); },
+                Err(e) => crate::qq::note_send_error(&app, &format!("读文件失败：{e}")),
             }
         });
     }

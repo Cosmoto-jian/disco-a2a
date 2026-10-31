@@ -93,9 +93,9 @@ impl Core {
         }
         self.inbox_changed();
         // QQ can't edit a sent card: its buttons grey out once one is pressed.
-        if let Some((rest, openid)) = qq {
+        if let Some(route) = qq {
             let (text, buttons) = (format!("{card}{note}"), buttons.clone());
-            tauri::async_runtime::spawn(async move { let _ = crate::qq::post_card(&rest, &openid, &text, &buttons).await; });
+            tauri::async_runtime::spawn(async move { let _ = crate::qq::post_card(&route, &text, &buttons).await; });
         }
         if let Some((rest, ch)) = discord {
             let inbox = self.inbox.clone();

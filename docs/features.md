@@ -8,7 +8,7 @@
 - `手动验证` = 无法离线确定性测试（真实 Discord 网关、Tailscale、系统对话框、更新服务器），后面写手动步骤。
 - `UI` = 纯界面行为，由 ui-test/ 与 `notes/ui-feature-inventory.md` 守护，本文件只登记。
 
-v1.6.5 基线新增的 selftest 检查在下表中用 ★ 标出；v1.8.0 跨设备传文件新增的用 ◆ 标出；v1.9.0 Cloudflare 隧道新增的用 ▲ 标出；v1.10.0 QQ 官方机器人新增的用 ● 标出；v1.11.0 agent 私聊同步到 QQ 新增的用 ◎ 标出；v1.11.1 QQ 连接修复新增的用 ✚ 标出；QQ 群修复（未绑定群 @机器人 无反应）新增的用 ✱ 标出。
+v1.6.5 基线新增的 selftest 检查在下表中用 ★ 标出；v1.8.0 跨设备传文件新增的用 ◆ 标出；v1.9.0 Cloudflare 隧道新增的用 ▲ 标出；v1.10.0 QQ 官方机器人新增的用 ● 标出；v1.11.0 agent 私聊同步到 QQ 新增的用 ◎ 标出；v1.11.1 QQ 连接修复新增的用 ✚ 标出；QQ 群修复（未绑定群 @机器人 无反应）新增的用 ✱ 标出；v1.13.0 多个 QQ 机器人（每个 agent 一个）新增的用 ◇ 标出。
 
 ## 私聊
 
@@ -145,6 +145,18 @@ v1.6.5 基线新增的 selftest 检查在下表中用 ★ 标出；v1.8.0 跨设
 | QQ 长回复分段 / 重发 / 降级 | 长回复按段落和代码块边界分段（每段 ≤1800 字，参考实现 TEXT_CHUNK_LIMIT 是 5000，实测保守更安全），代码块绝不切断（超长的代码块按行切开、每片自带完整 ``` 围栏），超过 1 段时加「（1/3）」编号；每条消息一个随机 msg_seq（1–65535，同官方 `getNextMsgSeq`），重试沿用同一个 msg_seq，QQ 去重使重复到达无害；HTTP 5xx / 429 / 网络失败 / 限流码（参考 PART_FINISH_RETRYABLE_CODES 40093001）最多重试 3 次，退避 400/800/1600 ms；markdown 被拒自动改发纯文本（同一 seq）；被动回复额度（每条消息 5 次，群 5 分钟 / 私聊 60 分钟）用完或窗口过期时，用不掉的那些分段改发主动消息，绝不静默丢弃；失败原因进设置 → QQ「发送失败」 | UT:disco-qq chunks_never_cut_a_code_block, UT:disco-qq retries_transient_failures_and_falls_back_to_plain_text, ✚ST:QQ 群：被动回复被拒（消息过期）时改发主动消息，不丢 |
 | QQ 状态与诊断 `qq_status` `diagnose` | 设置 → QQ 显示连接阶段（取 token / 取网关地址 / 连网关 / 鉴权 / 在线 / 重试中 / 已停止）、最近收到的事件（类型、时间、数量，GROUP_AT_MESSAGE_CREATE / GROUP_ADD_ROBOT 一样显示）、最近错误、最近发送失败、私聊主人状态、未绑定的 QQ 群、群消息开关（GROUP_MSG_REJECT）；一键诊断加「QQ 机器人凭据 / QQ access_token / QQ 实时连接（后台没在线时单独连一次到 READY）/ QQ 收到的事件 / QQ 私聊主人 / QQ 发送 / QQ 未绑定的群」；READY、连接错误、诊断结果、私聊主人变更、非主人私聊、进群、绑定、群消息开关都记审计 | ✚ST:QQ 一键诊断：凭据、token、实时连接、收到的事件、私聊主人, ✱ST:QQ 机器人被拉进群（GROUP_ADD_ROBOT）…, UI:Q10, UI:Q11 |
 
+## 多个 QQ 机器人，每个 agent 一个（v1.13.0）
+
+| 功能 | 说明 | 验证 |
+|---|---|---|
+| 添加机器人 `qq_add_bot` `qq_bots` | 设置 → QQ：一个机器人时「机器人」行旁有「添加机器人」；点了走同一个扫码流程（create_bind_task / poll_bind_result → AppID + 解密的 AppSecret + 扫码人 openid）。多个机器人时每个一行：名字、AppID 尾号、在线状态（第一个共享的标「默认」）、「对应 Agent」选择、删除；QQ 每个账号最多 5 个，满了不再显示添加。每个机器人一条独立连接（token、网关、RESUME 会话、去重、被动回复额度、msg_seq 都按 AppID 分开）；第一个机器人的凭据仍在钥匙串旧账号 `qq_bot`，其余在 `qq_bot:<AppID>`。同一个 AppID 再扫一次：不新增，只更新密钥并重连，设置页提示「已添加过，只更新了密钥」 | ◇ST:QQ 多机器人：添加第二个机器人，两个各自在线；再扫同一个 AppID 只更新密钥, UI:Q13 |
+| 对应 Agent `qq_set_bot_agent` | 「共享」= 所有同步到 QQ 的 agent 共用（以前的行为：`**名字**：` 前缀、`@名字` 切换）；选一个 agent = 这个机器人只替它说话。约束：一个 agent 最多一个专用机器人；至少留一个共享机器人（只有一个机器人时它不能专用）；agent 必须存在。改名 / 删除 agent 时专用机器人跟着改名 / 变回共享 | ◇ST:QQ 多机器人：一个 agent 只能有一个专用机器人，至少留一个共享机器人, UI:Q13 |
+| 专用机器人的私聊 | 主人私聊专用机器人 = 直接和它的 agent 说话：不用 `@名字`，回复不带 `**名字**：`，`/help` `/agents` `/tools` `/new` `/stop` 默认作用于它；它的 agent 的私聊回复、审批卡片、文件都走这个机器人（不再要求「同步到 QQ」）。每个机器人有自己的主人 openid（扫码人；没给时第一个私聊的人；「认领私聊」可换） | ◇ST:QQ 专用机器人的私聊直达它的 agent，不用 @，回复走它自己的机器人且不带「**名字**：」 |
+| 专用机器人与 QQ 群 | QQ 群 openid 按机器人区分，一个 Disco 群聊可以同时连多个机器人各自的 QQ 群（键 `qq_group/<群聊>/<AppID>`）。专用机器人在没连上的 QQ 群里被 @：回一句提示 + 4 位码；主人私聊它「绑定群 1234」时，如果它的 agent 已在本地 Disco 群聊里，回一张卡片：这些群聊（最多 5 个）+「新建」按钮（QQ 不显示按钮时回复数字也行，0 = 新建），只有主人点才算；没有可选的群聊就直接新建一个只含该 agent 的群聊。共享机器人的流程不变（直接新建）。群里 @专用机器人 → 那个群聊（没点名给组长）；agent 在群里的回答走它自己的机器人（它连着这个群聊时），否则走共享机器人并带 `**名字**：` | ◇ST:QQ 专用机器人在未绑定群被 @：给码；私聊「绑定群」列出 agent 已在的 Disco 群聊 + 新建；群里回答走它自己的机器人 |
+| 删除机器人 `qq_remove_bot` | 先确认；停它的连接、删钥匙串凭据、名字和主人；它的 agent 改用共享机器人；删的是共享机器人时，最早添加的剩余机器人接替；它连过的 QQ 群关系保留，重新扫码后恢复。「解绑」仍是全部解绑 | ◇ST:QQ 多机器人：删掉专用机器人，agent 回到共享机器人；删掉共享机器人，剩下的接替, UI:Q13 |
+| 导入时选专用机器人 `add_agent`（`bot`） | 添加 Agent 页：同步到 QQ 且有没人用的机器人（共享的那个之外）时，多一行「专用机器人」（默认「不用（共享机器人）」）；选了就给导入的第一个 agent（全部导入时只给第一个），用过就清空；已被占用的机器人在添加前就报错，不会留下半个 agent | ◇ST:QQ 多机器人：一个 agent 只能有一个专用机器人…（导入被拒）, UI:S3 |
+| 老用户升级 | v1.12 的单机器人设置第一次读取时静默迁移：生成一行机器人（共享），所有绑定键补上 AppID（`qq_group/`、`qq_of/`、`qq_me/`、`qq_seen/`），凭据、主人、名字留在原键；只迁移一次。注意：迁移后退回旧版本会看不到已连的 QQ 群 | ◇ST:QQ 老版本（单机器人）设置升级时静默迁移 |
+
 ## Agent 私聊同步到 QQ（v1.11.0）
 
 | 功能 | 行为契约 | 覆盖 |
@@ -252,6 +264,7 @@ v1.6.5 基线新增的 selftest 检查在下表中用 ★ 标出；v1.8.0 跨设
 | create_share, revoke_share, accept_invite | ST:共享 邀请码接入后能聊, ST:共享 撤销后被拒, ▲ST:隧道 邀请过期即拒（`days`） |
 | tunnel_status, tunnel_install, tunnel_login, tunnel_setup, tunnel_set | ▲ST:隧道 邀请码带 Access 令牌，设置往返；安装/登录/建隧道手动验证（真实 Cloudflare 账号） |
 | qq_claim_code, qq_reconnect | ✚ST:QQ 私聊：别人私聊会被告知怎么认领…, UI:Q10 |
+| qq_bots, qq_add_bot, qq_set_bot_agent, qq_remove_bot | ◇ST:QQ 多机器人…（4 项）, UI:Q13, UI:S3 |
 | qq_bind_group | ✱ST:QQ 机器人被拉进群（GROUP_ADD_ROBOT）：打招呼，并记进未绑定列表, UI:Q11 |
 | qq_status, qq_bind, qq_bind_cancel, qq_unbind, qq_group_code | ●ST:QQ 扫码绑定…, ●ST:QQ 绑定码把 QQ 群连上…, ●ST:QQ 解绑群和机器人；真实扫码与 QQ 群手动验证 |
 | set_agent_sync | ◎ST:QQ 私聊：agent 发文件到私聊；改回 Discord 后不再同步, UI:S4 |

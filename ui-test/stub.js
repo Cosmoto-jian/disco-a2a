@@ -41,7 +41,7 @@
     discord_status: "在线 · MyBot#0001",
     qq_status: "",
     // QQ bot: not bound; `qq_bind` shows a QR code, `STUB.qq_scan()` simulates the scan in mobile QQ.
-    qq: { bound: false, status: "", name: "", qr: null, url: null, owner: false, groups: 0, unbound: [], show_tools: false,
+    qq: { bound: false, status: "", name: "", qr: null, url: null, owner: false, groups: 0, unbound: [], show_tools: false, bots: [], notice: "",
       diag: { stage: "", ready: false, proxy: false, ready_at: 0, error: "", error_at: 0, event: "", event_at: 0, events: 0, send_error: "", send_error_at: 0, stranger: "", gate: "", gate_at: 0 } },
     qq_codes: [],
     // Where new agents' 1:1 chats sync (backend: last choice, else what is connected, Discord if both).
@@ -134,6 +134,9 @@
     conda_envs: () => clone(STUB.envs),
     add_agent: (a) => { const s = a.spec; const names = s.count > 1 ? Array.from({ length: s.count }, (_, i) => `${s.name}-${i + 1}`) : [s.name];
       if (s.sync === "qq" && !STUB.qq.bound) throw "先在设置里扫码接入 QQ 机器人，才能同步到 QQ";
+      const bot = s.bot ? STUB.qq.bots.find((x) => x.app === s.bot) : null;
+      if (s.bot && (!bot || bot.agent)) throw "这个机器人已经是别的 agent 的专用机器人";
+      if (bot) bot.agent = names[0];
       const sync = s.sync || syncDefault();
       if (s.sync) STUB.sync_last = s.sync;
       for (const n of names) STUB.agents.push({ name: n, kind: s.url && s.template === "a2a" ? "a2a" : s.template === "openai" ? "openai" : "acp", template: s.template, detail: s.cwd ?? "", live: false, look: "", sync });
@@ -158,7 +161,28 @@
     qq_status: () => clone(STUB.qq),
     qq_bind: () => { STUB.qq.qr = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 21 21"><rect width="21" height="21" fill="#fff"/><path d="M1 1h7v7H1z" fill="#000"/></svg>'; STUB.qq.url = "https://q.qq.com/qqbot/openclaw/connect.html?task_id=T1"; STUB.qq.status = ""; return clone(STUB.qq); },
     qq_bind_cancel: () => { STUB.qq.qr = null; STUB.qq.url = null; return clone(STUB.qq); },
-    qq_unbind: () => { Object.assign(STUB.qq, { bound: false, status: "", name: "", owner: false }); STUB.qq_status = ""; return clone(STUB.qq); },
+    qq_unbind: () => { Object.assign(STUB.qq, { bound: false, status: "", name: "", owner: false, bots: [] }); STUB.qq_status = ""; return clone(STUB.qq); },
+    // v1.13: several bots, one per agent. `STUB.qq_scan_bot(app, name)` simulates scanning another one.
+    qq_bots: () => clone(STUB.qq.bots),
+    qq_add_bot: () => { if (!STUB.qq.bound) throw "先在设置里扫码接入 QQ 机器人"; return H.qq_bind(); },
+    qq_set_bot_agent: (a) => {
+      const bots = STUB.qq.bots, b = bots.find((x) => x.app === a.app);
+      if (!b) throw "没有这个 QQ 机器人";
+      const want = a.agent || null;
+      if (want && bots.length < 2) throw "只有一个机器人时它是共享机器人，先添加另一个机器人，再给它配专用 agent";
+      if (want && !STUB.agents.some((x) => x.name === want)) throw `Disco 里没有叫 ${want} 的 agent`;
+      if (want && bots.some((x) => x.agent === want && x.app !== a.app)) throw `${want} 已经有自己的机器人，一个 agent 只能有一个`;
+      if (want && !bots.some((x) => x !== b && !x.agent)) throw "至少要留一个共享机器人：别的 QQ 机器人要先指定自己的 agent";
+      b.agent = want; return clone(STUB.qq);
+    },
+    qq_remove_bot: (a) => {
+      const i = STUB.qq.bots.findIndex((x) => x.app === a.app);
+      if (i < 0) throw "没有这个 QQ 机器人";
+      const wasShared = !STUB.qq.bots[i].agent;
+      STUB.qq.bots.splice(i, 1);
+      if (wasShared && STUB.qq.bots.length && !STUB.qq.bots.some((x) => !x.agent)) STUB.qq.bots[0].agent = null;
+      return clone(STUB.qq);
+    },
     qq_claim_code: () => { if (!STUB.qq.bound) throw "先在设置里扫码接入 QQ 机器人"; return "4321"; },
     qq_reconnect: () => { if (!STUB.qq.bound) throw "先在设置里扫码接入 QQ 机器人"; STUB.qq.status = "连接中：取 token…"; return clone(STUB.qq); },
     qq_set: (a) => { if (!STUB.qq.bound) throw "先在设置里扫码接入 QQ 机器人"; STUB.qq.show_tools = !!a.showTools; return clone(STUB.qq); },
@@ -195,7 +219,13 @@
     open_url: () => null,
   };
   // The user scanned and confirmed in mobile QQ: the bot is saved and connects.
-  STUB.qq_scan = () => { Object.assign(STUB.qq, { bound: true, qr: null, url: null, name: "DiscoBot", status: "在线 · DiscoBot", owner: true }); Object.assign(STUB.qq.diag, { stage: "在线", ready: true, ready_at: Date.now() }); STUB.qq_status = "在线 · DiscoBot"; };
+  STUB.qq_scan_bot = (app, name) => {
+    const known = STUB.qq.bots.some((b) => b.app === app);
+    if (!known) STUB.qq.bots.push({ app, name, agent: null, status: `在线 · ${name}`, owner: true, ready: true, groups: 0 });
+    Object.assign(STUB.qq, { qr: null, url: null, notice: known ? `「${name}」已添加过，只更新了密钥` : `已接入「${name}」` });
+    if (STUB.qq.bots.length > 1) { STUB.qq.status = `${STUB.qq.bots.length} 个机器人 · ${STUB.qq.bots.length} 个在线`; STUB.qq_status = STUB.qq.status; }
+  };
+  STUB.qq_scan = () => { Object.assign(STUB.qq, { bound: true, qr: null, url: null, name: "DiscoBot", status: "在线 · DiscoBot", owner: true, bots: [{ app: "102000001", name: "DiscoBot", agent: null, status: "在线 · DiscoBot", owner: true, ready: true, groups: 0 }] }); Object.assign(STUB.qq.diag, { stage: "在线", ready: true, ready_at: Date.now() }); STUB.qq_status = "在线 · DiscoBot"; };
   window.STUB = STUB; window.CALLS = []; window.UNKNOWN = []; window.STUB_FAIL = {};
   window.__TAURI__ = {
     core: { invoke: async (c, a) => {
