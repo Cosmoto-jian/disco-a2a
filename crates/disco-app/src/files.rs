@@ -173,7 +173,7 @@ impl Core {
             Ok((dst, size, hash)) => {
                 let name = safe_name(&f.name);
                 self.post_message(thread, agent, &file_line("", &name, size, &hash, &dst));
-                self.qq_file(thread, &dst, &name);
+                self.qq_file(thread, agent, &dst, &name);
             }
             Err(e) => self.post_message(thread, "system", &format!("{agent} 发来的{e}")),
         }
@@ -181,9 +181,10 @@ impl Core {
 
     /// Send a file of `thread` to the QQ group / private chat it syncs with, in the
     /// background (QQ's one-shot upload limit is 20 MB; a bigger one is reported in
-    /// Settings → QQ「发送失败」, never dropped silently).
-    fn qq_file(&self, thread: &str, path: &std::path::Path, name: &str) {
-        let Some(route) = crate::qq::target(self, thread) else { return };
+    /// Settings → QQ「发送失败」, never dropped silently). An agent's file goes through its
+    /// own QQ bot when it has one there (v1.13).
+    fn qq_file(&self, thread: &str, author: &str, path: &std::path::Path, name: &str) {
+        let Some(route) = crate::qq::target_for(self, thread, Some(author).filter(|a| *a != "me")) else { return };
         let (path, name, app) = (path.to_path_buf(), name.to_owned(), route.app.clone());
         tauri::async_runtime::spawn(async move {
             match tokio::fs::read(&path).await {
@@ -209,7 +210,7 @@ impl Core {
         };
         let line = file_line(note, &name, size, &hash, &dst);
         // A group tied to a QQ group (or a QQ-synced private chat) gets the file itself.
-        self.qq_file(thread, &dst, &name);
+        self.qq_file(thread, author, &dst, &name);
         {
             let mut q = PENDING.lock().unwrap_or_else(|p| p.into_inner());
             q.extend(remote.iter().map(|a| Pending { agent: a.clone(), thread: thread.to_owned(), path: dst.clone(), name: name.clone(), size, sha256: hash.clone() }));

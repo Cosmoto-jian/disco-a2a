@@ -79,7 +79,8 @@ impl Core {
     fn inbox_add_once(&self, item: Item, reply: Reply, once: bool) -> bool {
         let id = item.id.clone();
         let discord = self.discord_rest().zip(self.thread_channel(&item.thread));
-        let qq = crate::qq::target(self, &item.thread);
+        // The asking agent's own QQ bot when it has one there (v1.13), else the shared one.
+        let qq = crate::qq::target_for(self, &item.thread, Some(&item.agent));
         let card = format!("{} **{}** {}：{}", if item.kind == "permission" { "🔐" } else { "❓" }, item.agent,
             if item.kind == "permission" { "请求执行" } else { "问你" }, item.title);
         let mut buttons: Vec<(String, String, bool)> = item.options.iter().enumerate()

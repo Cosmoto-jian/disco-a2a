@@ -1272,7 +1272,10 @@ pub fn spawn(app: AppHandle, mock: String) {
             let others = crate::qq::target_for(&core, &thread, Some("m1")).map(|r| r.app).unwrap_or_default();
             let lead_quiet = count(&core, &thread, "m1") == 0;
             if mine_said == "@mq 在吗" && plain && shared_after == shared_before && routed == "103" && others == "102" && lead_quiet { Ok(label) }
-            else { Err(format!("me={mine_said:?} plain={plain} shared {shared_before}->{shared_after} routed={routed} others={others} lead_quiet={lead_quiet}")) } });
+            else {
+                let extra: Vec<serde_json::Value> = ["msg:G2", "msg:G3"].iter().flat_map(|k| qlog(k)).collect();
+                Err(format!("me={mine_said:?} plain={plain} shared {shared_before}->{shared_after} routed={routed} others={others} lead_quiet={lead_quiet} last={:?}", extra.last()))
+            } });
         let _ = check!("QQ 多机器人：删掉专用机器人，agent 回到共享机器人；删掉共享机器人，剩下的接替", {
             let s = serde_json::to_value(crate::qq::qq_remove_bot(st(), "103".into())?).map_err(|e| e.to_string())?;
             let n = s["bots"].as_array().map_or(0, Vec::len);
