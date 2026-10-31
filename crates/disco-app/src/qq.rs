@@ -774,6 +774,14 @@ fn group_bind_code(text: &str) -> Option<&str> {
     (code.len() == 4 && code.bytes().all(|b| b.is_ascii_digit())).then_some(code)
 }
 
+/// "q:<AppID>/<openid>/<member>" → (openid, member), only for this bot's own codes (a QQ
+/// group openid means nothing to another bot).
+fn group_target(target: &str, app: &str) -> Option<(String, String)> {
+    let rest = target.strip_prefix("q:")?.strip_prefix(app)?.strip_prefix('/')?;
+    let (openid, member) = rest.split_once('/').unwrap_or((rest, ""));
+    (!openid.is_empty()).then(|| (openid.to_owned(), member.to_owned()))
+}
+
 /// A bare number (`2`, `0`) typed as the answer to 「选哪个 Disco 群聊」.
 fn pick_number(text: &str) -> Option<usize> {
     let t = text.trim();
@@ -1065,12 +1073,11 @@ impl Core {
         // the owner in it.
         let group_code_text = group_bind_code(&m.content).or(code.filter(|_| !claimed));
         if let Some(got) = group_code_text {
-            match take_code(got, |t| t.starts_with("q:")) {
+            let mine = format!("q:{app}/");
+            match take_code(got, |t| t.starts_with(&mine)) {
                 Some(target) => {
                     // "q:<AppID>/<openid>/<member>": this bot's own group only.
-                    let tail_ = target.strip_prefix("q:").unwrap_or_default();
-                    let (openid, member) = tail_.split_once('/').map(|(o, rest)| (o.to_owned(), rest.split_once('/').map(|(_, m)| m.to_owned()).unwrap_or_default()))
-                        .unwrap_or_else(|| (String::new(), String::new()));
+                    let (openid, member) = group_target(&target, &app).unwrap_or_default();
                     if openid.is_empty() { return; }
                     // A bot dedicated to one agent: offer that agent's Disco groups first.
                     if let Some((text, buttons)) = self.qq_offer_groups(&app, &openid, &member) {
@@ -1666,6 +1673,12 @@ mod tests {
         let n = { let mut codes = lock(&CODES); let n = new_code(&codes); codes.push((n.clone(), "g:local-1".into(), Instant::now())); n };
         assert_eq!(take_code(&n, |t| t.starts_with("g:")), Some("g:local-1".to_owned()));
         assert_eq!(take_code(&n, |t| t.starts_with("o:")), None);
+        // v1.13: a group code names its bot; only that bot's private chat redeems it.
+        assert_eq!(group_target("q:A1/G-x/U-x", "A1"), Some(("G-x".to_owned(), "U-x".to_owned())));
+        assert_eq!(group_target("q:A1/G-x/", "A1"), Some(("G-x".to_owned(), String::new())));
+        assert_eq!(group_target("q:A1/G-x/U-x", "A2"), None, "another bot's group openid means nothing here");
+        assert_eq!(group_target("q:A12/G-x/U-x", "A1"), None, "AppID prefixes are not AppIDs");
+        assert_eq!((pick_number(" 2\r\n"), pick_number("0"), pick_number("123"), pick_number("2 号")), (Some(2), Some(0), None, None));
     }
 
     /// An agent's answer goes out with its tool trace stripped (Settings → QQ「显示工具

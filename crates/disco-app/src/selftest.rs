@@ -1203,7 +1203,8 @@ pub fn spawn(app: AppHandle, mock: String) {
             let reply = |b: &serde_json::Value| b["msg_id"] == "d1" && b["_app"] == "103";
             until(10, || qlog("c2c:OWNER3").iter().any(reply)).await.map_err(|e| format!("{e} {:?}", qlog("c2c:OWNER3")))?;
             let plain = qlog("c2c:OWNER3").iter().filter(|b| reply(b)).all(|b| !md(b).starts_with("**mq**"));
-            let shared_quiet = !qlog("c2c:OWNER").iter().any(|b| b["msg_id"] == "d1");
+            // (qlog matches by prefix: "c2c:OWNER" also lists OWNER3's chat, so check the sending bot.)
+            let shared_quiet = !qlog("c2c:OWNER").iter().any(|b| b["msg_id"] == "d1" && b["_app"] != "103");
             // A slash command there applies to that agent alone.
             let pushed = push_qq_to("103", serde_json::json!({ "op": 0, "t": "C2C_MESSAGE_CREATE", "d": { "id": "d1h", "content": "/agents",
                 "timestamp": "Sat 2026-10-31 4:00 PM CST (UTC+08:00)", "author": { "user_openid": "OWNER3" } } }));
@@ -1211,7 +1212,8 @@ pub fn spawn(app: AppHandle, mock: String) {
             let only = |b: &serde_json::Value| b["msg_id"] == "d1h" && md(b).contains("这里的 agent：mq") && !md(b).contains("mq2");
             until(10, || qlog("c2c:OWNER3").iter().any(only)).await.map_err(|e| format!("{e} {:?}", qlog("c2c:OWNER3")))?;
             let routed = crate::qq::target(&core, "dm:mq").map(|r| r.app).unwrap_or_default();
-            if plain && shared_quiet && routed == "103" { Ok(String::new()) } else { Err(format!("plain={plain} shared_quiet={shared_quiet} routed={routed}")) } });
+            if plain && shared_quiet && routed == "103" { Ok(String::new()) }
+            else { Err(format!("plain={plain} shared_quiet={shared_quiet} routed={routed}")) } });
         let _ = check!("QQ 专用机器人在未绑定群被 @：给码；私聊「绑定群」列出 agent 已在的 Disco 群聊 + 新建；群里回答走它自己的机器人", {
             let pushed = push_qq_to("103", serde_json::json!({ "op": 0, "t": "GROUP_AT_MESSAGE_CREATE", "d": { "id": "h1", "content": "你好",
                 "timestamp": "Sat 2026-10-31 4:01 PM CST (UTC+08:00)", "group_openid": "H1", "group_id": "H1",
